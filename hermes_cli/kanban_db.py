@@ -9618,6 +9618,98 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+DASHBOARD_ACTIVITY_KINDS = frozenset({
+    "created",
+    "assigned",
+    "claimed",
+    "spawned",
+    "completed",
+    "blocked",
+    "unblocked",
+    "promoted",
+    "crashed",
+    "timed_out",
+    "gave_up",
+    "released",
+    "scheduled",
+    "archived",
+})
+
+
+def _dashboard_activity_ref(prefix: str, namespace: str, value: object) -> str:
+    digest = hashlib.sha256(
+        f"hermes-kanban-activity-v1\x1f{namespace}\x1f{value}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def board_activity(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
+    """Return a bounded lifecycle projection without task content or raw IDs.
+
+    This is the read-only source contract for operator dashboards. Event
+    payloads are consulted only to recover the assignee recorded at creation or
+    reassignment; payloads, task content, run metadata, claim data, and raw
+    identifiers never leave this function.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise ValueError("activity limit must be an integer between 1 and 200")
+
+    database_row = conn.execute("PRAGMA database_list").fetchone()
+    namespace = str(database_row["file"] if database_row else "kanban")
+    kinds = sorted(DASHBOARD_ACTIVITY_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    rows = conn.execute(
+        "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+        "       r.profile AS run_profile "
+        "FROM task_events e "
+        "LEFT JOIN task_runs r ON r.id = e.run_id "
+        f"WHERE e.kind IN ({placeholders}) "
+        "ORDER BY e.id DESC LIMIT ?",
+        (*kinds, limit),
+    ).fetchall()
+
+    events = []
+    last_profile_by_work: dict[str, Optional[str]] = {}
+    for row in reversed(rows):
+        payload = None
+        if row["payload"]:
+            try:
+                candidate = json.loads(row["payload"])
+                payload = candidate if isinstance(candidate, dict) else None
+            except (TypeError, ValueError):
+                payload = None
+        payload_profile = payload.get("assignee") if payload else None
+        profile = (
+            payload_profile
+            if row["kind"] in {"created", "assigned"} and isinstance(payload_profile, str)
+            else row["run_profile"]
+        )
+        profile = profile if isinstance(profile, str) and profile else None
+        work_ref = _dashboard_activity_ref("work", namespace, row["task_id"])
+        previous_profile = last_profile_by_work.get(work_ref)
+        events.append({
+            "event_ref": _dashboard_activity_ref("event", namespace, row["id"]),
+            "work_ref": work_ref,
+            "kind": row["kind"],
+            "occurred_at": int(row["created_at"]),
+            "profile": profile,
+            "previous_profile": (
+                previous_profile
+                if row["kind"] == "assigned" and previous_profile != profile
+                else None
+            ),
+        })
+        if profile is not None:
+            last_profile_by_work[work_ref] = profile
+
+    return {
+        "contract_version": "hermes-kanban-activity-v1",
+        "retention_limit": limit,
+        "now": int(time.time()),
+        "events": events,
+    }
+
+
 def _to_epoch(val) -> Optional[int]:
     """Normalise a timestamp to unix epoch seconds.
 

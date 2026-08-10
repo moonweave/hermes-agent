@@ -95,6 +95,81 @@ def kanban_home(tmp_path, monkeypatch):
 # Stats + age
 # ---------------------------------------------------------------------------
 
+def test_board_stats_reports_aggregate_worker_evidence_without_task_content(
+    kanban_home, monkeypatch,
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 101)
+    host = kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        live_id = kb.create_task(
+            conn, title="private live title", body="private live body",
+            assignee="builder",
+        )
+        stale_id = kb.create_task(
+            conn, title="private stale title", body="private stale body",
+            assignee="builder",
+        )
+        remote_id = kb.create_task(
+            conn, title="private remote title", body="private remote body",
+            assignee="reviewer",
+        )
+        unassigned_id = kb.create_task(
+            conn, title="private unassigned title", body="private unassigned body",
+        )
+
+        assert kb.claim_task(conn, live_id, claimer=f"{host}:live") is not None
+        assert kb.claim_task(conn, stale_id, claimer=f"{host}:stale") is not None
+        assert kb.claim_task(conn, remote_id, claimer="remote-host:worker") is not None
+        assert kb.claim_task(conn, unassigned_id, claimer=f"{host}:unknown") is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = 101, last_heartbeat_at = ? WHERE id = ?",
+            (now - 5, live_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_pid = 202, last_heartbeat_at = ? WHERE id = ?",
+            (now - 5, stale_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_pid = 303, last_heartbeat_at = ? WHERE id = ?",
+            (now - 5, remote_id),
+        )
+
+        stats = kb.board_stats(conn)
+
+    assert stats["activity_totals"] == {
+        "running_rows": 4,
+        "live_worker_rows": 1,
+        "stale_worker_rows": 1,
+        "unverified_worker_rows": 2,
+        "unassigned_running_rows": 1,
+    }
+    assert stats["activity_by_assignee"] == {
+        "builder": {
+            "running_rows": 2,
+            "live_worker_rows": 1,
+            "stale_worker_rows": 1,
+            "unverified_worker_rows": 0,
+            "latest_heartbeat_at": now - 5,
+        },
+        "reviewer": {
+            "running_rows": 1,
+            "live_worker_rows": 0,
+            "stale_worker_rows": 0,
+            "unverified_worker_rows": 1,
+            "latest_heartbeat_at": now - 5,
+        },
+    }
+
+    payload = json.dumps(stats)
+    for private_value in (
+        live_id, stale_id, remote_id, unassigned_id,
+        "private live title", "private live body",
+    ):
+        assert private_value not in payload
+
 
 
 
@@ -1406,5 +1481,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

@@ -95,6 +95,61 @@ def kanban_home(tmp_path, monkeypatch):
 # Stats + age
 # ---------------------------------------------------------------------------
 
+def test_board_activity_projects_lifecycle_without_task_content(
+    kanban_home, monkeypatch,
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="private activity title",
+            body="private activity body",
+            assignee="builder",
+        )
+        assert kb.assign_task(conn, task_id, "reviewer")
+        assert kb.claim_task(conn, task_id, claimer="private-host:private-lock")
+        assert kb.complete_task(conn, task_id, result="private activity result")
+        activity = kb.board_activity(conn, limit=80)
+
+    assert activity["contract_version"] == "hermes-kanban-activity-v1"
+    assert activity["retention_limit"] == 80
+    assert activity["now"] == now
+    assert [event["kind"] for event in activity["events"]] == [
+        "created", "assigned", "claimed", "completed",
+    ]
+    assert activity["events"][0]["profile"] == "builder"
+    assert activity["events"][1]["previous_profile"] == "builder"
+    assert activity["events"][1]["profile"] == "reviewer"
+    assert activity["events"][2]["profile"] == "reviewer"
+    assert activity["events"][3]["profile"] == "reviewer"
+    assert len({event["event_ref"] for event in activity["events"]}) == 4
+    assert len({event["work_ref"] for event in activity["events"]}) == 1
+
+    payload = json.dumps(activity)
+    for private_value in (
+        task_id,
+        "private activity title",
+        "private activity body",
+        "private activity result",
+        "private-host:private-lock",
+    ):
+        assert private_value not in payload
+
+    observed_keys = set()
+    pending = [activity]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            observed_keys.update(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    assert observed_keys.isdisjoint({
+        "id", "task_id", "run_id", "title", "body", "result", "comment",
+        "payload", "claim_lock", "worker_pid", "hostname", "path", "email",
+    })
 
 
 

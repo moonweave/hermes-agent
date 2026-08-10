@@ -57,6 +57,27 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_activity_json_exposes_only_bounded_safe_projection(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="private cli activity title",
+            body="private cli activity body",
+            assignee="builder",
+        )
+
+    payload = json.loads(kc.run_slash("activity --json --limit 7"))
+
+    assert payload["contract_version"] == "hermes-kanban-activity-v1"
+    assert payload["retention_limit"] == 7
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["kind"] == "created"
+    rendered = json.dumps(payload)
+    assert task_id not in rendered
+    assert "private cli activity title" not in rendered
+    assert "private cli activity body" not in rendered
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -164,5 +185,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

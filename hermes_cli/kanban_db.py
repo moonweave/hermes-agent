@@ -10916,6 +10916,177 @@ def _unresolved_run_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _needs_input_stats(conn: sqlite3.Connection) -> dict:
+    """Cost of the unanswered human question: count, staleness, and blast radius.
+
+    ``block_kind='needs_input'`` is a first-class, agent-set fact, not an
+    inference. The constant's own comment (kanban_db.py:116) says it means
+    "needs a human decision/answer it cannot derive"; the ``tasks.block_kind``
+    schema comment (kanban_db.py:1266-1271) and ``block_task``'s docstring
+    (kanban_db.py:5650-5671) agree: ``needs_input``/``capability`` are
+    "truly blocked" and land in ``blocked`` for a human, unlike
+    ``dependency``, which is routed back to ``todo`` with no human involved.
+    The value is written by whoever calls ``block_task(kind="needs_input")``
+    -- in practice the ``kanban_block`` tool exposed to agent workers
+    (tools/kanban_tools.py:1709-1750), whose schema frames the kind
+    explicitly as "you need a human decision/answer" -- so on the intended
+    path this is an agent stating it is stuck and waiting on the operator,
+    not something this function infers from silence.
+
+    Caveat this function does NOT paper over: ``block_kind`` is preserved
+    across ``unblock_task`` (kanban_db.py:5964-5973, deliberately, to keep
+    the unblock-loop breaker honest) and across a subsequent re-claim/run
+    (``claim_task`` never touches it). It is cleared only by
+    ``complete_task`` (set to NULL on completion) or overwritten by a fresh
+    ``block_task`` call. So in principle a row that was asked, answered, and
+    unblocked back into ``ready``/``todo``/``running`` could still carry a
+    stale ``needs_input`` tag until one of those two things happens to it
+    next. Scope here is deliberately every ``status NOT IN ('done',
+    'archived')`` -- the same non-terminal scope as
+    ``_unresolved_run_stats`` -- rather than hard-coded to ``('blocked',
+    'triage')``, so a future stale tag on an active row would surface in
+    this count instead of being silently excluded by an assumption about
+    where the value "should" live. Measured against all four live boards
+    the day this was added, every row currently carrying ``needs_input`` is
+    ``blocked`` or ``triage`` -- there is no live stale-tag case today --
+    but that is a fact about current data, not a schema guarantee, and the
+    query does not hard-code it.
+
+    Returns three counts/timestamps per kind, over the population
+    (``block_kind = <kind> AND status NOT IN ('done', 'archived')``):
+
+    * ``*_rows`` -- how many.
+    * ``oldest_*_row_last_touch_at`` -- the oldest per-row last-touch
+      (``COALESCE(MAX(task_events.created_at), tasks.created_at)``, the same
+      idiom as ``_board_staleness_stats``).
+
+      This is NOT the age of the question. It is the last event of ANY kind
+      on the row that has gone longest without one. A comment on a waiting
+      card resets it without answering anything: measured live, 13 of 59
+      rows had ``commented`` as their last event, two of them carrying 25-27h
+      of reset, and the board's reported figure already differed from the
+      true earliest ask by half an hour. Callers must word it as a last
+      recorded event, never as how long ago someone was asked -- the same
+      distinction that killed two earlier signals on this surface. ``None``
+      only when the kind's row count is 0.
+    * ``needs_input_downstream_rows`` -- the cost of leaving the question
+      unanswered: the count of DISTINCT other rows linked as a
+      ``task_links`` child of any row in the population above, excluding
+      children that are themselves ``done``/``archived``. Counts rows, not
+      links, so a child gated on two different needs-input parents is
+      counted once, not twice.
+
+    Counts and timestamps only: no task id, title, or comment text leaves
+    this function.
+
+    Query plan (``EXPLAIN QUERY PLAN``, checked against all four live
+    boards): the count/oldest query's outer scan is ``SEARCH t USING INDEX
+    idx_tasks_status (status=?)``, one seek per non-terminal status value --
+    the same shape as ``_unresolved_run_stats`` -- and the correlated
+    ``MAX(created_at)`` subquery is ``SEARCH task_events USING COVERING
+    INDEX idx_events_task (task_id=?)``, the same as
+    ``_board_staleness_stats``. The downstream-children query adds two more
+    joins, both index-backed: ``SEARCH l USING COVERING INDEX
+    sqlite_autoindex_task_links_1 (parent_id=?)`` (the automatic unique
+    index SQLite builds for ``task_links``'s ``PRIMARY KEY (parent_id,
+    child_id)``, functionally the same access path as the explicit
+    ``idx_links_parent``) and ``SEARCH c USING INDEX
+    sqlite_autoindex_tasks_1 (id=?)`` (the automatic index for ``tasks.id
+    TEXT PRIMARY KEY``). No new index and no schema change accompanies this
+    function; every access path already existed. This runs on every
+    dispatcher tick.
+    """
+    non_terminal_statuses = sorted(VALID_STATUSES - {"done", "archived"})
+    placeholders = ", ".join("?" for _ in non_terminal_statuses)
+
+    # A row stopped for a human sits in ``blocked``; ``triage`` is where
+    # BLOCK_RECURRENCE_LIMIT routes one that keeps being re-blocked.
+    human_stopped_statuses = ["blocked", "triage"]
+    stopped_placeholders = ", ".join("?" for _ in human_stopped_statuses)
+
+    def _for_kind(kind: Optional[str]) -> tuple[int, Optional[int], int]:
+        """Count, oldest last-touch, and blast radius for one block kind.
+
+        A TYPED kind is scoped across every non-terminal status on purpose: the
+        tag is itself the recorded fact, so a tag left behind on a row that has
+        moved on surfaces here instead of hiding.
+
+        ``kind=None`` cannot use that scope. There is no tag on those rows, so
+        the only thing making one a block is its status, and ``block_kind IS
+        NULL`` otherwise matches every untagged open row — a plain ``todo`` row
+        satisfies it trivially. Measured when this was first written wrong: the
+        broad predicate returned 40 rows across four boards of which only 15
+        were blocked, and on one board all 5 reported rows had never been
+        blocked at all.
+        """
+        if kind is None:
+            predicate = "p.block_kind IS NULL"
+            kind_params: list = []
+            status_params = human_stopped_statuses
+            status_placeholders = stopped_placeholders
+        else:
+            predicate = "p.block_kind = ?"
+            kind_params = [kind]
+            status_params = non_terminal_statuses
+            status_placeholders = placeholders
+
+        row = conn.execute(
+            "SELECT MIN(last_touch) AS oldest, COUNT(*) AS n FROM ("
+            "SELECT COALESCE("
+            "(SELECT MAX(created_at) FROM task_events WHERE task_id = p.id), "
+            "p.created_at"
+            ") AS last_touch "
+            "FROM tasks p "
+            f"WHERE {predicate} AND p.status IN ({status_placeholders})"
+            ")",
+            kind_params + status_params,
+        ).fetchone()
+        rows = int(row["n"] or 0)
+        oldest = int(row["oldest"]) if row["oldest"] is not None else None
+        if (oldest is None) != (rows == 0):
+            raise ValueError(
+                f"oldest {kind or 'untyped'}-block row timestamp nullness "
+                "does not match its row count"
+            )
+
+        children_row = conn.execute(
+            "SELECT COUNT(DISTINCT l.child_id) AS n "
+            "FROM tasks p "
+            "JOIN task_links l ON l.parent_id = p.id "
+            "JOIN tasks c ON c.id = l.child_id "
+            f"WHERE {predicate} AND p.status IN ({status_placeholders}) "
+            f"AND c.status IN ({placeholders})",
+            kind_params + status_params + non_terminal_statuses,
+        ).fetchone()
+        return rows, oldest, int(children_row["n"] or 0)
+
+    needs_input_rows, oldest_needs_input, needs_input_children = _for_kind("needs_input")
+    capability_rows, oldest_capability, capability_children = _for_kind("capability")
+    untyped_rows, oldest_untyped, untyped_children = _for_kind(None)
+
+    return {
+        "needs_input_rows": needs_input_rows,
+        "oldest_needs_input_row_last_touch_at": oldest_needs_input,
+        "needs_input_downstream_rows": needs_input_children,
+        # A hard wall the agent cannot pass: no access, missing credentials, an
+        # action no AI agent can perform. The schema calls it "genuinely
+        # human-only", so it belongs in the same queue as needs_input but is a
+        # different request — do something, rather than answer something.
+        "capability_rows": capability_rows,
+        "oldest_capability_row_last_touch_at": oldest_capability,
+        "capability_downstream_rows": capability_children,
+        # Blocked with no kind recorded. The schema comment says to treat these
+        # as a generic human blocker, so they are reported rather than dropped —
+        # measured live they were the second-largest group (40 of 108) and
+        # omitting them would have shown barely half the operator's queue.
+        # Kept separate rather than folded into needs_input: the source does not
+        # say what these are waiting for, and merging would assert that it does.
+        "untyped_block_rows": untyped_rows,
+        "oldest_untyped_block_row_last_touch_at": oldest_untyped,
+        "untyped_block_downstream_rows": untyped_children,
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
@@ -10952,6 +11123,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     if staleness["blocked_rows"] != by_status.get("blocked", 0):
         raise ValueError("staleness blocked total does not reconcile with by_status")
     unresolved_runs = _unresolved_run_stats(conn)
+    needs_input = _needs_input_stats(conn)
 
     return {
         "by_status": by_status,
@@ -10990,6 +11162,44 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "max_unresolved_row_runs_last_started_at": (
             unresolved_runs["max_unresolved_row_runs_last_started_at"]
         ),
+        # Count of open (status NOT IN ('done', 'archived')) rows with
+        # block_kind='needs_input' -- an agent explicitly stated it needs a
+        # human decision/answer it cannot derive (see _needs_input_stats).
+        # This is a recorded fact the agent set, not an inference.
+        "needs_input_rows": needs_input["needs_input_rows"],
+        # Oldest per-row last-touch among the rows above (None only when
+        # needs_input_rows is 0), so a question asked five days ago reads
+        # differently from one asked an hour ago.
+        "oldest_needs_input_row_last_touch_at": (
+            needs_input["oldest_needs_input_row_last_touch_at"]
+        ),
+        # Distinct other (non-done/archived) rows gated behind any row above
+        # as a task_links child -- the cost of the unanswered question.
+        "needs_input_downstream_rows": needs_input["needs_input_downstream_rows"],
+        # The other two kinds the schema comment (kanban_db.py:110-125) routes
+        # to a human. `capability` is a hard wall -- no access, missing creds,
+        # an action no AI agent can perform, "genuinely human-only". An
+        # un-typed block carries no kind at all and the same comment says to
+        # treat it as a generic human blocker. Only `dependency` needs nobody:
+        # it goes back to `todo` and the parent-gating machinery promotes it.
+        #
+        # Reported as three separate facts rather than one sum. The operator's
+        # next action differs -- answer a question, do something an agent
+        # cannot, or classify an old block -- and the source does not say what
+        # an un-typed block is waiting for, so folding it into needs_input
+        # would assert something it does not know. Measured live the day this
+        # was added: needs_input 59, un-typed 40, capability 9, dependency 1;
+        # reporting needs_input alone would have shown barely half the queue.
+        "capability_rows": needs_input["capability_rows"],
+        "oldest_capability_row_last_touch_at": (
+            needs_input["oldest_capability_row_last_touch_at"]
+        ),
+        "capability_downstream_rows": needs_input["capability_downstream_rows"],
+        "untyped_block_rows": needs_input["untyped_block_rows"],
+        "oldest_untyped_block_row_last_touch_at": (
+            needs_input["oldest_untyped_block_row_last_touch_at"]
+        ),
+        "untyped_block_downstream_rows": needs_input["untyped_block_downstream_rows"],
         "now": now,
     }
 

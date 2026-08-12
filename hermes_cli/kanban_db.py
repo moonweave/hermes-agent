@@ -11007,28 +11007,34 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     def _for_kind(kind: Optional[str]) -> tuple[int, Optional[int], int]:
         """Count, oldest last-touch, and blast radius for one block kind.
 
-        A TYPED kind is scoped across every non-terminal status on purpose: the
-        tag is itself the recorded fact, so a tag left behind on a row that has
-        moved on surfaces here instead of hiding.
+        Every kind is scoped to ``blocked``/``triage``, because that is what the
+        number means: work stopped in front of a person right now.
 
-        ``kind=None`` cannot use that scope. There is no tag on those rows, so
-        the only thing making one a block is its status, and ``block_kind IS
-        NULL`` otherwise matches every untagged open row — a plain ``todo`` row
-        satisfies it trivially. Measured when this was first written wrong: the
-        broad predicate returned 40 rows across four boards of which only 15
-        were blocked, and on one board all 5 reported rows had never been
-        blocked at all.
+        A tag alone is not enough. ``block_kind`` deliberately survives
+        ``unblock_task`` (the unblock-loop breaker needs it to recognise a
+        re-block for the same cause, and that breaker is what bounds the runaway
+        respawn loops), so a row carrying ``needs_input`` may have been answered
+        and released back to ``ready`` — queued to run, waiting on nobody.
+        Measured: none today, but five rows across three boards have been
+        unblocked while still tagged, so it is structural, not hypothetical.
+        Surfacing a stale tag is a useful diagnostic, but it is a different
+        question from this one and must not inflate this count.
+
+        A status alone is not enough either, which is why the un-typed case
+        needs both halves. ``block_kind IS NULL`` matches every untagged row, so
+        without the status filter a plain ``todo`` row satisfies it trivially:
+        measured when this was first written wrong, the bare predicate returned
+        40 rows of which only 15 were blocked, and on one board all 5 reported
+        rows had never been blocked at all.
         """
         if kind is None:
             predicate = "p.block_kind IS NULL"
             kind_params: list = []
-            status_params = human_stopped_statuses
-            status_placeholders = stopped_placeholders
         else:
             predicate = "p.block_kind = ?"
             kind_params = [kind]
-            status_params = non_terminal_statuses
-            status_placeholders = placeholders
+        status_params = human_stopped_statuses
+        status_placeholders = stopped_placeholders
 
         row = conn.execute(
             "SELECT MIN(last_touch) AS oldest, COUNT(*) AS n FROM ("

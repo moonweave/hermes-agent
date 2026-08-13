@@ -55,6 +55,133 @@ def _confirm_prompt(prompt: str) -> bool:
         return False
 
 
+SESSIONS_ACTIVITY_CONTRACT = "hermes-sessions-activity-v1"
+# Enough sessions to cover every workspace a person could plausibly have open
+# at once, while keeping the read bounded on a 300+ session store.
+_ACTIVITY_SCAN_LIMIT = 200
+
+
+def _sessions_activity(db, args) -> int:
+    """Aggregate interactive-session activity, grouped by workspace digest.
+
+    Interactive sessions are a different subject from kanban rows: a chat a
+    person drives has no assignee, no worker PID and no task row, so a reader
+    that only watches kanban reports "no work observed" while real work is
+    happening in front of them. This states that work exists, per workspace,
+    and nothing about what it is.
+
+    Deliberately aggregate and identifier-free. Session ids, titles, previews,
+    models, chat ids and workspace paths never appear: titles and previews are
+    free user text and raw prompt text, and a path is an environment detail.
+    The workspace is emitted only as a sha256 of its key, so a consumer can
+    match it against a workspace it already knows without ever learning one it
+    does not. Callers name it or withhold it; this command never does.
+    """
+    import hashlib
+    import json as _json
+    import time as _time
+
+    from hermes_state import workspace_key as _ws_key
+
+    window = max(1, int(getattr(args, "window", 300) or 300))
+    now = int(_time.time())
+    floor = now - window
+
+    sessions = db.list_sessions_rich(
+        source=getattr(args, "source", None),
+        exclude_sources=None if getattr(args, "source", None) else ["tool"],
+        limit=_ACTIVITY_SCAN_LIMIT,
+        order_by_last_active=True,
+    )
+
+    by_workspace: dict[str, dict[str, int]] = {}
+    unresolved = {"open_sessions": 0, "recently_active_sessions": 0}
+    totals = {"open_sessions": 0, "recently_active_sessions": 0}
+
+    for row in sessions:
+        if row.get("ended_at") is not None:
+            continue
+        last_active = row.get("last_active")
+        last_active = int(last_active) if last_active else None
+        recent = last_active is not None and last_active >= floor
+        totals["open_sessions"] += 1
+        if recent:
+            totals["recently_active_sessions"] += 1
+
+        key = _ws_key(row) or ""
+        if not key:
+            # A session bound to no workspace is still real work; it is counted
+            # so the totals reconcile, but it cannot be attributed to anywhere.
+            unresolved["open_sessions"] += 1
+            if recent:
+                unresolved["recently_active_sessions"] += 1
+            continue
+
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        bucket = by_workspace.setdefault(
+            digest,
+            {
+                "workspace_sha256": digest,
+                "open_sessions": 0,
+                "recently_active_sessions": 0,
+                "last_activity_at": None,
+            },
+        )
+        bucket["open_sessions"] += 1
+        if recent:
+            bucket["recently_active_sessions"] += 1
+        if last_active is not None:
+            previous = bucket["last_activity_at"]
+            bucket["last_activity_at"] = (
+                last_active if previous is None else max(previous, last_active)
+            )
+
+    workspaces = sorted(
+        by_workspace.values(),
+        key=lambda entry: (
+            -entry["recently_active_sessions"],
+            -(entry["last_activity_at"] or 0),
+            entry["workspace_sha256"],
+        ),
+    )
+    payload = {
+        "contract_version": SESSIONS_ACTIVITY_CONTRACT,
+        "now": now,
+        "window_seconds": window,
+        "scan_limit": _ACTIVITY_SCAN_LIMIT,
+        # The scan hit its ceiling, so the store holds sessions this read never
+        # examined. The two counts degrade differently and must not be reported
+        # as equally trustworthy: rows arrive newest-activity-first, so anything
+        # active inside the window sorts ahead of everything the cut drops --
+        # `recently_active_sessions` stays exact unless more than `scan_limit`
+        # sessions were active at once, while `open_sessions` counts a long-open
+        # idle session that fell past the cut as absent and is a floor.
+        "scan_truncated": len(sessions) >= _ACTIVITY_SCAN_LIMIT,
+        "totals": totals,
+        "unresolved_workspace": unresolved,
+        "workspaces": workspaces,
+    }
+
+    if getattr(args, "json", False):
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    print(
+        f"Open interactive sessions: {totals['open_sessions']} "
+        f"({totals['recently_active_sessions']} active in the last {window}s)"
+    )
+    for entry in workspaces:
+        print(
+            f"  workspace {entry['workspace_sha256'][:12]}…  "
+            f"open {entry['open_sessions']}  "
+            f"recent {entry['recently_active_sessions']}  "
+            f"last {_relative_time(entry['last_activity_at'])}"
+        )
+    if unresolved["open_sessions"]:
+        print(f"  no workspace bound: {unresolved['open_sessions']}")
+    return 0
+
+
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -93,9 +220,11 @@ def cmd_sessions(args, sessions_parser=None):
             try:
                 from hermes_state import SessionDB
 
-                n = SessionDB()._conn.execute(
-                    "SELECT COUNT(*) FROM sessions"
-                ).fetchone()[0]
+                n = (
+                    SessionDB()
+                    ._conn.execute("SELECT COUNT(*) FROM sessions")
+                    .fetchone()[0]
+                )
                 print(f"✓ Repaired — {n} sessions recovered.")
             except Exception:
                 print("✓ Repaired.")
@@ -145,10 +274,7 @@ def cmd_sessions(args, sessions_parser=None):
             return 2
         if not inspect_only and report_path is None:
             report_path = output.with_name(output.name + ".recovery.json")
-        if (
-            report_path is not None
-            and os.path.lexists(report_path.expanduser())
-        ):
+        if report_path is not None and os.path.lexists(report_path.expanduser()):
             print(f"Error: refusing to overwrite existing report: {report_path}")
             return 2
 
@@ -236,6 +362,9 @@ def cmd_sessions(args, sessions_parser=None):
     _source = getattr(args, "source", None)
     _exclude = None if _source else ["tool"]
 
+    if action == "activity":
+        return _sessions_activity(db, args)
+
     if action == "list":
         from hermes_state import workspace_key as _ws_key
 
@@ -276,7 +405,9 @@ def cmd_sessions(args, sessions_parser=None):
                 print(f"{'Title':<28} {'Workspace':<18} {'Last Active':<13} {'ID'}")
                 print("─" * 110)
             else:
-                print(f"{'Preview':<38} {'Workspace':<18} {'Last Active':<13} {'Src':<6} {'ID'}")
+                print(
+                    f"{'Preview':<38} {'Workspace':<18} {'Last Active':<13} {'Src':<6} {'ID'}"
+                )
                 print("─" * 100)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
@@ -286,7 +417,9 @@ def cmd_sessions(args, sessions_parser=None):
                     print(f"{title:<28} {ws:<18} {last_active:<13} {s['id']}")
                 else:
                     preview = s.get("preview", "")[:36]
-                    print(f"{preview:<38} {ws:<18} {last_active:<13} {s['source']:<6} {s['id']}")
+                    print(
+                        f"{preview:<38} {ws:<18} {last_active:<13} {s['source']:<6} {s['id']}"
+                    )
             return
 
         if has_titles:
@@ -298,9 +431,7 @@ def cmd_sessions(args, sessions_parser=None):
         for s in sessions:
             last_active = _relative_time(s.get("last_active"))
             preview = (
-                s.get("preview", "")[:38]
-                if has_titles
-                else s.get("preview", "")[:48]
+                s.get("preview", "")[:38] if has_titles else s.get("preview", "")[:48]
             )
             if has_titles:
                 title = (s.get("title") or "—")[:30]
@@ -317,12 +448,28 @@ def cmd_sessions(args, sessions_parser=None):
         )
 
         _filter_arg_names = (
-            "older_than", "newer_than", "before", "after",
-            "source", "title", "end_reason", "cwd",
-            "min_messages", "max_messages", "model", "provider",
-            "user", "chat_id", "chat_type", "branch",
-            "min_tokens", "max_tokens", "min_cost", "max_cost",
-            "min_tool_calls", "max_tool_calls",
+            "older_than",
+            "newer_than",
+            "before",
+            "after",
+            "source",
+            "title",
+            "end_reason",
+            "cwd",
+            "min_messages",
+            "max_messages",
+            "model",
+            "provider",
+            "user",
+            "chat_id",
+            "chat_type",
+            "branch",
+            "min_tokens",
+            "max_tokens",
+            "min_cost",
+            "max_cost",
+            "min_tool_calls",
+            "max_tool_calls",
         )
         _any_filters = any(
             getattr(args, a, None) is not None for a in _filter_arg_names
@@ -469,7 +616,9 @@ def cmd_sessions(args, sessions_parser=None):
 
             if getattr(args, "upload", False):
                 if not session_id:
-                    print("--upload exports one session: pass --session-id (or drop filters to use the most recent).")
+                    print(
+                        "--upload exports one session: pass --session-id (or drop filters to use the most recent)."
+                    )
                     db.close()
                     return
                 resolved = db.resolve_session_id(session_id)
@@ -568,7 +717,6 @@ def cmd_sessions(args, sessions_parser=None):
                     return
                 line = _json.dumps(data, ensure_ascii=False) + "\n"
                 if args.output == "-":
-
                     sys.stdout.write(line)
                 else:
                     with open(args.output, "w", encoding="utf-8") as f:
@@ -589,9 +737,7 @@ def cmd_sessions(args, sessions_parser=None):
                         return
                     sessions = [
                         s
-                        for s in (
-                            db.export_session(row["id"]) for row in candidates
-                        )
+                        for s in (db.export_session(row["id"]) for row in candidates)
                         if s
                     ]
                 else:
@@ -600,7 +746,6 @@ def cmd_sessions(args, sessions_parser=None):
                         return
                     sessions = db.export_all(source=None)
                 if args.output == "-":
-
                     for s in sessions:
                         sys.stdout.write(
                             _json.dumps(_redact(s), ensure_ascii=False) + "\n"
@@ -608,9 +753,7 @@ def cmd_sessions(args, sessions_parser=None):
                 else:
                     with open(args.output, "w", encoding="utf-8") as f:
                         for s in sessions:
-                            f.write(
-                                _json.dumps(_redact(s), ensure_ascii=False) + "\n"
-                            )
+                            f.write(_json.dumps(_redact(s), ensure_ascii=False) + "\n")
                     print(f"Exported {len(sessions)} sessions to {args.output}")
             return
 
@@ -622,10 +765,16 @@ def cmd_sessions(args, sessions_parser=None):
         )
 
         if args.output == "-":
-            print("Markdown/QMD export writes files; stdout (-) is only supported with --format jsonl.")
+            print(
+                "Markdown/QMD export writes files; stdout (-) is only supported with --format jsonl."
+            )
             db.close()
             return
-        output_dir = Path(args.output).expanduser() if args.output else get_hermes_home() / "session-exports"
+        output_dir = (
+            Path(args.output).expanduser()
+            if args.output
+            else get_hermes_home() / "session-exports"
+        )
 
         def _export_one(session_id: str, *, include_lineage: bool = False):
             data = (
@@ -664,9 +813,7 @@ def cmd_sessions(args, sessions_parser=None):
                 return
             delete_target_ids = [resolved_session_id]
             if args.delete_after_verified:
-                delete_target_ids = db.get_session_delete_targets(
-                    resolved_session_id
-                )
+                delete_target_ids = db.get_session_delete_targets(resolved_session_id)
 
             exported_items = []
             for target_id in delete_target_ids:
@@ -674,15 +821,11 @@ def cmd_sessions(args, sessions_parser=None):
                     data, exported_path = _export_one(
                         target_id,
                         include_lineage=(
-                            target_id == resolved_session_id
-                            and lineage_is_logical
+                            target_id == resolved_session_id and lineage_is_logical
                         ),
                     )
                 except FileExistsError as e:
-                    print(
-                        f"Export already exists: {e}. "
-                        "Pass --force to overwrite."
-                    )
+                    print(f"Export already exists: {e}. Pass --force to overwrite.")
                     db.close()
                     return
                 if not data or not exported_path:
@@ -695,8 +838,7 @@ def cmd_sessions(args, sessions_parser=None):
                 exported_items.append((data, exported_path))
 
             message_count = sum(
-                len(data.get("messages") or [])
-                for data, _path in exported_items
+                len(data.get("messages") or []) for data, _path in exported_items
             )
             suffix = "" if message_count == 1 else "s"
             if len(exported_items) == 1:
@@ -810,11 +952,24 @@ def cmd_sessions(args, sessions_parser=None):
         _non_time_filters = any(
             getattr(args, a, None) is not None
             for a in (
-                "source", "title", "end_reason", "cwd",
-                "min_messages", "max_messages", "model", "provider",
-                "user", "chat_id", "chat_type", "branch",
-                "min_tokens", "max_tokens", "min_cost", "max_cost",
-                "min_tool_calls", "max_tool_calls",
+                "source",
+                "title",
+                "end_reason",
+                "cwd",
+                "min_messages",
+                "max_messages",
+                "model",
+                "provider",
+                "user",
+                "chat_id",
+                "chat_type",
+                "branch",
+                "min_tokens",
+                "max_tokens",
+                "min_cost",
+                "max_cost",
+                "min_tool_calls",
+                "max_tool_calls",
             )
         )
         if (
@@ -884,7 +1039,9 @@ def cmd_sessions(args, sessions_parser=None):
             if len(candidates) > len(shown):
                 print(f"  … and {len(candidates) - len(shown)} more")
             if args.dry_run:
-                print(f"Dry run — nothing {'deleted' if action == 'prune' else 'archived'}.")
+                print(
+                    f"Dry run — nothing {'deleted' if action == 'prune' else 'archived'}."
+                )
                 return
 
         if not args.yes:
@@ -1006,9 +1163,7 @@ def cmd_sessions(args, sessions_parser=None):
     elif action == "optimize":
         db_path = db.db_path
         before_mb = (
-            os.path.getsize(db_path) / (1024 * 1024)
-            if db_path.exists()
-            else 0.0
+            os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
         )
         print("Optimizing session store (FTS merge + VACUUM)…")
         try:
@@ -1019,11 +1174,7 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"Error: optimization failed: {e}")
             db.close()
             return
-        after_mb = (
-            os.path.getsize(db_path) / (1024 * 1024)
-            if db_path.exists()
-            else 0.0
-        )
+        after_mb = os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
         # Same WAL caveat as optimize-storage: after a VACUUM the main file
         # on disk lags until the WAL is checkpointed back (refused while a
         # live gateway holds a read-mark), so stat() understates the win and
@@ -1050,8 +1201,7 @@ def cmd_sessions(args, sessions_parser=None):
             print("✓ No affected rows found — nothing to clean.")
         elif args.dry_run:
             print(
-                f"Would clear {report['rows_affected']} row(s): "
-                f"ids {report['row_ids']}"
+                f"Would clear {report['rows_affected']} row(s): ids {report['row_ids']}"
             )
         else:
             if report["backup_path"]:
@@ -1074,6 +1224,7 @@ def cmd_sessions(args, sessions_parser=None):
         do_vacuum = not getattr(args, "no_vacuum", False)
         try:
             import shutil as _shutil
+
             free_bytes = _shutil.disk_usage(db_path.parent).free
         except Exception:
             free_bytes = None
@@ -1081,20 +1232,26 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"Search-index optimization for {db_path}")
         print(f"  Current database size: {before_mb:.1f} MB")
         if free_bytes is not None:
-            print(f"  Free disk: {free_bytes / (1024*1024):.0f} MB "
-                  f"(need ~{need_bytes / (1024*1024):.0f} MB to complete"
-                  f"{' incl. VACUUM' if do_vacuum else ''})")
+            print(
+                f"  Free disk: {free_bytes / (1024 * 1024):.0f} MB "
+                f"(need ~{need_bytes / (1024 * 1024):.0f} MB to complete"
+                f"{' incl. VACUUM' if do_vacuum else ''})"
+            )
             if free_bytes < need_bytes:
                 print()
-                print("⚠ Not enough free disk to complete safely. Free up "
-                      "space, or run with --no-vacuum (rebuilds the index "
-                      "but doesn't reclaim space until a later VACUUM).")
+                print(
+                    "⚠ Not enough free disk to complete safely. Free up "
+                    "space, or run with --no-vacuum (rebuilds the index "
+                    "but doesn't reclaim space until a later VACUUM)."
+                )
                 db.close()
                 return
         if before_mb > 500:
-            print("  This may take a while on a large database. It runs in "
-                  "the foreground with progress below; safe to Ctrl-C and "
-                  "re-run (it resumes).")
+            print(
+                "  This may take a while on a large database. It runs in "
+                "the foreground with progress below; safe to Ctrl-C and "
+                "re-run (it resumes)."
+            )
         if not getattr(args, "yes", False):
             try:
                 resp = input("Proceed? [y/N] ").strip().lower()
@@ -1111,21 +1268,24 @@ def cmd_sessions(args, sessions_parser=None):
             phase = info.get("phase")
             pct = info.get("percent", 0)
             if phase == "backfill":
-                print(f"\r  Rebuilding index: {pct:3d}% "
-                      f"({info.get('indexed',0):,}/{info.get('total',0):,})",
-                      end="", flush=True)
+                print(
+                    f"\r  Rebuilding index: {pct:3d}% "
+                    f"({info.get('indexed', 0):,}/{info.get('total', 0):,})",
+                    end="",
+                    flush=True,
+                )
             elif phase != _last["phase"]:
-                label = {"teardown": "Reclaiming old index",
-                         "vacuum": "Compacting database (VACUUM)",
-                         "done": "Done"}.get(phase, phase)
+                label = {
+                    "teardown": "Reclaiming old index",
+                    "vacuum": "Compacting database (VACUUM)",
+                    "done": "Done",
+                }.get(phase, phase)
                 print(f"\n  {label}…", flush=True)
             _last["phase"] = phase
 
         print("Optimizing search-index storage…")
         try:
-            result = db.optimize_fts_storage(
-                progress_cb=_progress, vacuum=do_vacuum
-            )
+            result = db.optimize_fts_storage(progress_cb=_progress, vacuum=do_vacuum)
         except Exception as e:
             print(f"\nError: optimization failed: {e}")
             print("No data was lost. Re-run to resume.")
@@ -1135,9 +1295,7 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"\nCould not optimize: {result.get('reason', 'unknown')}")
             db.close()
             return
-        after_mb = (
-            os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
-        )
+        after_mb = os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
         # Prefer SQLite's own page accounting over stat(). In WAL mode a
         # VACUUM's rewrite sits in the -wal file until a checkpoint folds it
         # back, and that checkpoint is refused while another connection (a
@@ -1155,8 +1313,10 @@ def cmd_sessions(args, sessions_parser=None):
             f"({_size_delta_label(saved)})"
         )
         if result.get("vacuumed") is False:
-            print("  (VACUUM was skipped or failed — run "
-                  "`hermes sessions optimize` later to reclaim freed space.)")
+            print(
+                "  (VACUUM was skipped or failed — run "
+                "`hermes sessions optimize` later to reclaim freed space.)"
+            )
 
     elif action == "repair-routing":
         records = db.find_orphaned_gateway_sessions(
@@ -1164,42 +1324,53 @@ def cmd_sessions(args, sessions_parser=None):
         )
         adoptable = [r for r in records if r["adoptable"]]
         for record in records:
-            print(f"{record['orphan_id']}  ({record['source']}, "
-                  f"{record['message_count']} messages)")
+            print(
+                f"{record['orphan_id']}  ({record['source']}, "
+                f"{record['message_count']} messages)"
+            )
             if record["adoptable"]:
-                print(f"  → adopt into {record['session_key']} "
-                      f"(from {record['donor_id']}, "
-                      f"evidence: {record['evidence']})")
+                print(
+                    f"  → adopt into {record['session_key']} "
+                    f"(from {record['donor_id']}, "
+                    f"evidence: {record['evidence']})"
+                )
             else:
                 print(f"  ✗ not repairable — {record['reason']}")
 
         if not records:
             print("✓ No gateway sessions are missing their routing identity.")
         elif not adoptable:
-            print(f"\n{len(records)} orphaned session(s) found, none "
-                  "unambiguously repairable. Nothing to do.")
+            print(
+                f"\n{len(records)} orphaned session(s) found, none "
+                "unambiguously repairable. Nothing to do."
+            )
         elif not getattr(args, "apply", False):
-            print(f"\n{len(adoptable)} of {len(records)} orphaned session(s) "
-                  "can be repaired. Re-run with --apply to perform them.")
+            print(
+                f"\n{len(adoptable)} of {len(records)} orphaned session(s) "
+                "can be repaired. Re-run with --apply to perform them."
+            )
         else:
             # A running gateway holds the old routing mapping in memory and
             # would write it back over the repair on its next save.
-            print("\nStop the gateway before applying — a running gateway "
-                  "still holds the old routing mapping in memory.")
-            if _confirm_prompt(
-                f"Adopt {len(adoptable)} orphaned session(s)? [y/N] "
-            ):
+            print(
+                "\nStop the gateway before applying — a running gateway "
+                "still holds the old routing mapping in memory."
+            )
+            if _confirm_prompt(f"Adopt {len(adoptable)} orphaned session(s)? [y/N] "):
                 repaired = 0
                 for record in adoptable:
                     if db.adopt_orphaned_gateway_session(
                         record["orphan_id"], record["donor_id"]
                     ):
                         repaired += 1
-                        print(f"✓ {record['orphan_id']} now owns "
-                              f"{record['session_key']}")
+                        print(
+                            f"✓ {record['orphan_id']} now owns {record['session_key']}"
+                        )
                     else:
-                        print(f"✗ {record['orphan_id']} was not adopted "
-                              "(the row changed since it was reported)")
+                        print(
+                            f"✗ {record['orphan_id']} was not adopted "
+                            "(the row changed since it was reported)"
+                        )
                 print(f"\nRepaired {repaired} of {len(adoptable)} session(s).")
             else:
                 print("Aborted — nothing was changed.")

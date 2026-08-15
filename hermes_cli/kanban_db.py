@@ -88,7 +88,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -10939,6 +10939,48 @@ def _unresolved_run_stats(conn: sqlite3.Connection) -> dict:
 #: diagnostic matches on (kanban_diagnostics.py), deliberately: two definitions
 #: of "waiting for review" that could drift apart would be worse than one.
 _REVIEW_REQUIRED_REASON_PREFIX = "review-required:"
+_NEEDS_WORK_REASON_PREFIX = "needs_work:"
+_REVIEW_HOLD_REASON_RE = re.compile(r"^review_r\d+_hold(?:\b|:)", re.IGNORECASE)
+
+
+def _needs_input_reason_subset_stats(
+    conn: sqlite3.Connection,
+    human_stopped_statuses: list[str],
+    matches: Callable[[str], bool],
+) -> int:
+    """Count stopped needs-input rows whose current reason matches ``matches``.
+
+    The task stores only the block kind. The reason that is currently in force
+    lives on the latest ``blocked`` or ``block_loop_detected`` event, so every
+    reason-derived aggregate must use the same event selection and must never
+    expose the reason itself.
+    """
+    placeholders = ", ".join("?" for _ in human_stopped_statuses)
+    rows = conn.execute(
+        "SELECT p.id FROM tasks p "
+        f"WHERE p.block_kind = 'needs_input' AND p.status IN ({placeholders})",
+        human_stopped_statuses,
+    ).fetchall()
+
+    matched = 0
+    for row in rows:
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected') "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if event is None:
+            continue
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if matches(str(payload.get("reason") or "").strip()):
+            matched += 1
+    return matched
 
 def _awaiting_review_stats(
     conn: sqlite3.Connection, human_stopped_statuses: list[str]
@@ -10961,45 +11003,35 @@ def _awaiting_review_stats(
     the starvation case.
 
     Deliberately a strict subset of the ``needs_input`` count above -- same
-    ``block_kind`` and same ``blocked``/``triage`` scope -- so the two numbers
-    reconcile and the remainder is a real "waiting on a person" figure. Counts
-    only: no id, title, or reason text leaves this function.
+    ``block_kind`` and same ``blocked``/``triage`` scope. The owner-facing
+    remainder must also subtract the distinct builder-correction subset below.
+    Counts only: no id, title, or reason text leaves this function.
     """
-    placeholders = ", ".join("?" for _ in human_stopped_statuses)
-    rows = conn.execute(
-        "SELECT p.id FROM tasks p "
-        f"WHERE p.block_kind = 'needs_input' AND p.status IN ({placeholders})",
+    return _needs_input_reason_subset_stats(
+        conn,
         human_stopped_statuses,
-    ).fetchall()
+        lambda reason: reason.lower().startswith(_REVIEW_REQUIRED_REASON_PREFIX),
+    )
 
-    awaiting = 0
-    for row in rows:
-        # Both kinds carry the reason that set the block currently in force.
-        # `blocked` alone is not enough: BLOCK_RECURRENCE_LIMIT re-routes a
-        # repeatedly-blocked row to `triage` and records the new reason under
-        # `block_loop_detected`, so reading only `blocked` would answer with a
-        # superseded reason -- and `triage` is half of this function's own
-        # population. Ordered by `id`, not `created_at`: block and re-block
-        # land in the same second routinely, which is exactly when the
-        # distinction matters.
-        event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected') "
-            "ORDER BY id DESC LIMIT 1",
-            (row["id"],),
-        ).fetchone()
-        if event is None:
-            continue
-        try:
-            payload = json.loads(event["payload"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        reason = str(payload.get("reason") or "").strip().lower()
-        if reason.startswith(_REVIEW_REQUIRED_REASON_PREFIX):
-            awaiting += 1
-    return awaiting
+
+def _needs_work_stats(
+    conn: sqlite3.Connection, human_stopped_statuses: list[str]
+) -> int:
+    """How many needs-input rows are a builder correction, not an owner ask.
+
+    ``needs_work:`` and ``REVIEW_R<n>_HOLD`` are explicit reviewer-to-builder
+    routing markers. They can be emitted under ``needs_input`` even though the
+    next action is code or evidence repair. Keep the aggregate disjoint from
+    review-required handoffs and expose only its count.
+    """
+    return _needs_input_reason_subset_stats(
+        conn,
+        human_stopped_statuses,
+        lambda reason: (
+            reason.lower().startswith(_NEEDS_WORK_REASON_PREFIX)
+            or _REVIEW_HOLD_REASON_RE.match(reason) is not None
+        ),
+    )
 
 
 def _needs_input_stats(conn: sqlite3.Connection) -> dict:
@@ -11156,6 +11188,9 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     capability_rows, oldest_capability, capability_children = _for_kind("capability")
     untyped_rows, oldest_untyped, untyped_children = _for_kind(None)
     awaiting_review_rows = _awaiting_review_stats(conn, human_stopped_statuses)
+    needs_work_rows = _needs_work_stats(conn, human_stopped_statuses)
+    if awaiting_review_rows + needs_work_rows > needs_input_rows:
+        raise ValueError("needs-input reason subsets exceed needs-input rows")
 
     return {
         "needs_input_rows": needs_input_rows,
@@ -11171,6 +11206,11 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
         # whole queue as one number tells an operator that 53 things need them
         # when most need a handoff that silently never happens.
         "needs_input_awaiting_review_rows": awaiting_review_rows,
+        # Strict subset of `needs_input_rows`: reviewer-to-builder correction
+        # markers, not a question or action for the owner. The CLI projection
+        # deliberately returns the count only; task IDs and review reasons stay
+        # inside the board database.
+        "needs_input_needs_work_rows": needs_work_rows,
         # A hard wall the agent cannot pass: no access, missing credentials, an
         # action no AI agent can perform. The schema calls it "genuinely
         # human-only", so it belongs in the same queue as needs_input but is a
@@ -11283,6 +11323,13 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         # handoff that no dispatcher will ever make, rather than on a person.
         "needs_input_awaiting_review_rows": needs_input[
             "needs_input_awaiting_review_rows"
+        ],
+        # Strict subset of `needs_input_rows`: review findings whose explicit
+        # next action is code or evidence correction by the builder/CTO, not a
+        # decision from the owner. Count-only for the same privacy boundary as
+        # the adjacent review-handoff aggregate.
+        "needs_input_needs_work_rows": needs_input[
+            "needs_input_needs_work_rows"
         ],
         # The other two kinds the schema comment (kanban_db.py:110-125) routes
         # to a human. `capability` is a hard wall -- no access, missing creds,

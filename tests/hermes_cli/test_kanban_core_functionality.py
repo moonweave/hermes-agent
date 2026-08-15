@@ -1885,6 +1885,37 @@ def test_board_stats_separates_review_handoffs_from_questions_for_a_person(kanba
     # `capability` keeps its own bucket and contributes nothing here.
     assert stats["capability_rows"] == 1
 
+
+def test_board_stats_separates_builder_corrections_from_owner_questions(kanban_home):
+    """Review HOLDs must not inflate the queue sent to the owner."""
+    with kb.connect() as conn:
+
+        def _blocked(title, reason):
+            task_id = kb.create_task(conn, title=title, assignee="builder")
+            kb.claim_task(conn, task_id)
+            assert kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+            return task_id
+
+        _blocked("builder correction", "needs_work: fix reviewer finding")
+        _blocked("review hold", "REVIEW_R12_HOLD: refresh evidence")
+        _blocked("an actual operator ask", "operator: select the release window")
+
+        stats = kb.board_stats(conn)
+
+    assert stats["needs_input_rows"] == 3
+    assert stats["needs_input_awaiting_review_rows"] == 0
+    assert stats["needs_input_needs_work_rows"] == 2
+    assert (
+        stats["needs_input_rows"]
+        - stats["needs_input_awaiting_review_rows"]
+        - stats["needs_input_needs_work_rows"]
+        == 1
+    )
+    serialized = json.dumps(stats)
+    assert "fix reviewer finding" not in serialized
+    assert "refresh evidence" not in serialized
+
+
 def test_a_later_block_reason_replaces_an_earlier_one_in_the_review_split(kanban_home):
     """Only the reason currently in force decides, whichever event carries it.
 
@@ -1910,7 +1941,7 @@ def test_a_later_block_reason_replaces_an_earlier_one_in_the_review_split(kanban
         assert kb.block_task(
             conn,
             task_id,
-            reason="needs_work: which origin should this use?",
+            reason="operator: which origin should this use?",
             kind="needs_input",
         )
 

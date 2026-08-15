@@ -26,6 +26,7 @@ three bypass the agent entirely. The tools are for dispatcher-spawned
 worker handoffs and for configured orchestrator profiles that route work
 through the board.
 """
+
 from __future__ import annotations
 
 import json
@@ -55,6 +56,7 @@ def _profile_has_kanban_toolset() -> bool:
     # (~30s) by the tool registry.
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config()
         toolsets = cfg.get("toolsets", [])
         return "kanban" in toolsets
@@ -138,6 +140,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
@@ -224,6 +227,7 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+
     return kb, kb.connect(board=board)
 
 
@@ -245,6 +249,7 @@ def _goal_judge_available() -> bool:
     """
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
+
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
         return False
@@ -324,6 +329,7 @@ def heartbeat_current_worker_from_env() -> bool:
     if not tid:
         return False
     import time as _time
+
     now = _time.monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
@@ -386,6 +392,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     global _comment_poll_last_attempt
     import time as _time
+
     now = _time.monotonic()
     if (now - _comment_poll_last_attempt) < _COMMENT_POLL_MIN_INTERVAL_SECONDS:
         return False
@@ -417,7 +424,9 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     _comment_watermark[tid] = max(c.id for c in rows)
 
     own = (os.environ.get("HERMES_PROFILE") or "").strip()
-    fresh = [c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()]
+    fresh = [
+        c for c in rows if (c.author or "").strip() != own and (c.body or "").strip()
+    ]
     if not fresh:
         return False
 
@@ -514,14 +523,13 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -537,12 +545,17 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _task_dict(t):
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
+                    "id": t.id,
+                    "title": t.title,
+                    "body": t.body,
+                    "assignee": t.assignee,
+                    "status": t.status,
+                    "tenant": t.tenant,
+                    "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
+                    "created_by": t.created_by,
+                    "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
                     "result": t.result,
@@ -553,11 +566,15 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _run_dict(r):
                 return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
+                    "id": r.id,
+                    "profile": r.profile,
+                    "status": r.status,
+                    "outcome": r.outcome,
+                    "summary": r.summary,
+                    "error": r.error,
                     "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
                 }
 
             return json.dumps({
@@ -565,14 +582,17 @@ def _handle_show(args: dict, **kw) -> str:
                 "parents": parents,
                 "children": children,
                 "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
+                    {"author": c.author, "body": c.body, "created_at": c.created_at}
                     for c in comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
+                    {
+                        "kind": e.kind,
+                        "payload": e.payload,
+                        "created_at": e.created_at,
+                        "run_id": e.run_id,
+                    }
+                    for e in events[-50:]  # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
                 # Also surface the worker's own context block so the
@@ -639,7 +659,8 @@ def _handle_list(args: dict, **kw) -> str:
                 "truncated": truncated,
                 "next_limit": (
                     min(limit * 2, KANBAN_LIST_MAX_LIMIT)
-                    if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
+                    if truncated and limit < KANBAN_LIST_MAX_LIMIT
+                    else None
                 ),
                 "promoted": promoted,
             })
@@ -659,9 +680,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -691,9 +710,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"{type(created_cards).__name__}"
             )
         # Normalise: strings only, stripped, non-empty.
-        created_cards = [
-            str(c).strip() for c in created_cards if str(c).strip()
-        ]
+        created_cards = [str(c).strip() for c in created_cards if str(c).strip()]
     if artifacts is not None:
         if isinstance(artifacts, str):
             # Accept a single path as a string for convenience.
@@ -703,9 +720,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"artifacts must be a list of file paths, got "
                 f"{type(artifacts).__name__}"
             )
-        artifacts = [
-            str(p).strip() for p in artifacts if str(p).strip()
-        ]
+        artifacts = [str(p).strip() for p in artifacts if str(p).strip()]
         # Carry the artifact list inside metadata so it rides the
         # existing completed-event payload without a schema change at
         # the DB layer.  The gateway notifier reads payload['artifacts']
@@ -716,8 +731,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata = {}
             elif not isinstance(metadata, dict):
                 return tool_error(
-                    f"metadata must be an object/dict, got "
-                    f"{type(metadata).__name__}"
+                    f"metadata must be an object/dict, got {type(metadata).__name__}"
                 )
             # Don't overwrite an existing metadata.artifacts the worker
             # passed manually — merge instead.
@@ -734,9 +748,7 @@ def _handle_complete(args: dict, **kw) -> str:
             else:
                 metadata["artifacts"] = artifacts
     if not (summary or result):
-        return tool_error(
-            "provide at least one of: summary (preferred), result"
-        )
+        return tool_error("provide at least one of: summary (preferred), result")
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
@@ -767,8 +779,11 @@ def _handle_complete(args: dict, **kw) -> str:
 
             try:
                 ok = kb.complete_task(
-                    conn, tid,
-                    result=result, summary=summary, metadata=metadata,
+                    conn,
+                    tid,
+                    result=result,
+                    summary=summary,
+                    metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
@@ -799,6 +814,22 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.CompletionEvidenceError as ev_err:
+                # Same structured-rejection contract as the phantom-card
+                # gate above: nothing was mutated, so a corrected retry
+                # works. The difference is that retrying is not always the
+                # right move here — if the work genuinely did not happen,
+                # blocking is the honest outcome and the message has to say
+                # so, or the model will keep inventing paths to get past
+                # the gate.
+                return tool_error(
+                    f"{ev_err}\n"
+                    f"Your task is still in-flight (no state change). Either "
+                    f"retry kanban_complete with the paths you really changed, "
+                    f'or call kanban_block with kind="capability" if you could '
+                    f"not make the change — blocking is the correct outcome when "
+                    f"there is nothing to show."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
@@ -821,9 +852,7 @@ def _handle_block(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -851,11 +880,7 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
-        if (
-            task
-            and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
-        ):
+        if task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS:
             conn.close()
             return tool_error(
                 f"goal_mode tasks can only block with kind in "
@@ -866,15 +891,15 @@ def _handle_block(args: dict, **kw) -> str:
             )
         try:
             ok = kb.block_task(
-                conn, tid,
+                conn,
+                tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
                 return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"could not block {tid} (unknown id or not in running/ready)"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
@@ -902,9 +927,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -945,7 +968,8 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "requesting review."
                 )
             ok, fail_reason = kb.request_review(
-                conn, tid,
+                conn,
+                tid,
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
@@ -954,9 +978,7 @@ def _handle_request_review(args: dict, **kw) -> str:
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
-                return tool_error(
-                    f"could not request review for {tid}: {detail}"
-                )
+                return tool_error(f"could not request review for {tid}: {detail}")
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
             return _ok(
@@ -980,9 +1002,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1036,9 +1056,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1130,9 +1148,7 @@ def _handle_attach(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1144,6 +1160,7 @@ def _handle_attach(args: dict, **kw) -> str:
         return tool_error("content_base64 is required")
     import base64
     import binascii
+
     try:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
@@ -1222,11 +1239,15 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
             if resp.is_redirect:
                 location = resp.headers.get("location")
                 if not location:
-                    raise ValueError(f"redirect without Location header from {current_url}")
+                    raise ValueError(
+                        f"redirect without Location header from {current_url}"
+                    )
                 current_url = urljoin(current_url, location)
                 continue
             resp.raise_for_status()
-            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip() or None
+            content_type = (resp.headers.get("content-type") or "").split(";")[
+                0
+            ].strip() or None
             for chunk in resp.iter_bytes(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
@@ -1252,9 +1273,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
@@ -1266,6 +1285,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
     if not filename or not str(filename).strip():
         # Derive a name from the URL path's leaf component.
         from urllib.parse import unquote, urlparse
+
         leaf = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip()
         filename = leaf or "download"
     content_type = args.get("content_type")
@@ -1305,9 +1325,7 @@ def _handle_attachments(args: dict, **kw) -> str:
     """List a task's attachments (read-only; no ownership restriction)."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1449,7 +1467,8 @@ def _handle_create(args: dict, **kw) -> str:
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
+                    if max_runtime_seconds is not None
+                    else None
                 ),
                 skills=skills,
                 model_override=model_override,
@@ -1532,6 +1551,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     chat_id = ""
     try:
         from gateway.session_context import get_session_env
+
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
@@ -1548,9 +1568,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             # every CLI invocation, which is exactly the over-eager
             # behaviour that got #19718 reverted upstream. The TUI
             # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
+            session_key = get_session_env("HERMES_SESSION_KEY", "") or os.environ.get(
+                "HERMES_SESSION_KEY", ""
             )
             if not session_key:
                 return False  # CLI / cron / test — no persistent channel
@@ -1560,13 +1579,13 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
-        )
+        notifier_profile = get_session_env(
+            "HERMES_SESSION_PROFILE", ""
+        ) or os.environ.get("HERMES_PROFILE")
         if not notifier_profile:
             try:
                 from hermes_cli.profiles import get_active_profile_name
+
                 notifier_profile = get_active_profile_name() or "default"
             except Exception:
                 notifier_profile = "default"
@@ -1588,11 +1607,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+
         _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=thread_id, user_id=user_id,
+            thread_id=thread_id,
+            user_id=user_id,
             notifier_profile=notifier_profile,
             delivery_metadata=delivery_metadata or None,
         )
@@ -1600,7 +1623,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     except Exception as _exc:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
-            _exc, platform, bool(chat_id),
+            _exc,
+            platform,
+            bool(chat_id),
         )
         return False
 
@@ -1689,6 +1714,7 @@ def _board_schema_prop() -> dict[str, str]:
     """
     return {"type": "string", "description": _DESC_BOARD}
 
+
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
@@ -1734,8 +1760,13 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage",
+                    "todo",
+                    "ready",
+                    "running",
+                    "blocked",
+                    "done",
+                    "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1764,7 +1795,12 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "tests_run, decisions, findings, etc). ``metadata.changed_files`` "
+        "is verified, not decorative: when the card declares an evidence "
+        "repository, the kernel asks git whether those paths actually "
+        "differ and refuses the completion if they do not. If you could "
+        'not make the change, block with kind="capability" — that is '
+        "the correct outcome, not a failure. At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -1795,8 +1831,8 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    'attempt — {"changed_files": [...], "tests_run": 12, '
+                    '"findings": [...]}. Surfaced to downstream '
                     "workers alongside ``summary``."
                 ),
             },
@@ -1832,8 +1868,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Optional list of absolute paths to deliverable "
                     "files you produced during this run — generated "
                     "charts, PDFs, spreadsheets, images, archives. "
-                    "Examples: [\"/tmp/q3-revenue.png\", "
-                    "\"/tmp/report.pdf\"]. The gateway notifier "
+                    'Examples: ["/tmp/q3-revenue.png", '
+                    '"/tmp/report.pdf"]. The gateway notifier '
                     "uploads each path as a native attachment to the "
                     "subscribed chat (images embed inline, everything "
                     "else uploads as a file) so the deliverable "
@@ -1933,8 +1969,12 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "metadata": {
                 "type": "object",
                 "description": (
-                    "Optional structured handoff facts for the reviewer, such "
-                    "as changed_files, tests_run, commit, or decisions."
+                    "Structured handoff facts for the reviewer, such as "
+                    "changed_files, tests_run, commit, or decisions. List "
+                    "every path you changed in ``changed_files``: you are "
+                    "the one who knows, and if the card declares an "
+                    "evidence repository the reviewer's completion is "
+                    "checked against this list."
                 ),
                 "additionalProperties": True,
             },
@@ -2337,7 +2377,7 @@ KANBAN_LINK_SCHEMA = {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
-            "child_id":  {"type": "string", "description": "Child task id."},
+            "child_id": {"type": "string", "description": "Child task id."},
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],

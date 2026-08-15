@@ -1404,6 +1404,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    evidence_repo = args.get("evidence_repo")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1461,6 +1462,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                evidence_repo=evidence_repo,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
@@ -2238,6 +2240,23 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "evidence_repo": {
+                "type": "string",
+                "description": (
+                    "Absolute path to the repository this task's completion "
+                    "is checked against. Set it whenever the card asks for a "
+                    "code change: the kernel then refuses to close the card "
+                    "unless git shows the paths the worker claims to have "
+                    "changed actually differ. No commit is needed — a dirty "
+                    "working tree or a new file is enough. Say in the body "
+                    "that the worker must list what it changed in "
+                    "metadata.changed_files, and that blocking with "
+                    "kind=\"capability\" is the right answer if it cannot "
+                    "make the change. Leave this out for probes, syntheses, "
+                    "reviews and anything else that legitimately produces no "
+                    "code — the check does nothing unless a repo is named."
                 ),
             },
             "project": {

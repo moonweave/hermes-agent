@@ -5167,7 +5167,7 @@ def _verify_completion_evidence(
     """
     claimed, commit, _source = _claimed_change_evidence(conn, task_id, metadata)
     repo = Path(evidence_repo).expanduser()
-    changed = _git_changed_paths(repo, base_sha=None)
+    changed = _git_changed_paths(repo)
     if changed is None:
         return f"{repo} is not a readable git repository", claimed, None
     if not claimed:
@@ -7722,38 +7722,48 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         return Path(out).expanduser()
 
 
-def _git_changed_paths(
-    repo: Path, base_sha: Optional[str] = None
-) -> Optional[set[str]]:
-    """Paths that differ from ``HEAD`` (or from ``base_sha``), or ``None``.
+def _git_changed_paths(repo: Path) -> Optional[set[str]]:
+    """Every path the working tree has touched since ``HEAD``, or ``None``.
 
     ``None`` means the question could not be asked — the path is missing, is not
     a git repository, or git failed. That is deliberately distinct from the
     empty set, which means "asked, and nothing changed": a completion gate must
     refuse both, but only the second is the worker's fault.
 
-    Working-tree diff rather than commit range, because the cards in this
+    Working-tree state rather than commit range, because the cards in this
     install routinely forbid committing. Measured 2026-08-14: the one task that
     genuinely did its work left 23 modified files and zero commits, so a gate
     that demanded a commit range would have rejected the honest case and passed
     nothing at all.
+
+    Untracked files count. ``git diff`` alone cannot see a file that did not
+    exist at ``HEAD``, so a worker asked to write a new module would have had
+    its honest work refused. ``--exclude-standard`` keeps build output and
+    ignored files from passing as evidence.
     """
-    against = base_sha if base_sha else "HEAD"
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), "diff", "--name-only", against],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            check=False,
+    seen: set[str] = set()
+    for argv in (
+        ["diff", "--name-only", "HEAD"],
+        ["ls-files", "--others", "--exclude-standard"],
+    ):
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), *argv],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        seen.update(
+            line.strip() for line in (result.stdout or "").splitlines() if line.strip()
         )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    return seen
 
 
 def _git_commit_exists(repo: Path, sha: str) -> bool:

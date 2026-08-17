@@ -1591,3 +1591,47 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_board_stats_reports_the_completion_evidence_gate(kanban_home, tmp_path):
+    """A zero refusal count is unreadable without knowing how many cards are armed.
+
+    "Nobody claimed a false completion" and "no card asks for evidence" are
+    opposite facts that both render as 0 refusals, so the armed count ships
+    beside them. Retries are separated from rows: one card that corrected its
+    claim twice is one row and three events, not three bad cards.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    conn = kb.connect()
+    try:
+        empty = kb.board_stats(conn)
+        assert empty["completion_evidence_armed_rows"] == 0
+        assert empty["completion_evidence_blocked_rows"] == 0
+        assert empty["completion_evidence_blocked_events"] == 0
+
+        armed = kb.create_task(
+            conn, title="armed", assignee="builder", evidence_repo=str(repo),
+        )
+        kb.create_task(conn, title="not armed", assignee="builder")
+        assert kb.board_stats(conn)["completion_evidence_armed_rows"] == 1
+
+        for _ in range(3):
+            with pytest.raises(kb.CompletionEvidenceError):
+                kb.complete_task(
+                    conn, armed, summary="done",
+                    metadata={"changed_files": ["untouched.py"]},
+                )
+
+        stats = kb.board_stats(conn)
+        assert stats["completion_evidence_armed_rows"] == 1
+        assert stats["completion_evidence_blocked_rows"] == 1
+        assert stats["completion_evidence_blocked_events"] == 3
+
+        # Counts only: no path, repository, or task id may ride along.
+        serialized = repr(sorted(stats.items()))
+        assert str(repo) not in serialized
+        assert "untouched.py" not in serialized
+        assert armed not in serialized
+    finally:
+        conn.close()

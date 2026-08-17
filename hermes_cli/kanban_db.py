@@ -11345,6 +11345,42 @@ def _running_activity_stats(
     return by_assignee, totals
 
 
+def _completion_evidence_stats(conn: sqlite3.Connection) -> dict[str, int]:
+    """How often the completion-evidence gate refused a close, and on how many rows.
+
+    The gate already refuses and records ``completion_blocked_no_evidence``, but
+    that record only ever reached whoever read the board database. An operator
+    watching a screen could not tell the difference between "nobody claimed a
+    false completion this week" and "the gate is not switched on anywhere",
+    which are opposite facts.
+
+    ``rows`` is the number of distinct cards that hit the gate; ``events`` is
+    the number of refusals, so a card that retried three times before getting
+    its paths right shows as 1 row and 3 events. ``armed_rows`` counts the cards
+    that declared an evidence repository at all -- without it a zero refusal
+    count is unreadable.
+
+    Counts only. No task identifier, claimed path, or repository path leaves
+    this function: the refusal payload holds all three and none of them are a
+    number.
+    """
+    refused = conn.execute(
+        "SELECT COUNT(DISTINCT task_id) AS rows, COUNT(*) AS events "
+        "FROM task_events WHERE kind = 'completion_blocked_no_evidence'"
+    ).fetchone()
+    armed = conn.execute(
+        "SELECT COUNT(*) AS armed FROM tasks "
+        "WHERE evidence_repo IS NOT NULL AND TRIM(evidence_repo) <> ''"
+    ).fetchone()
+    return {
+        "completion_evidence_armed_rows": int((armed["armed"] if armed else 0) or 0),
+        "completion_evidence_blocked_rows": int((refused["rows"] if refused else 0) or 0),
+        "completion_evidence_blocked_events": int(
+            (refused["events"] if refused else 0) or 0
+        ),
+    }
+
+
 def _blocked_cause_stats(conn: sqlite3.Connection) -> dict[str, int]:
     """Aggregate split of blocked rows by whether the runtime ever ran them.
 
@@ -11924,6 +11960,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         now=now,
     )
     blocked_causes = _blocked_cause_stats(conn)
+    completion_evidence = _completion_evidence_stats(conn)
     staleness = _board_staleness_stats(conn)
     if staleness["blocked_rows"] != by_status.get("blocked", 0):
         raise ValueError("staleness blocked total does not reconcile with by_status")
@@ -11936,6 +11973,10 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "activity_by_assignee": activity_by_assignee,
         "activity_totals": activity_totals,
         "blocked_causes": blocked_causes,
+        # How the completion-evidence gate is doing. Without `armed_rows` a zero
+        # refusal count reads as "nothing false was claimed" when it may mean
+        # "no card asks for evidence", which are opposite facts.
+        **completion_evidence,
         "oldest_ready_age_seconds": oldest_ready_age,
         # When a task on this board last finished. Heartbeats, comments and a
         # re-dispatch loop all record events without finishing anything, so

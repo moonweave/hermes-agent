@@ -1405,6 +1405,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     evidence_repo = args.get("evidence_repo")
+    supersedes = args.get("supersedes")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1463,6 +1464,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 evidence_repo=evidence_repo,
+                supersedes=supersedes,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
@@ -2253,10 +2255,26 @@ KANBAN_CREATE_SCHEMA = {
                     "working tree or a new file is enough. Say in the body "
                     "that the worker must list what it changed in "
                     "metadata.changed_files, and that blocking with "
-                    "kind=\"capability\" is the right answer if it cannot "
+                    'kind="capability" is the right answer if it cannot '
                     "make the change. Leave this out for probes, syntheses, "
                     "reviews and anything else that legitimately produces no "
                     "code — the check does nothing unless a repo is named."
+                ),
+            },
+            "supersedes": {
+                "type": "string",
+                "description": (
+                    "Task id of an earlier card this one replaces. Set it "
+                    "whenever you create a card because a previous one is "
+                    "stuck and you are moving the work to a fresh row — a "
+                    "re-review after a review blocked, a second attempt after "
+                    "the first hit a wall. The old card is left exactly as it "
+                    "is: nothing here closes, unblocks or deletes it. It only "
+                    "stops the old row from being counted as one more thing "
+                    "waiting on the operator, which is what happens today — "
+                    "abandoned cards accumulate in that queue and the operator "
+                    "cannot tell them from the real asks. Leave this out for "
+                    "a card that is genuinely new work rather than a retry."
                 ),
             },
             "project": {

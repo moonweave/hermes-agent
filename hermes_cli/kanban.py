@@ -77,6 +77,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "evidence_repo": t.evidence_repo,
+        "supersedes": t.supersedes,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -439,6 +440,16 @@ def build_parser(
         "completion is refused. Omit for work that "
         "legitimately produces no code — the check is "
         "off unless a repo is named.",
+    )
+    p_create.add_argument(
+        "--supersedes",
+        default=None,
+        metavar="TASK_ID",
+        help="Task id this card replaces. Use it when an "
+        "earlier card is stuck and the work is moving to "
+        "this one. The old card is left untouched — it is "
+        "not closed, unblocked or deleted — but it stops "
+        "counting as another item waiting on the operator.",
     )
     p_create.add_argument(
         "--model",
@@ -1796,6 +1807,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             evidence_repo=getattr(args, "evidence_repo", None),
+            supersedes=getattr(args, "supersedes", None),
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),

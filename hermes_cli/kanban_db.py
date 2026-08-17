@@ -990,6 +990,11 @@ class Task:
     # changed actually differ, and refuses the completion if they do not.
     # Name matches the ``--evidence-repo`` CLI flag on ``kanban create``.
     evidence_repo: Optional[str] = None
+    # Id of the earlier card this one replaces, or ``None`` if it replaces
+    # nothing. Purely declarative: the superseded row is not touched, and
+    # this never causes anything to run. Name matches the ``--supersedes``
+    # CLI flag on ``kanban create``.
+    supersedes: Optional[str] = None
     # When True, the dispatched worker runs in a Ralph-style goal loop
     # (the same engine behind the ``/goal`` slash command): after each
     # turn an auxiliary judge model evaluates the worker's response
@@ -1100,6 +1105,11 @@ class Task:
             evidence_repo=(
                 row["evidence_repo"]
                 if "evidence_repo" in keys and row["evidence_repo"]
+                else None
+            ),
+            supersedes=(
+                row["supersedes"]
+                if "supersedes" in keys and row["supersedes"]
                 else None
             ),
             goal_mode=(
@@ -1288,6 +1298,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set, ``complete_task`` asks git whether the claimed paths actually
     -- differ and refuses the completion if they do not.
     evidence_repo        TEXT,
+    -- The id of an earlier card this one was created to replace. NULL (the
+    -- common case) means this card stands on its own. Set it when a blocked
+    -- card is abandoned in place and the work continues on a fresh row, so
+    -- the old row can be reported as debris instead of as an open ask: the
+    -- pattern is a review that blocks, a re-review that also blocks, and a
+    -- third card that finishes the job while the first two sit in the
+    -- operator's queue forever. Never enforced as a foreign key and never
+    -- acted on -- the superseded row keeps its own status, and nothing here
+    -- closes, deletes, or unblocks it. It only tells the stats which rows
+    -- stopped being questions.
+    supersedes           TEXT,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -2501,6 +2522,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # worker's word. Declaring a path opts the card into the gate.
         _add_column_if_missing(conn, "tasks", "evidence_repo", "evidence_repo TEXT")
 
+    if "supersedes" not in cols:
+        # The earlier card this one replaces. NULL for every existing row,
+        # which is the honest default: nothing retroactively claims that an
+        # old blocked card was superseded. Only cards created after this
+        # column exists can say so, and only by declaring it.
+        _add_column_if_missing(conn, "tasks", "supersedes", "supersedes TEXT")
+
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
@@ -3037,6 +3065,7 @@ def create_task(
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     evidence_repo: Optional[str] = None,
+    supersedes: Optional[str] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -3367,11 +3396,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, evidence_repo,
+                        skills, max_retries, evidence_repo, supersedes,
                         model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3394,6 +3423,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         (evidence_repo.strip() or None) if evidence_repo else None,
+                        (supersedes.strip() or None) if supersedes else None,
                         model_override,
                         provider_override,
                         reasoning_effort,
@@ -11374,7 +11404,9 @@ def _completion_evidence_stats(conn: sqlite3.Connection) -> dict[str, int]:
     ).fetchone()
     return {
         "completion_evidence_armed_rows": int((armed["armed"] if armed else 0) or 0),
-        "completion_evidence_blocked_rows": int((refused["rows"] if refused else 0) or 0),
+        "completion_evidence_blocked_rows": int(
+            (refused["rows"] if refused else 0) or 0
+        ),
         "completion_evidence_blocked_events": int(
             (refused["events"] if refused else 0) or 0
         ),
@@ -11729,6 +11761,50 @@ def _needs_work_stats(
     )
 
 
+def _superseded_stats(
+    conn: sqlite3.Connection, human_stopped_statuses: list[str]
+) -> int:
+    """How many stopped rows a later card has declared it replaces.
+
+    A blocked card is not always a live question. The recurring shape is a
+    reviewer card that blocks, a re-review card that also blocks, and a third
+    card that finishes the work — while the first two keep sitting in the
+    operator's queue. Measured on one live board the day this was added:
+    of four blocked rows, two were review cards already answered by a
+    completed ``Final independent review``, and the operator had no way to
+    tell them apart from the two that were real.
+
+    Reported as a strict subset of the stopped-row population, never
+    subtracted from it. The same discipline as
+    ``needs_input_awaiting_review_rows``: the total stays honest and the
+    caller decides how to present the part of it that is debris. Nothing
+    here closes, unblocks, or deletes the superseded row.
+
+    ``supersedes`` is declared by whoever creates the replacement card, so
+    this is an agent stating a fact about its own intent, not something
+    inferred from title similarity or timing. Rows created before the column
+    existed carry NULL and are therefore never counted — this undercounts
+    real debris rather than guessing at it.
+
+    The superseding card's own status is deliberately not checked. If the
+    replacement is itself blocked, IT is the live question and appears in
+    the same population on its own row; requiring the replacement to be
+    ``done`` would leave both rows counted as separate asks, which is the
+    double-counting this exists to remove. Only ``archived`` replacements
+    are ignored, because an archived card no longer represents anything.
+    """
+    placeholders = ", ".join("?" for _ in human_stopped_statuses)
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks p "
+        f"WHERE p.status IN ({placeholders}) AND EXISTS ("
+        "SELECT 1 FROM tasks s "
+        "WHERE s.supersedes = p.id AND s.id <> p.id AND s.status <> 'archived'"
+        ")",
+        human_stopped_statuses,
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
 def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     """Cost of the unanswered human question: count, staleness, and blast radius.
 
@@ -11886,8 +11962,14 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
     untyped_rows, oldest_untyped, untyped_children = _for_kind(None)
     awaiting_review_rows = _awaiting_review_stats(conn, human_stopped_statuses)
     needs_work_rows = _needs_work_stats(conn, human_stopped_statuses)
+    superseded_rows = _superseded_stats(conn, human_stopped_statuses)
     if awaiting_review_rows + needs_work_rows > needs_input_rows:
         raise ValueError("needs-input reason subsets exceed needs-input rows")
+    # Scoped to the same stopped statuses but across every block kind, so it
+    # can exceed needs_input_rows without anything being wrong. Bound it
+    # against the population it is actually a subset of.
+    if superseded_rows > needs_input_rows + capability_rows + untyped_rows:
+        raise ValueError("superseded rows exceed the stopped-row population")
 
     return {
         "needs_input_rows": needs_input_rows,
@@ -11908,6 +11990,15 @@ def _needs_input_stats(conn: sqlite3.Connection) -> dict:
         # deliberately returns the count only; task IDs and review reasons stay
         # inside the board database.
         "needs_input_needs_work_rows": needs_work_rows,
+        # Debris: stopped rows that a later card declared it replaces. A subset
+        # of the three stopped-row counts here taken together, NOT of
+        # needs_input alone — a capability wall gets abandoned and replaced the
+        # same way an unanswered question does. Reported, never subtracted: the
+        # queue totals stay what they are and the caller decides how much of
+        # the queue is still a real ask. Undercounts by construction, because
+        # only cards created since the `supersedes` column existed can declare
+        # one, and nothing infers supersession from titles or timing.
+        "superseded_stopped_rows": superseded_rows,
         # A hard wall the agent cannot pass: no access, missing credentials, an
         # action no AI agent can perform. The schema calls it "genuinely
         # human-only", so it belongs in the same queue as needs_input but is a
@@ -12031,9 +12122,12 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         # next action is code or evidence correction by the builder/CTO, not a
         # decision from the owner. Count-only for the same privacy boundary as
         # the adjacent review-handoff aggregate.
-        "needs_input_needs_work_rows": needs_input[
-            "needs_input_needs_work_rows"
-        ],
+        "needs_input_needs_work_rows": needs_input["needs_input_needs_work_rows"],
+        # Debris across all three stopped kinds below, not a subset of
+        # needs_input alone: rows a later card declared it replaces. Reported
+        # next to the totals rather than deducted from them, so the queue
+        # figures stay comparable across the change.
+        "superseded_stopped_rows": needs_input["superseded_stopped_rows"],
         # The other two kinds the schema comment (kanban_db.py:110-125) routes
         # to a human. `capability` is a hard wall -- no access, missing creds,
         # an action no AI agent can perform, "genuinely human-only". An

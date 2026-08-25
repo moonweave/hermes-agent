@@ -47,7 +47,13 @@ class _Sessions:
 
 
 def _session(
-    *, source="desktop", profile="reviewer", workspace=WORKSPACE, git_repo_root=None, active
+    *,
+    source="desktop",
+    profile="reviewer",
+    workspace=WORKSPACE,
+    git_repo_root=None,
+    active,
+    activity_description="executing tool: private tool name",
 ):
     return {
         "id": "private-session-id",
@@ -58,9 +64,40 @@ def _session(
         "title": "private title",
         "preview": "private prompt",
         "last_active": active,
-        "last_activity_description": "executing tool: private tool name",
+        "last_activity_description": activity_description,
         "ended_at": None,
     }
+
+
+def test_sessions_activity_v2_excludes_recent_idle_session_without_mid_turn_label(
+    capsys, monkeypatch
+):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    db = _Sessions([_session(active=now - 2, activity_description="")])
+
+    assert _sessions_activity_v2(
+        db, argparse.Namespace(source=None, json=True)
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["aggregates"] == []
+    assert payload["coverage"]["complete"] is True
+
+
+def test_sessions_activity_v2_does_not_return_evidence_at_expiry_boundary(
+    capsys, monkeypatch
+):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    db = _Sessions([_session(active=now - 120)])
+
+    assert _sessions_activity_v2(
+        db, argparse.Namespace(source=None, json=True, window=120)
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["aggregates"] == []
 
 
 def test_sessions_activity_v2_aggregates_current_interactive_work_without_identifiers(

@@ -220,9 +220,11 @@ def _sessions_activity_v2(db, args) -> int:
     for row in sessions:
         if row.get("ended_at") is not None:
             continue
+        if not (row.get("last_activity_description") or "").strip():
+            continue
         last_active = row.get("last_active")
         last_active = int(last_active) if last_active else None
-        if last_active is None or last_active < floor:
+        if last_active is None or last_active <= floor:
             continue
         workspace = _activity_workspace_key(row, _ws_key)
         profile_raw = row.get("profile_name")

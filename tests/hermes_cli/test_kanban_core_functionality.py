@@ -324,8 +324,8 @@ def test_activity_ref_salt_seed_converges_across_concurrent_processes(tmp_path):
     salt and therefore one set of refs (constraint 5). Correctness must not
     rest on _cross_process_init_lock -- it is bounded by
     _INIT_LOCK_TIMEOUT_SECONDS and proceeds without the lock on timeout --
-    so this exercises the real guarantee: INSERT OR IGNORE plus the
-    unconditional re-SELECT in _activity_ref_salt."""
+    so this exercises the real guarantee: INSERT OR IGNORE on the writable
+    initialization path, followed by read-only activity projection."""
     import multiprocessing as mp
     import sqlite3
 
@@ -434,6 +434,24 @@ def test_activity_salt_reprovisions_after_row_loss(kanban_home):
 
     assert count_after == 1
     assert activity["events"] == []
+
+
+def test_board_activity_does_not_repair_missing_salt_on_read_only_path(
+    kanban_home,
+):
+    import sqlite3
+
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        kb.create_task(conn, title="read-only activity", assignee="builder")
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key = ?", (kb._ACTIVITY_SALT_META_KEY,)
+        )
+
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError, match="activity ref salt is missing"):
+            kb.board_activity(conn, limit=10)
 
 
 def test_board_stats_reports_aggregate_worker_evidence_without_task_content(

@@ -2727,7 +2727,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         is not None
     )
     if meta_table_exists:
-        _activity_ref_salt(conn)
+        _seed_activity_ref_salt(conn)
 
     _rebuild_drifted_tables(conn)
 
@@ -12188,50 +12188,42 @@ _ACTIVITY_SALT_META_KEY = "activity_ref_salt_v1"
 _ACTIVITY_SALT_BYTES = 32
 
 
-def _activity_ref_salt(conn: sqlite3.Connection) -> bytes:
-    """Return the per-board HMAC key that pseudonymizes activity refs.
+def _seed_activity_ref_salt(conn: sqlite3.Connection) -> None:
+    """Create the per-board activity-ref key on a writable init path."""
+    row = conn.execute(
+        "SELECT 1 FROM kanban_meta WHERE key = ?", (_ACTIVITY_SALT_META_KEY,)
+    ).fetchone()
+    if row is not None:
+        return
+    if _board_has_activity_history(conn):
+        _log.warning(
+            "kanban: activity ref salt missing on a board with recorded "
+            "history; reseeding, so activity refs will change once"
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO kanban_meta (key, value) VALUES (?, ?)",
+        (_ACTIVITY_SALT_META_KEY, secrets.token_hex(32)),
+    )
 
-    Write-once: the row is seeded on first use and never updated or
+
+def _activity_ref_salt(conn: sqlite3.Connection) -> bytes:
+    """Read the per-board HMAC key that pseudonymizes activity refs.
+
+    Write-once: the row is seeded during database initialization and never updated or
     deleted (see kanban_meta in SCHEMA_SQL). That keeps board_activity
     refs stable for as long as the underlying row ids are stable. A
     legacy board rebuilt by _rebuild_drifted_tables reassigns
     task_events ids, so its refs churn once even though the salt
     survives.
-
-    Concurrency: several processes can race to seed this row on a
-    freshly created board. ``INSERT OR IGNORE`` lets exactly one writer
-    win; the unconditional re-SELECT afterward -- not the locally
-    generated candidate -- is what every racing process returns, so
-    they all converge on the same salt regardless of who won. Do not
-    optimize that re-SELECT away.
-
-    Not wrapped in write_txn: _sqlite_connect() opens with
-    isolation_level=None (autocommit), so the single INSERT OR IGNORE is
-    already its own atomic transaction. write_txn additionally calls
-    _assert_not_delegated_child_mutation(), which would break a
-    delegate_task child that only reads the activity projection, and
-    issues BEGIN IMMEDIATE, which cannot nest inside a caller's open
-    transaction.
     """
     row = conn.execute(
         "SELECT value FROM kanban_meta WHERE key = ?", (_ACTIVITY_SALT_META_KEY,)
     ).fetchone()
     if row is None:
-        if _board_has_activity_history(conn):
-            # A board with recorded history should already own a salt. Losing it
-            # reseeds silently and churns every ref exactly once, which a consumer
-            # that dedupes on event_ref reads as "everything is new". Say so.
-            _log.warning(
-                "kanban: activity ref salt missing on a board with recorded "
-                "history; reseeding, so activity refs will change once"
-            )
-        conn.execute(
-            "INSERT OR IGNORE INTO kanban_meta (key, value) VALUES (?, ?)",
-            (_ACTIVITY_SALT_META_KEY, secrets.token_hex(32)),
+        raise RuntimeError(
+            "kanban activity ref salt is missing; initialize the board through "
+            "a writable connection before reading activity"
         )
-        row = conn.execute(
-            "SELECT value FROM kanban_meta WHERE key = ?", (_ACTIVITY_SALT_META_KEY,)
-        ).fetchone()
     salt = bytes.fromhex(row[0])
     if len(salt) != _ACTIVITY_SALT_BYTES:
         # bytes.fromhex("") returns b"", and HMAC under an empty key is no key at

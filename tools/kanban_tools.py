@@ -1801,7 +1801,8 @@ KANBAN_COMPLETE_SCHEMA = {
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). ``metadata.changed_files`` "
         "is verified, not decorative: when the card declares an evidence "
-        "repository, the kernel asks git whether those paths actually "
+        "repository, list exact repository-relative paths; the kernel asks "
+        "git whether those paths actually "
         "differ and refuses the completion if they do not. If you could "
         'not make the change, block with kind="capability" — that is '
         "the correct outcome, not a failure. At least one of "
@@ -1837,7 +1838,9 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Free-form dict of structured facts about this "
                     'attempt — {"changed_files": [...], "tests_run": 12, '
                     '"findings": [...]}. Surfaced to downstream '
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. Changed-file entries must "
+                    "be exact repository-relative paths; placeholders are not "
+                    "completion evidence."
                 ),
             },
             "result": {

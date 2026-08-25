@@ -5187,6 +5187,21 @@ def _claimed_change_evidence(
     return [], commit, None
 
 
+COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS = 10
+
+
+def _repo_relative_evidence_path(repo: Path, claimed_path: str) -> Optional[str]:
+    """Normalize a claimed path to the exact repo-relative form git reports."""
+    repo_root = repo.expanduser().absolute()
+    candidate = Path(claimed_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    try:
+        return candidate.absolute().relative_to(repo_root).as_posix()
+    except ValueError:
+        return None
+
+
 def _verify_completion_evidence(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5220,16 +5235,10 @@ def _verify_completion_evidence(
     if commit and not _git_commit_exists(repo, commit):
         return f"commit {commit} does not exist in {repo}", claimed, sorted(changed)
 
-    # Suffix match, so a worker may cite `security.py` or the repo-relative
-    # `backend/instagram_automation/security.py` and both resolve. Git reports
-    # repo-relative paths; workers reliably do not.
     unmatched = [
         path
         for path in claimed
-        if not any(
-            actual == path or actual.endswith("/" + path.lstrip("./"))
-            for actual in changed
-        )
+        if _repo_relative_evidence_path(repo, path) not in changed
     ]
     if unmatched:
         return (
@@ -7792,7 +7801,7 @@ def _git_changed_paths(repo: Path) -> Optional[set[str]]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=30,
+                timeout=COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS,
                 check=False,
             )
         except Exception:
@@ -7818,7 +7827,7 @@ def _git_commit_exists(repo: Path, sha: str) -> bool:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=30,
+            timeout=COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS,
             check=False,
         )
     except Exception:

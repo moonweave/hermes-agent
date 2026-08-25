@@ -1635,3 +1635,67 @@ def test_board_stats_reports_the_completion_evidence_gate(kanban_home, tmp_path)
         assert armed not in serialized
     finally:
         conn.close()
+
+
+def test_completion_evidence_requires_repo_relative_changed_path(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source = repo / "backend" / "security.py"
+    source.parent.mkdir()
+    source.write_text("enabled = False\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "backend/security.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add security module"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source.write_text("enabled = True\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="tighten security",
+            assignee="builder",
+            evidence_repo=str(repo),
+        )
+        with pytest.raises(kb.CompletionEvidenceError, match="security.py"):
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="done",
+                metadata={"changed_files": ["security.py"]},
+            )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={"changed_files": ["backend/security.py"]},
+        )
+
+
+def test_completion_evidence_git_status_probes_have_a_short_timeout(
+    tmp_path, monkeypatch
+):
+    observed_timeouts = []
+
+    def fake_run(*_args, timeout, **_kwargs):
+        observed_timeouts.append(timeout)
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+    assert kb._git_changed_paths(tmp_path) == set()
+    assert observed_timeouts == [
+        kb.COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS,
+        kb.COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS,
+    ]
+    assert kb.COMPLETION_EVIDENCE_GIT_TIMEOUT_SECONDS <= 10

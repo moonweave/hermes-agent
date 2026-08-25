@@ -93,6 +93,14 @@ def test_session_caption_is_owner_scoped_and_export_omits_ephemeral_fields(tmp_p
         "runtime_phase_code", "phase_observed_at", "phase_expires_at",
     ):
         assert key not in exported
+    db.end_session("open", end_reason="completed")
+    ended = db.get_session("open")
+    for key in (
+        "live_caption", "live_caption_observed_at", "live_caption_expires_at",
+        "runtime_phase_code", "phase_observed_at", "phase_expires_at",
+    ):
+        assert ended[key] is None
+    assert not db.publish_live_caption("open", "종료 뒤 늦은 문장", observed_at=220.0)
     db.close()
 
 
@@ -221,6 +229,9 @@ def test_streaming_and_non_streaming_share_one_caption_boundary():
         agent,
         {"role": "assistant", "content": "작업 경계를 확인하고 있어요."},
     )
+
+    agent.show_commentary = False
+    assert not AIAgent._publish_live_caption(agent, "화면 설정이 끈 문장")
 
     assert db.captions == [("session-1", "작업 경계를 확인하고 있어요.")]
     assert delivered == ["작업 경계를 확인하고 있어요."]

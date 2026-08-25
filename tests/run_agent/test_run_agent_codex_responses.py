@@ -604,8 +604,50 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
     assert len(delivered) == 1
 
 
+def test_run_codex_stream_persists_commentary_without_ui_callback(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    published = []
+    agent.interim_assistant_callback = None
+    agent._publish_live_caption = lambda text: published.append(text) or True
+    commentary_text = "작업 구조를 확인하고 있어요."
+    commentary_item = SimpleNamespace(
+        type="message",
+        phase="commentary",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text=commentary_text)],
+    )
+    function_item = SimpleNamespace(
+        type="function_call",
+        id="fc_quiet_worker",
+        call_id="call_quiet_worker",
+        name="terminal",
+        arguments="{}",
+    )
 
+    def _fake_create(**kwargs):
+        assert kwargs.get("stream") is True
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="message", phase="commentary"),
+            ),
+            SimpleNamespace(type="response.output_text.delta", delta=commentary_text),
+            SimpleNamespace(type="response.output_item.done", item=commentary_item),
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="function_call"),
+            ),
+            SimpleNamespace(type="response.output_item.done", item=function_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ])
 
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+    agent._run_codex_stream(_codex_request_kwargs())
+
+    assert published == [commentary_text]
 
 
 def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fails(

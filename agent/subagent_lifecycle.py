@@ -73,7 +73,7 @@ class SubagentHandle:
     model: Optional[str]
     role: str
     depth: int
-    capability: str
+    capability: str = dataclasses.field(repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -192,10 +192,16 @@ class SubagentLifecycleService:
     handle cannot reconnect after a restart instead of launching work again.
     """
 
-    def __init__(self, parent_agent_resolver: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        parent_agent_resolver: Callable[[], Any],
+        authorization_resolver: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self._parent_agent_resolver = parent_agent_resolver
+        self._authorization_resolver = authorization_resolver
 
     def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
+        self._require_authorized()
         parent = self._parent_agent_resolver()
         if parent is None:
             raise SubagentLifecycleError(
@@ -207,6 +213,14 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "parent_session_id does not match the active session."
             )
+        return self._launch_validated(request, parent, parent_session_id)
+
+    def _launch_validated(
+        self,
+        request: SubagentLaunchRequest,
+        parent: Any,
+        parent_session_id: Optional[str],
+    ) -> SubagentHandle:
         correlation_key = (parent_session_id, request.correlation_id or "")
         with _REGISTRY.lock:
             self._cleanup_locked()
@@ -226,17 +240,31 @@ class SubagentLifecycleService:
             task_index=0,
             goal=request.goal,
             context=request.context,
-            toolsets=list(request.allowed_toolsets)
-            if request.allowed_toolsets
-            else None,
+            toolsets=(
+                list(request.allowed_toolsets)
+                if request.allowed_toolsets is not None
+                else None
+            ),
             model=request.model,
             max_iterations=DEFAULT_MAX_ITERATIONS,
             task_count=1,
             parent_agent=parent,
             role=request.role,
         )
+        if request.allowed_toolsets == () and (
+            getattr(child, "enabled_toolsets", None) != []
+            or bool(getattr(child, "valid_tool_names", None))
+            or bool(getattr(child, "tools", None))
+            or getattr(child, "_delegate_role", None) != "leaf"
+            or getattr(child, "_delegate_depth", None) != 1
+        ):
+            self._close_child(child)
+            raise SubagentLifecycleError(
+                "Hermes failed to construct a strictly tool-less child."
+            )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
+            self._close_child(child)
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
         created = time.time()
         handle = SubagentHandle(
@@ -256,10 +284,35 @@ class SubagentLifecycleService:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        try:
+            record.future = self._submit(record, request.goal, parent)
+        except Exception:
+            with _REGISTRY.lock:
+                if _REGISTRY.records.get(subagent_id) is record:
+                    _REGISTRY.records.pop(subagent_id, None)
+                if (
+                    request.correlation_id
+                    and _REGISTRY.correlations.get(correlation_key) == subagent_id
+                ):
+                    _REGISTRY.correlations.pop(correlation_key, None)
+            self._close_child(child)
+            raise
         return handle
 
+    def _submit(self, record: _Record, goal: str, parent: Any) -> Optional[Future]:
+        return _EXECUTOR.submit(self._run, record, goal, parent)
+
+    @staticmethod
+    def _close_child(child: Any) -> None:
+        close = getattr(child, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
     def status(self, handle: SubagentHandle) -> SubagentStatus:
+        self._require_authorized()
         record = self._record(handle)
         if record is None:
             return SubagentStatus(
@@ -271,6 +324,7 @@ class SubagentLifecycleService:
     def wait(
         self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
     ) -> SubagentTerminalState:
+        self._require_authorized()
         record = self._record(handle)
         if record is None:
             return SubagentTerminalState(
@@ -290,6 +344,7 @@ class SubagentLifecycleService:
             )
 
     def cancel(self, handle: SubagentHandle, *, reason: str) -> SubagentCancelResult:
+        self._require_authorized()
         record = self._record(handle)
         if record is None:
             return SubagentCancelResult(False, unknown_handle=True)
@@ -322,6 +377,7 @@ class SubagentLifecycleService:
         return SubagentCancelResult(True, state=SubagentState.CANCEL_REQUESTED)
 
     def result(self, handle: SubagentHandle) -> SubagentResult:
+        self._require_authorized()
         record = self._record(handle)
         if record is None:
             return SubagentResult(
@@ -338,6 +394,7 @@ class SubagentLifecycleService:
             )
 
     def reconnect(self, handle: SubagentHandle) -> SubagentReconnectResult:
+        self._require_authorized()
         record = self._record(handle)
         if record is None:
             return SubagentReconnectResult(
@@ -345,6 +402,20 @@ class SubagentLifecycleService:
             )
         with _REGISTRY.lock:
             return SubagentReconnectResult(True, record.state)
+
+    def _require_authorized(self) -> None:
+        if self._authorization_resolver is None:
+            return
+        try:
+            authorized = self._authorization_resolver()
+        except Exception as exc:
+            raise SubagentLifecycleError(
+                "Subagent lifecycle authorization failed."
+            ) from exc
+        if authorized is not True:
+            raise SubagentLifecycleError(
+                "Plugin is not authorized for subagent lifecycle."
+            )
 
     def _record(self, handle: SubagentHandle) -> Optional[_Record]:
         if (

@@ -26,10 +26,13 @@ Capability id                Legacy config gate (``plugins.entries.<id>.…``)
 ``llm.profile_override``     ``llm.allow_profile_override``
 ``llm.task_override``        ``llm.allow_task_override``
 ``gateway.platform_actions`` ``allow_platform_actions``
+``delegation.coordinator``   none; explicit capability grant only
+``delegation.subagents``     none; explicit capability grant only
 ===========================  ==================================================
 
-The legacy ``allow_*`` keys keep working verbatim (deprecated but honored):
-a gate is open when the legacy key is true **or** the capability is granted.
+Where a legacy key is listed, it keeps working verbatim (deprecated but
+honored): the gate is open when that key is true **or** the capability is
+granted. New sensitive surfaces may intentionally be grant-only.
 
 Consent state
 -------------
@@ -64,11 +67,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CapabilitySpec:
-    """One declarable capability and the legacy gate it maps to."""
+    """One declarable capability and its optional deprecated legacy gate."""
 
     id: str
     # Path of the deprecated boolean under ``plugins.entries.<plugin_id>``,
     # e.g. ("allow_tool_override",) or ("llm", "allow_model_override").
+    # Empty means explicit capability grant only; no legacy bypass exists.
     legacy_path: Tuple[str, ...]
     # One-line risk description shown on the consent screen.
     description: str
@@ -126,6 +130,21 @@ CAPABILITY_REGISTRY: Dict[str, CapabilitySpec] = {
             description=(
                 "Act on connected chat platforms as the gateway bot "
                 "(add reactions, rename threads) via ctx.platform_actions"
+            ),
+        ),
+        CapabilitySpec(
+            id="delegation.coordinator",
+            legacy_path=(),
+            description=(
+                "Reserve host-owned coordinator consultations and launch "
+                "strictly tool-less role agents"
+            ),
+        ),
+        CapabilitySpec(
+            id="delegation.subagents",
+            legacy_path=(),
+            description=(
+                "Launch and supervise generic host-owned delegated subagents"
             ),
         ),
     )
@@ -222,6 +241,8 @@ def granted_capabilities(
 
 def _legacy_gate_set(entry: Mapping[str, Any], spec: CapabilitySpec) -> bool:
     """True when the deprecated ``allow_*`` key for *spec* is truthy."""
+    if not spec.legacy_path:
+        return False
     node: Any = entry
     for part in spec.legacy_path:
         if not isinstance(node, Mapping):
@@ -327,10 +348,12 @@ def record_consent(
         "granted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
-    # Bridge: mirror each granted capability into its legacy gate so the
-    # existing enforcement sites (which still read allow_*) honor the grant.
+    # Bridge: mirror capabilities that have a legacy gate so existing
+    # enforcement sites (which still read allow_*) honor the grant.
     for cap in entry[GRANTED_KEY]:
         spec = CAPABILITY_REGISTRY[cap]
+        if not spec.legacy_path:
+            continue
         node = entry
         for part in spec.legacy_path[:-1]:
             child = node.setdefault(part, {})

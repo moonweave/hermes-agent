@@ -43,10 +43,13 @@ def _read_cfg(home):
 
 
 class TestRegistry:
-    def test_every_capability_has_legacy_gate(self):
+    def test_every_capability_has_description_and_delegation_is_grant_only(self):
         for spec in CAPABILITY_REGISTRY.values():
-            assert spec.legacy_path, spec.id
             assert spec.description
+            if spec.id in {"delegation.coordinator", "delegation.subagents"}:
+                assert spec.legacy_path == ()
+            else:
+                assert spec.legacy_path, spec.id
 
     def test_known_ids(self):
         assert "tools.override" in VALID_CAPABILITY_IDS
@@ -195,6 +198,17 @@ class TestConsentPersistence:
     def test_capability_granted_after_consent(self, hermes_home):
         record_consent("capplug", ["tools.override"], ["tools.override"])
         assert plugin_capability_granted("capplug", "tools.override") is True
+
+    def test_grant_only_delegation_capability_persists_without_legacy_mirror(
+        self, hermes_home
+    ):
+        capability = "delegation.subagents"
+        record_consent("capplug", [capability], [capability])
+
+        entry = _read_cfg(hermes_home)["plugins"]["entries"]["capplug"]
+        assert entry["granted_capabilities"] == [capability]
+        assert plugin_capability_granted("capplug", capability) is True
+        assert "allow_subagents" not in entry
 
     def test_declined_stays_off(self, hermes_home):
         # No record_consent call — nothing granted.

@@ -1406,6 +1406,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._coordinator_service: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
         self._platform_actions: Any = None
@@ -1600,21 +1601,81 @@ class PluginContext:
 
     @property
     def subagent_lifecycle(self) -> Any:
-        """Return the public, plugin-safe subagent lifecycle service.
+        """Return the grant-only public subagent lifecycle service.
 
         The service only resolves the active host-owned parent agent when a
         child is launched. Plugins receive serializable handles and immutable
-        snapshots; they never receive a live agent or a private registry.
+        snapshots; they never receive a live agent or a private registry. Both
+        manifest declaration and explicit consent are required.
         """
+        capability_id = "delegation.subagents"
+        if (
+            capability_id not in self.manifest.capabilities
+            or not plugin_capability_granted(self.plugin_id, capability_id)
+        ):
+            raise PermissionError(
+                f"Plugin {self.plugin_id!r} requires declared and granted "
+                f"capability {capability_id!r}"
+            )
         if self._subagent_lifecycle is None:
             from agent.subagent_lifecycle import (
                 SubagentLifecycleService,
                 get_active_subagent_parent,
             )
+            def _authorized() -> bool:
+                return (
+                    capability_id in self.manifest.capabilities
+                    and plugin_capability_granted(self.plugin_id, capability_id)
+                )
+
             self._subagent_lifecycle = SubagentLifecycleService(
-                get_active_subagent_parent
+                get_active_subagent_parent,
+                authorization_resolver=_authorized,
             )
         return self._subagent_lifecycle
+
+    @property
+    def coordinator_service(self) -> Any:
+        """Return the capability-gated host coordinator service.
+
+        Routes must be explicitly listed under the plugin-relative
+        ``coordinator_routes`` setting.  Missing or malformed policy fails
+        closed.  The signing authority remains entirely host-owned.
+        """
+        capability_id = "delegation.coordinator"
+        if (
+            capability_id not in self.manifest.capabilities
+            or not plugin_capability_granted(self.plugin_id, capability_id)
+        ):
+            raise PermissionError(
+                f"Plugin {self.plugin_id!r} requires declared and granted "
+                f"capability {capability_id!r}"
+            )
+        if self._coordinator_service is None:
+            from agent.route_capability import CoordinatorService
+            from agent.subagent_lifecycle import get_active_subagent_parent
+
+            def _allowed_routes() -> tuple[str, ...]:
+                value = self.get_config("coordinator_routes", ())
+                if not isinstance(value, (list, tuple)) or any(
+                    not isinstance(route, str) or not route for route in value
+                ):
+                    raise ValueError("coordinator_routes must be a list of route ids")
+                return tuple(value)
+
+            def _authorized() -> bool:
+                return (
+                    capability_id in self.manifest.capabilities
+                    and plugin_capability_granted(self.plugin_id, capability_id)
+                )
+
+            self._coordinator_service = CoordinatorService(
+                issuer_plugin_id=self.plugin_id,
+                parent_agent_resolver=get_active_subagent_parent,
+                allowed_routes_resolver=_allowed_routes,
+                authorization_resolver=_authorized,
+            )
+        return self._coordinator_service
 
     # -- profile awareness --------------------------------------------------
 

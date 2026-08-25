@@ -7,8 +7,13 @@ arbitrary toolsets.
 """
 
 from types import SimpleNamespace
+from typing import Any, cast
 
-from tools.delegate_tool import _strip_blocked_tools, _emit_parent_console
+from tools.delegate_tool import (
+    _build_child_agent,
+    _emit_parent_console,
+    _strip_blocked_tools,
+)
 
 
 class TestToolsetIntersection:
@@ -46,6 +51,106 @@ class TestToolsetIntersection:
         scoped = [t for t in requested if t in parent_toolsets]
 
         assert scoped == []
+
+    def test_explicit_empty_toolsets_reach_real_constructor_as_empty(self, monkeypatch):
+        """An explicit empty list is a deny-all request, never inheritance."""
+        captured = {}
+        parent = SimpleNamespace(
+            enabled_toolsets=["terminal", "file", "mcp-market"],
+            valid_tool_names={"terminal", "read_file", "mcp_market_snapshot"},
+            disabled_toolsets=[],
+            model="test-model",
+            provider="test-provider",
+            base_url="https://example.invalid",
+            api_key="test",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            reasoning_config=None,
+            prefill_messages=None,
+            _fallback_chain=None,
+            _session_db=None,
+            session_id="parent",
+        )
+
+        class Constructed:
+            session_id = "child"
+            enabled_toolsets: list[str] = []
+            valid_tool_names = set()
+            tools = []
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            child = Constructed()
+            child.enabled_toolsets = kwargs["enabled_toolsets"]
+            return child
+
+        monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+        monkeypatch.setattr(
+            "tools.delegate_tool._build_child_system_prompt", lambda *_a, **_k: "prompt"
+        )
+        monkeypatch.setattr(
+            "tools.delegate_tool._load_config", lambda: {}
+        )
+
+        child = _build_child_agent(
+            task_index=0,
+            goal="strict tool-less",
+            context=None,
+            toolsets=[],
+            model=None,
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+            role="leaf",
+        )
+
+        assert captured["enabled_toolsets"] == []
+        constructed = cast(Any, child)
+        assert constructed.enabled_toolsets == []
+        assert constructed.valid_tool_names == set()
+        assert constructed.tools == []
+
+    def test_explicit_empty_toolsets_build_real_aiagent_without_tools(self):
+        """Exercise the production builder and AIAgent initialization path."""
+        parent = SimpleNamespace(
+            enabled_toolsets=["terminal", "file", "mcp-market"],
+            valid_tool_names={"terminal", "read_file", "mcp_market_snapshot"},
+            disabled_toolsets=[],
+            model="test/model",
+            provider="openrouter",
+            base_url="https://example.invalid",
+            api_key="test",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            reasoning_config=None,
+            prefill_messages=None,
+            _fallback_chain=None,
+            _session_db=None,
+            session_id="parent-real-construction",
+        )
+
+        child = _build_child_agent(
+            task_index=0,
+            goal="strict tool-less real construction",
+            context=None,
+            toolsets=[],
+            model=None,
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+            role="leaf",
+        )
+        try:
+            constructed = cast(Any, child)
+            assert constructed.enabled_toolsets == []
+            assert constructed.valid_tool_names == set()
+            assert constructed.tools == []
+            assert constructed._delegate_role == "leaf"
+            assert constructed._delegate_depth == 1
+        finally:
+            child.close()
 
 
 class TestEmitParentConsole:

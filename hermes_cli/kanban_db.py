@@ -6657,6 +6657,11 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        if reviewer is not None:
+            try:
+                reviewer = _canonical_assignee(reviewer)
+            except ValueError as exc:
+                return _ret(False, f"invalid reviewer: {exc}")
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -6709,7 +6714,6 @@ def request_review(
                     "pass reviewer= explicitly — an unassigned review row is "
                     "never dispatched",
                 )
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:

@@ -710,6 +710,28 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         assert ev["implementer"] == "worker"
 
 
+def test_explicit_blank_reviewer_is_a_structured_refusal(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="blank reviewer", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+        ok, reason = kb.request_review(
+            conn,
+            tid,
+            summary="v1",
+            reviewer="   ",
+            expected_run_id=claimed.current_run_id,
+            with_reason=True,
+        )
+
+        assert ok is False
+        assert reason is not None and "reviewer" in reason
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+
+
 def test_first_review_without_reviewer_or_assignee_is_refused(kanban_home: Path) -> None:
     """A review row nobody owns is never dispatched, so it must never be made.
 

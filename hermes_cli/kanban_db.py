@@ -12731,6 +12731,167 @@ def board_activity_v3(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
     )
 
 
+def _operator_inbox_kind(block_kind: Optional[str], reason: str) -> str:
+    lowered = reason.strip().lower()
+    if block_kind == "needs_input" and (
+        lowered.startswith(_REVIEW_REQUIRED_REASON_PREFIX)
+        or lowered.startswith(_NEEDS_WORK_REASON_PREFIX)
+        or _REVIEW_HOLD_REASON_RE.match(lowered) is not None
+    ):
+        return "agent_action"
+    if block_kind in {"needs_input", "capability"}:
+        return "needs_user"
+    return "unclassified_block"
+
+
+def _operator_inbox_summary(value: object) -> Optional[str]:
+    # The shared sanitizer appends an ellipsis on truncation, so reserve one
+    # character to keep this public contract within its declared bound.
+    clean = sanitize_live_caption(value, max_chars=239)
+    if not clean:
+        return None
+    lowered = clean.lower()
+    for prefix in (_REVIEW_REQUIRED_REASON_PREFIX, _NEEDS_WORK_REASON_PREFIX):
+        if lowered.startswith(prefix):
+            return clean[len(prefix):].lstrip()
+    if _REVIEW_HOLD_REASON_RE.match(lowered):
+        _, separator, remainder = clean.partition(":")
+        return remainder.strip() if separator and remainder.strip() else clean
+    return clean
+
+
+def board_operator_inbox(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 40,
+    outcome_window_seconds: int = 86_400,
+) -> dict:
+    """Return bounded owner/agent actions and recent terminal outcomes.
+
+    This contract exposes only sanitized display text and pseudonymous item
+    references. Raw task/run/event ids, bodies, paths, comments and payloads
+    never leave the board boundary.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("operator inbox limit must be an integer between 1 and 100")
+    if not isinstance(outcome_window_seconds, int) or outcome_window_seconds < 60:
+        raise ValueError("operator inbox outcome window must be at least 60 seconds")
+
+    now = int(time.time())
+    cutoff = now - outcome_window_seconds
+    with _activity_read_snapshot(conn):
+        salt = _activity_ref_salt_readonly(conn)
+        blocked_rows = conn.execute(
+            "SELECT t.id AS task_id, t.title, t.assignee, t.block_kind, "
+            "       e.id AS event_id, e.payload, e.created_at "
+            "FROM tasks t "
+            "LEFT JOIN task_events e ON e.id = ("
+            "  SELECT MAX(be.id) FROM task_events be "
+            "  WHERE be.task_id = t.id AND be.kind = 'blocked'"
+            ") "
+            "WHERE t.status IN ('blocked', 'triage') "
+            "  AND (t.block_kind IS NULL OR t.block_kind IN ('needs_input', 'capability')) "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM tasks s WHERE s.supersedes = t.id "
+            "    AND s.id <> t.id AND s.status <> 'archived'"
+            "  ) "
+            "ORDER BY COALESCE(e.created_at, t.created_at) DESC, t.id DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+        total_blocked = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks t "
+            "WHERE t.status IN ('blocked', 'triage') "
+            "  AND (t.block_kind IS NULL OR t.block_kind IN ('needs_input', 'capability')) "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM tasks s WHERE s.supersedes = t.id "
+            "    AND s.id <> t.id AND s.status <> 'archived'"
+            "  )"
+        ).fetchone()[0])
+        terminal_rows = conn.execute(
+            "WITH ranked AS ("
+            "  SELECT e.id AS event_id, e.task_id, e.kind, e.created_at, "
+            "         t.title, COALESCE(r.profile, t.assignee) AS profile, "
+            "         COALESCE(r.summary, t.result) AS summary, "
+            "         ROW_NUMBER() OVER (PARTITION BY e.task_id ORDER BY e.id DESC) AS rank "
+            "  FROM task_events e "
+            "  JOIN tasks t ON t.id = e.task_id "
+            "  LEFT JOIN task_runs r ON r.id = e.run_id "
+            "  WHERE e.kind IN ('completed', 'crashed', 'timed_out', 'gave_up') "
+            "    AND e.created_at >= ?"
+            ") SELECT event_id, task_id, kind, created_at, title, profile, summary "
+            "FROM ranked WHERE rank = 1 ORDER BY event_id DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        total_terminal = int(conn.execute(
+            "SELECT COUNT(DISTINCT task_id) FROM task_events "
+            "WHERE kind IN ('completed', 'crashed', 'timed_out', 'gave_up') "
+            "AND created_at >= ?",
+            (cutoff,),
+        ).fetchone()[0])
+
+    items = []
+    for row in blocked_rows:
+        payload = {}
+        if row["payload"]:
+            try:
+                candidate = json.loads(row["payload"])
+                payload = candidate if isinstance(candidate, dict) else {}
+            except (TypeError, ValueError):
+                payload = {}
+        reason = payload.get("reason") if isinstance(payload.get("reason"), str) else ""
+        occurred_at = int(row["created_at"] or now)
+        items.append({
+            "item_ref": _dashboard_activity_ref("inbox", salt, row["task_id"]),
+            "kind": _operator_inbox_kind(row["block_kind"], reason),
+            "title": sanitize_live_caption(row["title"], max_chars=95) or "확인이 필요한 작업",
+            "summary": _operator_inbox_summary(reason),
+            "profile": row["assignee"] if isinstance(row["assignee"], str) and row["assignee"] else None,
+            "occurred_at": occurred_at,
+            "provenance": "task_state",
+        })
+    for row in terminal_rows:
+        items.append({
+            "item_ref": _dashboard_activity_ref("inbox", salt, row["event_id"]),
+            "kind": "finished" if row["kind"] == "completed" else "failed",
+            "title": sanitize_live_caption(row["title"], max_chars=95) or "작업 결과",
+            "summary": _operator_inbox_summary(row["summary"]),
+            "profile": row["profile"] if isinstance(row["profile"], str) and row["profile"] else None,
+            "occurred_at": int(row["created_at"]),
+            "provenance": "terminal_event",
+        })
+    kind_priority = {
+        "needs_user": 4,
+        "unclassified_block": 3,
+        "agent_action": 2,
+        "failed": 1,
+        "finished": 0,
+    }
+    items.sort(
+        key=lambda item: (
+            kind_priority[item["kind"]],
+            item["occurred_at"],
+            item["item_ref"],
+        ),
+        reverse=True,
+    )
+    items = items[:limit]
+    scan_truncated = total_blocked + total_terminal > len(items)
+    return {
+        "contract_version": "hermes-kanban-operator-inbox-v1",
+        "retention_limit": limit,
+        "outcome_window_seconds": outcome_window_seconds,
+        "now": now,
+        "items": items,
+        "coverage": {
+            "complete": not scan_truncated,
+            "total_items": total_blocked + total_terminal,
+            "returned_items": len(items),
+            "scan_truncated": scan_truncated,
+        },
+    }
+
+
 def _to_epoch(val) -> Optional[int]:
     """Normalise a timestamp to unix epoch seconds.
 

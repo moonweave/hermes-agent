@@ -158,6 +158,80 @@ def test_board_activity_v3_adds_caption_without_changing_v2(kanban_home, monkeyp
     assert cli_payload["contract_version"] == "hermes-kanban-activity-v3"
 
 
+def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results(
+    kanban_home, monkeypatch
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        owner_task = kb.create_task(
+            conn, title="Open authenticated Research Grove window", assignee="webdesignqa"
+        )
+        assert kb.block_task(
+            conn,
+            owner_task,
+            kind="needs_input",
+            reason=(
+                "Open an already authenticated browser window. "
+                "Do not read /Users/person/private.env or https://user:pass@example.test/?token=secret"
+            ),
+        )
+        repair_task = kb.create_task(
+            conn, title="Repair failed browser assertions", assignee="builder"
+        )
+        assert kb.block_task(
+            conn,
+            repair_task,
+            kind="needs_input",
+            reason="needs_work: fix the deterministic browser assertion",
+        )
+        obsolete_task = kb.create_task(
+            conn, title="Obsolete browser audit", assignee="webdesignqa"
+        )
+        assert kb.block_task(
+            conn, obsolete_task, kind="capability", reason="Browser unavailable"
+        )
+        kb.create_task(
+            conn,
+            title="Replacement browser audit",
+            assignee="webdesignqa",
+            supersedes=obsolete_task,
+        )
+        completed_task = kb.create_task(
+            conn, title="Publish verified release", assignee="vcm"
+        )
+        assert kb.complete_task(
+            conn, completed_task, summary="Release checks passed without deployment"
+        )
+
+        payload = kb.board_operator_inbox(conn, limit=20)
+
+    assert payload["contract_version"] == "hermes-kanban-operator-inbox-v1"
+    assert [(item["kind"], item["title"]) for item in payload["items"]] == [
+        ("needs_user", "Open authenticated Research Grove window"),
+        ("agent_action", "Repair failed browser assertions"),
+        ("finished", "Publish verified release"),
+    ]
+    owner = next(item for item in payload["items"] if item["kind"] == "needs_user")
+    assert owner["summary"].startswith("Open an already authenticated browser window")
+    assert all(len(item["title"]) <= 96 for item in payload["items"])
+    assert all(item["summary"] is None or len(item["summary"]) <= 240 for item in payload["items"])
+    rendered = json.dumps(payload)
+    for private in (
+        owner_task,
+        repair_task,
+        obsolete_task,
+        completed_task,
+        "/Users/person/private.env",
+        "user:pass",
+        "token=secret",
+    ):
+        assert private not in rendered
+
+    cli_payload = json.loads(kc.run_slash("operator-inbox --json --limit 20"))
+    assert cli_payload["contract_version"] == "hermes-kanban-operator-inbox-v1"
+
+
 def test_run_caption_cannot_overwrite_sibling_or_resurrect_after_end(kanban_home):
     with kb.connect() as conn:
         first = kb.create_task(conn, title="first", assignee="reviewer")

@@ -1042,6 +1042,20 @@ def build_parser(
     )
     p_activity_v3.add_argument("--json", action="store_true")
 
+    p_operator_inbox = sub.add_parser(
+        "operator-inbox",
+        help="Privacy-safe owner actions and recent terminal outcomes",
+    )
+    p_operator_inbox.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        choices=range(1, 101),
+        metavar="1..100",
+        help="Maximum current actions and recent outcomes to return (default: 40)",
+    )
+    p_operator_inbox.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1378,6 +1392,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "activity": _cmd_activity,
             "activity-v2": _cmd_activity_v2,
             "activity-v3": _cmd_activity_v3,
+            "operator-inbox": _cmd_operator_inbox,
             "log": _cmd_log,
             "runs": _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -3294,6 +3309,18 @@ def _cmd_activity_v3(args: argparse.Namespace) -> int:
             f"  current  {stream['stream_ref']}  "
             f"@{stream['profile'] or 'unresolved'}  {text}"
         )
+    return 0
+
+
+def _cmd_operator_inbox(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        inbox = kb.board_operator_inbox(conn, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps(inbox, indent=2, ensure_ascii=False))
+        return 0
+    print("Current operator actions and recent outcomes:")
+    for item in inbox["items"]:
+        print(f"  {_fmt_ts(item['occurred_at'])}  {item['kind']:18s}  {item['title']}")
     return 0
 
 

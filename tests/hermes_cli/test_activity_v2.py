@@ -168,6 +168,21 @@ def test_sessions_activity_v2_normalizes_git_roots_and_symlinked_workspaces(
     assert str(alias) not in rendered
 
 
+def test_sessions_activity_v2_does_not_claim_truncation_after_window_boundary(
+    capsys, monkeypatch
+):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    db = _Sessions([_session(active=now - 500 - index) for index in range(220)])
+
+    assert _sessions_activity_v2(db, argparse.Namespace(source=None, json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["aggregates"] == []
+    assert payload["coverage"]["complete"] is True
+    assert payload["coverage"]["scan_truncated"] is False
+
+
 def test_board_activity_v2_returns_run_scoped_evidence_streams_with_v1_events(kanban_home, monkeypatch):
     now = 1_800_000_000
     monkeypatch.setattr(kb.time, "time", lambda: now)

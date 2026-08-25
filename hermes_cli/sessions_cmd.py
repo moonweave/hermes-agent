@@ -265,7 +265,11 @@ def _sessions_activity_v2(db, args) -> int:
             -(entry["evidence_observed_at"] or 0), entry["profile"], entry["workspace_digest"]
         )
     )
-    scan_truncated = len(sessions) >= _ACTIVITY_SCAN_LIMIT
+    oldest_scanned = min(
+        (int(row.get("last_active") or 0) for row in sessions),
+        default=0,
+    )
+    scan_truncated = len(sessions) >= _ACTIVITY_SCAN_LIMIT and oldest_scanned >= floor
     payload = {
         "contract_version": SESSIONS_ACTIVITY_V2_CONTRACT,
         "now": now,

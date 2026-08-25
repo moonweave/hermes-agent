@@ -5164,11 +5164,27 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
-    # Browser Use CLI backend — browser_exec replaces the whole browser_*
-    # surface (including browser_cdp/browser_dialog, whose check_fns funnel
-    # through here), so hide these tools from the model.
+    # Browser Use CLI backend — browser_exec normally replaces the whole
+    # browser_* surface.  Least-privilege sessions that do not grant terminal
+    # cannot receive browser_exec, because it executes host Python; their
+    # schema resolver separately calls check_builtin_browser_requirements()
+    # and exposes only the constrained browser_* actions when this local
+    # backend is available.
     if _is_browser_use_cli_mode():
         return False
+
+    return check_builtin_browser_requirements()
+
+
+def check_builtin_browser_requirements() -> bool:
+    """Check the constrained built-in browser backend independent of mode.
+
+    ``browser.backend=browser-use`` is a schema preference, not proof that the
+    local agent-browser/Chromium implementation is absent.  Keeping this probe
+    separate lets a browser-granted, no-terminal session fall back safely
+    without globally advertising both implementations or weakening the
+    browser_exec host-code gate.
+    """
 
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():

@@ -27,6 +27,7 @@ session a few steps later.
 """
 import asyncio
 from contextvars import copy_context
+from typing import Any, cast
 
 import pytest
 
@@ -148,6 +149,57 @@ def test_reset_session_vars_closes_inheritance_leak():
     assert captured["bound"]["HERMES_SESSION_KEY"] == FOREIGN["session_key"]
 
 
+def test_gateway_reentry_drops_inherited_delegated_child_context():
+    """A synthetic completion turn must start as a top-level parent turn.
+
+    ``BasePlatformAdapter.handle_message`` creates the gateway processing task
+    with ``asyncio.create_task``, which snapshots the caller's ContextVars.  A
+    background delegation completion can therefore re-enter from a context
+    that still carries the delegated-child marker.  The real gateway handler
+    must clear that inherited execution role before any parent tool can build a
+    subprocess environment.
+    """
+    from types import SimpleNamespace
+
+    from agent.delegation_context import delegated_child_context
+    from gateway.run import GatewayRunner
+    from tools.environments.local import _make_run_env
+
+    captured = {}
+
+    class ReentrySource:
+        @property
+        def profile(self):
+            captured["subprocess_marker"] = _make_run_env({}).get(
+                "HERMES_DELEGATED_CHILD_CONTEXT"
+            )
+            return None
+
+        @property
+        def profile_route_rejected(self):
+            # Stop immediately after the handler-entry reset seam.  This keeps
+            # the test focused on the actual gateway boundary without building
+            # an agent or touching a live platform/session.
+            return True
+
+    runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True))
+    event = SimpleNamespace(source=ReentrySource())
+
+    async def _reenter():
+        await GatewayRunner._handle_message(
+            cast(Any, runner),
+            cast(Any, event),
+        )
+
+    async def _spawn_reentry():
+        await asyncio.create_task(_reenter())
+
+    with delegated_child_context("child-session"):
+        asyncio.run(_spawn_reentry())
+
+    assert captured["subprocess_marker"] is None
+
+
 # ---------------------------------------------------------------------------
 # Async-delivery capability inheritance (the sibling var outside _VAR_MAP)
 # ---------------------------------------------------------------------------
@@ -198,5 +250,3 @@ def test_reset_session_vars_closes_async_delivery_leak():
         "After reset, async delivery must default to supported; "
         f"got {captured['window']!r}"
     )
-
-

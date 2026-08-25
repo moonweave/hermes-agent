@@ -12249,6 +12249,23 @@ def main():
         "--json", action="store_true", help="Emit the aggregate as JSON"
     )
 
+    sessions_activity_v2 = sessions_subparsers.add_parser(
+        "activity-v2",
+        help="Aggregate recent interactive evidence by profile/workspace (no ids or content)",
+    )
+    sessions_activity_v2.add_argument(
+        "--source", help="Filter by interactive session source (cli, desktop, telegram, ...)"
+    )
+    sessions_activity_v2.add_argument(
+        "--window",
+        type=int,
+        default=120,
+        help="Seconds for current evidence (default: 120)",
+    )
+    sessions_activity_v2.add_argument(
+        "--json", action="store_true", help="Emit the aggregate as JSON"
+    )
+
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument(
         "--source", help="Filter by source (cli, telegram, discord, etc.)"

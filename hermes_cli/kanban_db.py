@@ -228,6 +228,11 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Short-lived observation lease for a run whose evidence is stale,
+# unobservable, or PID-only. Consumers use this to keep an attention signal
+# brief without pretending it is a durable worker claim.
+_ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS = 120
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -12317,6 +12322,205 @@ def board_activity(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
         "retention_limit": limit,
         "now": int(time.time()),
         "events": events,
+    }
+
+
+@contextlib.contextmanager
+def _activity_read_snapshot(conn: sqlite3.Connection):
+    """Hold one read snapshot without taking ownership of a caller's txn."""
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+
+
+def _activity_ref_salt_readonly(conn: sqlite3.Connection) -> bytes:
+    """Read the board pseudonymization key without mutating an observation."""
+    row = conn.execute(
+        "SELECT value FROM kanban_meta WHERE key = ?", (_ACTIVITY_SALT_META_KEY,)
+    ).fetchone()
+    if row is None:
+        raise ValueError("kanban activity ref salt is missing")
+    try:
+        salt = bytes.fromhex(row[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("kanban activity ref salt is malformed") from exc
+    if len(salt) != _ACTIVITY_SALT_BYTES:
+        raise ValueError("kanban activity ref salt is malformed")
+    return salt
+
+
+def _current_run_evidence_state(
+    row: sqlite3.Row,
+    *,
+    now: int,
+    host_prefix: str,
+) -> tuple[str, Optional[int]]:
+    """Classify a current run using the same evidence hierarchy as stats."""
+    claim_lock = row["claim_lock"] or ""
+    heartbeat = row["last_heartbeat_at"]
+    claim_expires = row["claim_expires"]
+    pid = row["worker_pid"]
+    host_local = claim_lock.startswith(host_prefix)
+    heartbeat_stale = (
+        heartbeat is not None
+        and max(0, now - int(heartbeat)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    )
+    claim_expired = claim_expires is not None and int(claim_expires) < now
+    pid_alive = bool(host_local and pid and _pid_alive(int(pid)))
+    heartbeat_fresh = heartbeat is not None and not heartbeat_stale
+    if pid_alive and heartbeat_fresh and not claim_expired:
+        return "live_verified", int(heartbeat)
+    if heartbeat_stale or claim_expired or bool(host_local and pid and not pid_alive):
+        observed_at = heartbeat if heartbeat is not None else claim_expires
+        return "stale", int(observed_at) if observed_at is not None else now
+    if pid_alive:
+        return "pid_alive", now
+    return "unverified", now
+
+
+def _current_run_evidence_expiry(
+    row: sqlite3.Row,
+    *,
+    evidence_state: str,
+    observed_at: int,
+    now: int,
+) -> int:
+    """Return a numeric lease end strictly after the evidence observation."""
+    claim_expires = row["claim_expires"]
+    claim_lease = (
+        min(int(claim_expires), now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS)
+        if claim_expires is not None and int(claim_expires) > now
+        else None
+    )
+    if evidence_state == "live_verified":
+        return max(observed_at + 1, claim_lease or (now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS))
+    if evidence_state == "pid_alive":
+        return max(
+            observed_at + 1,
+            min(claim_lease, now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS)
+            if claim_lease is not None
+            else now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS,
+        )
+    return max(observed_at + 1, now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS)
+
+
+def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
+    """Return v1 lifecycle events plus current-run evidence in one snapshot.
+
+    This is deliberately additive: ``board_activity`` remains the v1 wire
+    contract. The v2 stream never carries a task/run id, titles, results,
+    claim details, paths, PIDs, or event payloads.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise ValueError("activity limit must be an integer between 1 and 200")
+
+    kinds = sorted(DASHBOARD_ACTIVITY_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    with _activity_read_snapshot(conn):
+        salt = _activity_ref_salt_readonly(conn)
+        event_rows = conn.execute(
+            "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+            "       r.profile AS run_profile "
+            "FROM task_events e "
+            "LEFT JOIN task_runs r ON r.id = e.run_id "
+            f"WHERE e.kind IN ({placeholders}) "
+            "ORDER BY e.id DESC LIMIT ?",
+            (*kinds, limit),
+        ).fetchall()
+        total_streams = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks t "
+            "JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND r.status = 'running'"
+        ).fetchone()[0])
+        stream_rows = conn.execute(
+            "SELECT r.id AS run_id, r.profile, r.started_at, r.claim_lock, "
+            "       r.worker_pid, r.last_heartbeat_at, r.claim_expires "
+            "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND r.status = 'running' "
+            "ORDER BY COALESCE(r.last_heartbeat_at, r.started_at) DESC, r.id DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    events = []
+    last_profile_by_work: dict[str, Optional[str]] = {}
+    for row in reversed(event_rows):
+        payload = None
+        if row["payload"]:
+            try:
+                candidate = json.loads(row["payload"])
+                payload = candidate if isinstance(candidate, dict) else None
+            except (TypeError, ValueError):
+                payload = None
+        payload_profile = payload.get("assignee") if payload else None
+        profile = (
+            payload_profile
+            if row["kind"] in {"created", "assigned"}
+            and isinstance(payload_profile, str)
+            else row["run_profile"]
+        )
+        profile = profile if isinstance(profile, str) and profile else None
+        work_ref = _dashboard_activity_ref("work", salt, row["task_id"])
+        previous_profile = last_profile_by_work.get(work_ref)
+        events.append({
+            "event_ref": _dashboard_activity_ref("event", salt, row["id"]),
+            "work_ref": work_ref,
+            "kind": row["kind"],
+            "occurred_at": int(row["created_at"]),
+            "profile": profile,
+            "previous_profile": (
+                previous_profile
+                if row["kind"] == "assigned" and previous_profile != profile
+                else None
+            ),
+        })
+        if profile is not None:
+            last_profile_by_work[work_ref] = profile
+
+    work_streams = []
+    for row in stream_rows:
+        evidence_state, observed_at = _current_run_evidence_state(
+            row, now=now, host_prefix=host_prefix
+        )
+        if observed_at is None:
+            observed_at = now
+        expires_at = _current_run_evidence_expiry(
+            row,
+            evidence_state=evidence_state,
+            observed_at=observed_at,
+            now=now,
+        )
+        work_streams.append({
+            "stream_ref": _dashboard_activity_ref("stream", salt, row["run_id"]),
+            "profile": row["profile"] if isinstance(row["profile"], str) and row["profile"] else None,
+            "evidence_state": evidence_state,
+            "evidence_observed_at": observed_at,
+            "evidence_expires_at": expires_at,
+            "phase_code": None,
+            "phase_observed_at": None,
+            "phase_expires_at": None,
+        })
+
+    scan_truncated = total_streams > len(work_streams)
+    return {
+        "contract_version": "hermes-kanban-activity-v2",
+        "retention_limit": limit,
+        "now": now,
+        "events": events,
+        "work_streams": work_streams,
+        "coverage": {
+            "complete": not scan_truncated,
+            "total_streams": total_streams,
+            "returned_streams": len(work_streams),
+            "scan_truncated": scan_truncated,
+        },
     }
 
 

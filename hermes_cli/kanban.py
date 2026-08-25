@@ -1014,6 +1014,20 @@ def build_parser(
     )
     p_activity.add_argument("--json", action="store_true")
 
+    p_activity_v2 = sub.add_parser(
+        "activity-v2",
+        help="Privacy-safe lifecycle and current-run evidence projection",
+    )
+    p_activity_v2.add_argument(
+        "--limit",
+        type=int,
+        default=80,
+        choices=range(1, 201),
+        metavar="1..200",
+        help="Maximum lifecycle events and current streams to return (default: 80)",
+    )
+    p_activity_v2.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1348,6 +1362,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "watch": _cmd_watch,
             "stats": _cmd_stats,
             "activity": _cmd_activity,
+            "activity-v2": _cmd_activity_v2,
             "log": _cmd_log,
             "runs": _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -3229,6 +3244,23 @@ def _cmd_activity(args: argparse.Namespace) -> int:
         print(
             f"  {_fmt_ts(event['occurred_at'])}  {event['kind']:10s}  "
             f"{event['work_ref']}  @{profile}"
+        )
+    return 0
+
+
+def _cmd_activity_v2(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        activity = kb.board_activity_v2(conn, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps(activity, indent=2, ensure_ascii=False))
+        return 0
+    print("Recent privacy-safe lifecycle activity and current work streams:")
+    for event in activity["events"]:
+        print(f"  {_fmt_ts(event['occurred_at'])}  {event['kind']:10s}  {event['work_ref']}")
+    for stream in activity["work_streams"]:
+        print(
+            f"  current  {stream['stream_ref']}  @{stream['profile'] or 'unresolved'}  "
+            f"{stream['evidence_state']}"
         )
     return 0
 

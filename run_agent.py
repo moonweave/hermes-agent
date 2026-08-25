@@ -638,8 +638,6 @@ class AIAgent:
             try:
                 from hermes_cli.profiles import get_active_profile_name
                 _profile_for_session = get_active_profile_name()
-                if _profile_for_session == "default":
-                    _profile_for_session = None
             except Exception:
                 _profile_for_session = None
             # Carry the live YOLO bypass into the creation-time model_config so

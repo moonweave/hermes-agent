@@ -23,6 +23,8 @@ import os
 import sys
 from pathlib import Path
 
+from hermes_cli.platforms import PLATFORMS
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference (call-time, keeps patches working)."""
@@ -46,6 +48,7 @@ _INTERACTIVE_ACTIVITY_V2_WINDOW_SECONDS = 120
 # Enough sessions to cover every workspace a person could plausibly have open
 # at once, while keeping the read bounded on a 300+ session store.
 _ACTIVITY_SCAN_LIMIT = 200
+_HQ_INTERACTIVE_SOURCES = frozenset(PLATFORMS).difference({"cli", "cron"})
 
 
 def _activity_workspace_key(row, workspace_key):
@@ -320,6 +323,7 @@ def _sessions_activity_v3(db, args) -> int:
     floor = now - window
     excluded_sources = [
         "tool", "dispatcher", "delegate", "subagent", "kanban", "kanban-worker",
+        "cron",
     ]
     sessions = db.list_sessions_rich(
         source=getattr(args, "source", None),
@@ -328,7 +332,7 @@ def _sessions_activity_v3(db, args) -> int:
         order_by_last_active=True,
     )
 
-    groups: dict[tuple[str, str], dict] = {}
+    groups: dict[tuple[str, str, str], dict] = {}
     unresolved_profile = {"recent_session_count": 0}
     unresolved_workspace = {"recent_session_count": 0}
     for row in sessions:
@@ -343,24 +347,35 @@ def _sessions_activity_v3(db, args) -> int:
         workspace = _activity_workspace_key(row, _ws_key)
         profile_raw = row.get("profile_name")
         profile = profile_raw.strip() if isinstance(profile_raw, str) else ""
-        if not workspace:
-            unresolved_workspace["recent_session_count"] += 1
         if not profile:
             unresolved_profile["recent_session_count"] += 1
-        if not workspace or not profile:
+        if not profile:
             continue
 
-        workspace_digest = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
-        group_key = (profile, workspace_digest)
+        source = str(row.get("source") or "").strip().lower()
+        if workspace:
+            context_scope = "workspace"
+            workspace_digest = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
+            context_identity = workspace_digest
+        elif source in _HQ_INTERACTIVE_SOURCES:
+            context_scope = "hq"
+            workspace_digest = None
+            context_identity = "hermes-hq"
+        else:
+            unresolved_workspace["recent_session_count"] += 1
+            continue
+
+        group_key = (profile, context_scope, context_identity)
         bucket = groups.setdefault(
             group_key,
             {
                 "activity_ref": "activity_"
                 + hashlib.sha256(
-                    f"{profile}\x1f{workspace_digest}".encode("utf-8")
+                    f"{profile}\x1f{context_scope}\x1f{context_identity}".encode("utf-8")
                 ).hexdigest()[:16],
                 "profile": profile,
                 "workspace_digest": workspace_digest,
+                "context_scope": context_scope,
                 "recent_session_count": 0,
                 "evidence_observed_at": None,
                 "_caption": None,
@@ -435,7 +450,9 @@ def _sessions_activity_v3(db, args) -> int:
 
     aggregates.sort(
         key=lambda entry: (
-            -(entry["evidence_observed_at"] or 0), entry["profile"], entry["workspace_digest"]
+            -(entry["evidence_observed_at"] or 0),
+            entry["profile"],
+            entry["workspace_digest"] or "",
         )
     )
     oldest_scanned = min(
@@ -463,8 +480,13 @@ def _sessions_activity_v3(db, args) -> int:
         return 0
     print(f"Recent interactive activity groups: {len(aggregates)}")
     for aggregate in aggregates:
+        context_label = (
+            "Hermes HQ"
+            if aggregate["context_scope"] == "hq"
+            else f"{aggregate['workspace_digest'][:12]}…"
+        )
         print(
-            f"  @{aggregate['profile']}  {aggregate['workspace_digest'][:12]}…  "
+            f"  @{aggregate['profile']}  {context_label}  "
             f"recent {aggregate['recent_session_count']}"
         )
     return 0

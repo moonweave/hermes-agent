@@ -36,12 +36,15 @@ class _Sessions:
         return [row for row in self.rows if row.get("source") not in excluded]
 
 
-def _session(*, session_id, active, caption=None, caption_at=None, source="desktop"):
+def _session(
+    *, session_id, active, caption=None, caption_at=None, source="desktop",
+    profile="reviewer", cwd="/private/repo",
+):
     return {
         "id": session_id,
         "source": source,
-        "profile_name": "reviewer",
-        "cwd": "/private/repo",
+        "profile_name": profile,
+        "cwd": cwd,
         "git_repo_root": None,
         "last_active": active,
         "last_activity_description": "executing tool",
@@ -193,6 +196,74 @@ def test_sessions_activity_v3_uses_latest_open_caption_and_keeps_v2_private(caps
     assert "older" not in json.dumps(payload)
     assert "newer" not in json.dumps(payload)
     assert "worker" not in json.dumps(payload)
+
+
+def test_discord_default_profile_without_workspace_projects_to_hq(capsys):
+    now = int(time.time())
+    db = _Sessions([
+        _session(
+            session_id="operator",
+            active=now - 2,
+            caption="현재 요청의 실행 경계를 확인하고 있어요.",
+            caption_at=now - 2,
+            source="discord",
+            profile="default",
+            cwd=None,
+        ),
+    ])
+
+    assert _sessions_activity_v3(db, argparse.Namespace(source=None, json=True, window=120)) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["unresolved_workspace"]["recent_session_count"] == 0
+    assert payload["aggregates"] == [{
+        "activity_ref": payload["aggregates"][0]["activity_ref"],
+        "profile": "default",
+        "workspace_digest": None,
+        "context_scope": "hq",
+        "recent_session_count": 1,
+        "evidence_observed_at": now - 2,
+        "evidence_expires_at": now + 118,
+        "live_caption": {
+            "text": "현재 요청의 실행 경계를 확인하고 있어요.",
+            "observed_at": now - 2,
+            "expires_at": now + 88,
+            "provenance": "agent_commentary",
+        },
+        "phase_code": "using_tool",
+        "phase_observed_at": now - 2,
+        "phase_expires_at": now + 43,
+    }]
+
+
+def test_default_gateway_profile_is_persisted_as_observed_identity(monkeypatch):
+    import run_agent
+    from run_agent import AIAgent
+
+    captured = {}
+
+    class _DB:
+        def create_session(self, **kwargs):
+            captured.update(kwargs)
+
+    agent = SimpleNamespace(
+        _persist_disabled=False,
+        _session_db_created=False,
+        _session_db=_DB(),
+        platform="discord",
+        session_id="gateway-session",
+        model="model",
+        _session_init_model_config=None,
+        _cached_system_prompt=None,
+        _parent_session_id=None,
+    )
+    monkeypatch.setattr(run_agent, "_session_source_for_agent", lambda _platform: "discord")
+    monkeypatch.setattr(run_agent, "_launch_cwd_for_session", lambda _source: None)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+
+    AIAgent._ensure_db_session(agent)
+
+    assert captured["profile_name"] == "default"
 
 
 def test_streaming_and_non_streaming_share_one_caption_boundary():

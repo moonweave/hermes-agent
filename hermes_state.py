@@ -5107,7 +5107,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (total_messages, total_tool_calls, child_session_id),
             )
             updated = conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression', "
+                "live_caption = NULL, live_caption_observed_at = NULL, "
+                "live_caption_expires_at = NULL, runtime_phase_code = NULL, "
+                "phase_observed_at = NULL, phase_expires_at = NULL "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), parent_session_id),
             )
@@ -5130,7 +5133,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "UPDATE sessions SET ended_at = ?, end_reason = ?, "
+                "live_caption = NULL, live_caption_observed_at = NULL, "
+                "live_caption_expires_at = NULL, runtime_phase_code = NULL, "
+                "phase_observed_at = NULL, phase_expires_at = NULL "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
@@ -5803,6 +5809,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "last_activity_provenance = ? "
                 "WHERE id = ?",
                 ("", ActivityProvenance.UNKNOWN.value, session_id),
+            )
+
+        self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
+
+    def publish_live_caption(
+        self,
+        session_id: str,
+        caption: str,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Publish one ephemeral caption only for its still-open session."""
+        if not session_id or not caption:
+            return False
+        from agent.live_activity import CAPTION_TTL_SECONDS, sanitize_live_caption
+
+        clean = sanitize_live_caption(caption)
+        if not clean:
+            return False
+        when = float(observed_at if observed_at is not None else time.time())
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET live_caption = ?, "
+                "live_caption_observed_at = ?, live_caption_expires_at = ? "
+                "WHERE id = ? AND ended_at IS NULL "
+                "AND (live_caption_observed_at IS NULL OR live_caption_observed_at <= ?)",
+                (clean, when, when + CAPTION_TTL_SECONDS, session_id, when),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S))
+
+    def publish_runtime_phase(
+        self,
+        session_id: str,
+        phase_code: str,
+        *,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        """Publish a deterministic runtime phase without changing liveness."""
+        from agent.live_activity import PHASE_TTL_SECONDS, valid_runtime_phase
+
+        phase = valid_runtime_phase(phase_code)
+        if not session_id or phase is None:
+            return False
+        when = float(observed_at if observed_at is not None else time.time())
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET runtime_phase_code = ?, "
+                "phase_observed_at = ?, phase_expires_at = ? "
+                "WHERE id = ? AND ended_at IS NULL "
+                "AND (phase_observed_at IS NULL OR phase_observed_at <= ?)",
+                (phase, when, when + PHASE_TTL_SECONDS, session_id, when),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S))
+
+    def clear_session_live_work_state(self, session_id: str) -> None:
+        """Remove only ephemeral public caption/phase state at turn end."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET live_caption = NULL, "
+                "live_caption_observed_at = NULL, live_caption_expires_at = NULL, "
+                "runtime_phase_code = NULL, phase_observed_at = NULL, "
+                "phase_expires_at = NULL WHERE id = ?",
+                (session_id,),
             )
 
         self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)

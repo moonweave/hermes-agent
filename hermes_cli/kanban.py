@@ -1028,6 +1028,20 @@ def build_parser(
     )
     p_activity_v2.add_argument("--json", action="store_true")
 
+    p_activity_v3 = sub.add_parser(
+        "activity-v3",
+        help="Current evidence with bounded agent commentary captions",
+    )
+    p_activity_v3.add_argument(
+        "--limit",
+        type=int,
+        default=80,
+        choices=range(1, 201),
+        metavar="1..200",
+        help="Maximum lifecycle events and current streams to return (default: 80)",
+    )
+    p_activity_v3.add_argument("--json", action="store_true")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1363,6 +1377,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "stats": _cmd_stats,
             "activity": _cmd_activity,
             "activity-v2": _cmd_activity_v2,
+            "activity-v3": _cmd_activity_v3,
             "log": _cmd_log,
             "runs": _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -3261,6 +3276,23 @@ def _cmd_activity_v2(args: argparse.Namespace) -> int:
         print(
             f"  current  {stream['stream_ref']}  @{stream['profile'] or 'unresolved'}  "
             f"{stream['evidence_state']}"
+        )
+    return 0
+
+
+def _cmd_activity_v3(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        activity = kb.board_activity_v3(conn, limit=args.limit)
+    if getattr(args, "json", False):
+        print(json.dumps(activity, indent=2, ensure_ascii=False))
+        return 0
+    print("Current work streams with agent commentary:")
+    for stream in activity["work_streams"]:
+        caption = stream.get("live_caption")
+        text = caption["text"] if caption else stream.get("phase_code") or "working"
+        print(
+            f"  current  {stream['stream_ref']}  "
+            f"@{stream['profile'] or 'unresolved'}  {text}"
         )
     return 0
 

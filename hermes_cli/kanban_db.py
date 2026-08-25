@@ -1394,7 +1394,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    live_caption        TEXT,
+    live_caption_observed_at REAL,
+    live_caption_expires_at REAL,
+    runtime_phase_code  TEXT,
+    phase_observed_at   REAL,
+    phase_expires_at    REAL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2652,6 +2658,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         is not None
     )
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        for name, declaration in (
+            ("live_caption", "live_caption TEXT"),
+            ("live_caption_observed_at", "live_caption_observed_at REAL"),
+            ("live_caption_expires_at", "live_caption_expires_at REAL"),
+            ("runtime_phase_code", "runtime_phase_code TEXT"),
+            ("phase_observed_at", "phase_observed_at REAL"),
+            ("phase_expires_at", "phase_expires_at REAL"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, declaration)
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2771,7 +2790,9 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, live_caption TEXT, live_caption_observed_at REAL,"
+        " live_caption_expires_at REAL, runtime_phase_code TEXT,"
+        " phase_observed_at REAL, phase_expires_at REAL)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -4260,7 +4281,13 @@ def _end_run(
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
-               worker_pid    = NULL
+               worker_pid    = NULL,
+               live_caption  = NULL,
+               live_caption_observed_at = NULL,
+               live_caption_expires_at = NULL,
+               runtime_phase_code = NULL,
+               phase_observed_at = NULL,
+               phase_expires_at = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4279,6 +4306,65 @@ def _end_run(
         (task_id,),
     )
     return run_id
+
+
+def publish_run_caption(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    caption: str,
+    observed_at: Optional[float] = None,
+) -> bool:
+    """Publish a caption only while this exact run still owns the task."""
+    from agent.live_activity import CAPTION_TTL_SECONDS, sanitize_live_caption
+
+    clean = sanitize_live_caption(caption)
+    if not clean:
+        return False
+    when = float(observed_at if observed_at is not None else time.time())
+    with write_txn(conn):
+        cursor = conn.execute(
+            "UPDATE task_runs SET live_caption = ?, "
+            "live_caption_observed_at = ?, live_caption_expires_at = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL AND EXISTS (SELECT 1 FROM tasks t "
+            "WHERE t.id = ? AND t.status = 'running' AND t.current_run_id = task_runs.id) "
+            "AND (live_caption_observed_at IS NULL OR live_caption_observed_at <= ?)",
+            (
+                clean, when, when + CAPTION_TTL_SECONDS, int(run_id), task_id,
+                task_id, when,
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def publish_run_phase(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    phase_code: str,
+    observed_at: Optional[float] = None,
+) -> bool:
+    """Publish a deterministic phase without extending the run lease."""
+    from agent.live_activity import PHASE_TTL_SECONDS, valid_runtime_phase
+
+    phase = valid_runtime_phase(phase_code)
+    if phase is None:
+        return False
+    when = float(observed_at if observed_at is not None else time.time())
+    with write_txn(conn):
+        cursor = conn.execute(
+            "UPDATE task_runs SET runtime_phase_code = ?, "
+            "phase_observed_at = ?, phase_expires_at = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL AND EXISTS (SELECT 1 FROM tasks t "
+            "WHERE t.id = ? AND t.status = 'running' AND t.current_run_id = task_runs.id) "
+            "AND (phase_observed_at IS NULL OR phase_observed_at <= ?)",
+            (phase, when, when + PHASE_TTL_SECONDS, int(run_id), task_id, task_id, when),
+        )
+    return cursor.rowcount == 1
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -12419,11 +12505,16 @@ def _current_run_evidence_expiry(
     return max(observed_at + 1, now + _ACTIVITY_EVIDENCE_SHORT_LEASE_SECONDS)
 
 
-def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
-    """Return v1 lifecycle events plus current-run evidence in one snapshot.
+def _board_activity_current(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    contract_version: str,
+    include_live_caption: bool,
+) -> dict:
+    """Return lifecycle events and current-run evidence in one snapshot.
 
-    This is deliberately additive: ``board_activity`` remains the v1 wire
-    contract. The v2 stream never carries a task/run id, titles, results,
+    The public streams never carry a task/run id, titles, results,
     claim details, paths, PIDs, or event payloads.
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
@@ -12451,7 +12542,10 @@ def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
         ).fetchone()[0])
         stream_rows = conn.execute(
             "SELECT r.id AS run_id, r.profile, r.started_at, r.claim_lock, "
-            "       r.worker_pid, r.last_heartbeat_at, r.claim_expires "
+            "       r.worker_pid, r.last_heartbeat_at, r.claim_expires, "
+            "       r.live_caption, r.live_caption_observed_at, "
+            "       r.live_caption_expires_at, r.runtime_phase_code, "
+            "       r.phase_observed_at, r.phase_expires_at "
             "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
             "WHERE t.status = 'running' AND r.status = 'running' "
             "ORDER BY COALESCE(r.last_heartbeat_at, r.started_at) DESC, r.id DESC "
@@ -12507,20 +12601,57 @@ def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
             observed_at=observed_at,
             now=now,
         )
-        work_streams.append({
+        evidence_is_working = evidence_state in {"live_verified", "pid_alive"}
+        phase_code = row["runtime_phase_code"]
+        phase_observed_at = row["phase_observed_at"]
+        phase_expires_at = row["phase_expires_at"]
+        phase_current = (
+            evidence_is_working
+            and phase_code in {
+                "starting", "thinking", "using_tool", "coordinating",
+                "waiting", "organizing", "working",
+            }
+            and phase_observed_at is not None
+            and phase_expires_at is not None
+            and float(phase_expires_at) > now
+        )
+        stream = {
             "stream_ref": _dashboard_activity_ref("stream", salt, row["run_id"]),
             "profile": row["profile"] if isinstance(row["profile"], str) and row["profile"] else None,
             "evidence_state": evidence_state,
             "evidence_observed_at": observed_at,
             "evidence_expires_at": expires_at,
-            "phase_code": None,
-            "phase_observed_at": None,
-            "phase_expires_at": None,
-        })
+            "phase_code": phase_code if phase_current else None,
+            "phase_observed_at": int(float(phase_observed_at)) if phase_current else None,
+            "phase_expires_at": min(int(float(phase_expires_at)), expires_at) if phase_current else None,
+        }
+        if include_live_caption:
+            caption = row["live_caption"]
+            caption_observed_at = row["live_caption_observed_at"]
+            caption_expires_at = row["live_caption_expires_at"]
+            caption_current = (
+                evidence_is_working
+                and isinstance(caption, str)
+                and bool(caption.strip())
+                and caption_observed_at is not None
+                and caption_expires_at is not None
+                and float(caption_expires_at) > now
+            )
+            stream["live_caption"] = (
+                {
+                    "text": caption,
+                    "observed_at": int(float(caption_observed_at)),
+                    "expires_at": min(int(float(caption_expires_at)), expires_at),
+                    "provenance": "agent_commentary",
+                }
+                if caption_current
+                else None
+            )
+        work_streams.append(stream)
 
     scan_truncated = total_streams > len(work_streams)
     return {
-        "contract_version": "hermes-kanban-activity-v2",
+        "contract_version": contract_version,
         "retention_limit": limit,
         "now": now,
         "events": events,
@@ -12532,6 +12663,26 @@ def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
             "scan_truncated": scan_truncated,
         },
     }
+
+
+def board_activity_v2(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
+    """Return the stable v2 lifecycle/current-evidence contract."""
+    return _board_activity_current(
+        conn,
+        limit=limit,
+        contract_version="hermes-kanban-activity-v2",
+        include_live_caption=False,
+    )
+
+
+def board_activity_v3(conn: sqlite3.Connection, *, limit: int = 80) -> dict:
+    """Return v2 evidence plus a bounded agent-commentary caption."""
+    return _board_activity_current(
+        conn,
+        limit=limit,
+        contract_version="hermes-kanban-activity-v3",
+        include_live_caption=True,
+    )
 
 
 def _to_epoch(val) -> Optional[int]:

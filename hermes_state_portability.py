@@ -268,6 +268,16 @@ class SessionPortabilityMixin:
         session = self.get_session(session_id)
         if not session:
             return None
+        session = dict(session)
+        for key in (
+            "live_caption",
+            "live_caption_observed_at",
+            "live_caption_expires_at",
+            "runtime_phase_code",
+            "phase_observed_at",
+            "phase_expires_at",
+        ):
+            session.pop(key, None)
         messages = self.get_messages(session_id)
         return {**session, "messages": messages}
 

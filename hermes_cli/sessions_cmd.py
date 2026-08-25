@@ -41,6 +41,7 @@ def _relative_time(ts):
 
 SESSIONS_ACTIVITY_CONTRACT = "hermes-sessions-activity-v1"
 SESSIONS_ACTIVITY_V2_CONTRACT = "hermes-sessions-activity-v2"
+SESSIONS_ACTIVITY_V3_CONTRACT = "hermes-sessions-activity-v3"
 _INTERACTIVE_ACTIVITY_V2_WINDOW_SECONDS = 120
 # Enough sessions to cover every workspace a person could plausibly have open
 # at once, while keeping the read bounded on a 300+ session store.
@@ -299,6 +300,176 @@ def _sessions_activity_v2(db, args) -> int:
     return 0
 
 
+def _sessions_activity_v3(db, args) -> int:
+    """Aggregate current interactive evidence with ephemeral public captions."""
+    import hashlib
+    import json as _json
+    import time as _time
+
+    from agent.live_activity import valid_runtime_phase
+    from hermes_state import workspace_key as _ws_key
+
+    window = max(
+        1,
+        int(
+            getattr(args, "window", _INTERACTIVE_ACTIVITY_V2_WINDOW_SECONDS)
+            or _INTERACTIVE_ACTIVITY_V2_WINDOW_SECONDS
+        ),
+    )
+    now = int(_time.time())
+    floor = now - window
+    excluded_sources = [
+        "tool", "dispatcher", "delegate", "subagent", "kanban", "kanban-worker",
+    ]
+    sessions = db.list_sessions_rich(
+        source=getattr(args, "source", None),
+        exclude_sources=excluded_sources,
+        limit=_ACTIVITY_SCAN_LIMIT,
+        order_by_last_active=True,
+    )
+
+    groups: dict[tuple[str, str], dict] = {}
+    unresolved_profile = {"recent_session_count": 0}
+    unresolved_workspace = {"recent_session_count": 0}
+    for row in sessions:
+        if row.get("ended_at") is not None:
+            continue
+        if not (row.get("last_activity_description") or "").strip():
+            continue
+        last_active = row.get("last_active")
+        last_active = int(last_active) if last_active else None
+        if last_active is None or last_active <= floor:
+            continue
+        workspace = _activity_workspace_key(row, _ws_key)
+        profile_raw = row.get("profile_name")
+        profile = profile_raw.strip() if isinstance(profile_raw, str) else ""
+        if not workspace:
+            unresolved_workspace["recent_session_count"] += 1
+        if not profile:
+            unresolved_profile["recent_session_count"] += 1
+        if not workspace or not profile:
+            continue
+
+        workspace_digest = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
+        group_key = (profile, workspace_digest)
+        bucket = groups.setdefault(
+            group_key,
+            {
+                "activity_ref": "activity_"
+                + hashlib.sha256(
+                    f"{profile}\x1f{workspace_digest}".encode("utf-8")
+                ).hexdigest()[:16],
+                "profile": profile,
+                "workspace_digest": workspace_digest,
+                "recent_session_count": 0,
+                "evidence_observed_at": None,
+                "_caption": None,
+                "_phase": None,
+            },
+        )
+        bucket["recent_session_count"] += 1
+        if bucket["evidence_observed_at"] is None or last_active > bucket["evidence_observed_at"]:
+            bucket["evidence_observed_at"] = last_active
+
+        caption = row.get("live_caption")
+        caption_observed = row.get("live_caption_observed_at")
+        caption_expires = row.get("live_caption_expires_at")
+        if (
+            isinstance(caption, str)
+            and caption.strip()
+            and isinstance(caption_observed, (int, float))
+            and isinstance(caption_expires, (int, float))
+            and caption_observed <= now < caption_expires
+            and (
+                bucket["_caption"] is None
+                or caption_observed > bucket["_caption"]["observed_at"]
+            )
+        ):
+            bucket["_caption"] = {
+                "text": caption.strip(),
+                "observed_at": int(caption_observed),
+                "expires_at": int(caption_expires),
+                "provenance": "agent_commentary",
+            }
+
+        phase_code = row.get("runtime_phase_code")
+        phase_observed = row.get("phase_observed_at")
+        phase_expires = row.get("phase_expires_at")
+        if (
+            valid_runtime_phase(phase_code)
+            and isinstance(phase_observed, (int, float))
+            and isinstance(phase_expires, (int, float))
+            and phase_observed <= now < phase_expires
+            and (
+                bucket["_phase"] is None
+                or phase_observed > bucket["_phase"]["observed_at"]
+            )
+        ):
+            bucket["_phase"] = {
+                "code": phase_code,
+                "observed_at": int(phase_observed),
+                "expires_at": int(phase_expires),
+            }
+
+    aggregates = []
+    for bucket in groups.values():
+        observed_at = bucket["evidence_observed_at"]
+        evidence_expires = observed_at + window
+        caption = bucket.pop("_caption")
+        phase = bucket.pop("_phase")
+        bucket["evidence_expires_at"] = evidence_expires
+        if caption is not None:
+            caption["expires_at"] = min(caption["expires_at"], evidence_expires)
+            if caption["expires_at"] <= now:
+                caption = None
+        bucket["live_caption"] = caption
+        if phase is not None:
+            bucket["phase_code"] = phase["code"]
+            bucket["phase_observed_at"] = phase["observed_at"]
+            bucket["phase_expires_at"] = min(phase["expires_at"], evidence_expires)
+        else:
+            bucket["phase_code"] = None
+            bucket["phase_observed_at"] = None
+            bucket["phase_expires_at"] = None
+        aggregates.append(bucket)
+
+    aggregates.sort(
+        key=lambda entry: (
+            -(entry["evidence_observed_at"] or 0), entry["profile"], entry["workspace_digest"]
+        )
+    )
+    oldest_scanned = min(
+        (int(row.get("last_active") or 0) for row in sessions),
+        default=0,
+    )
+    scan_truncated = len(sessions) >= _ACTIVITY_SCAN_LIMIT and oldest_scanned >= floor
+    payload = {
+        "contract_version": SESSIONS_ACTIVITY_V3_CONTRACT,
+        "now": now,
+        "window_seconds": window,
+        "scan_limit": _ACTIVITY_SCAN_LIMIT,
+        "aggregates": aggregates,
+        "unresolved_profile": unresolved_profile,
+        "unresolved_workspace": unresolved_workspace,
+        "coverage": {
+            "complete": not scan_truncated,
+            "total_aggregates": len(aggregates),
+            "returned_aggregates": len(aggregates),
+            "scan_truncated": scan_truncated,
+        },
+    }
+    if getattr(args, "json", False):
+        print(_json.dumps(payload, indent=2))
+        return 0
+    print(f"Recent interactive activity groups: {len(aggregates)}")
+    for aggregate in aggregates:
+        print(
+            f"  @{aggregate['profile']}  {aggregate['workspace_digest'][:12]}…  "
+            f"recent {aggregate['recent_session_count']}"
+        )
+    return 0
+
+
 def _session_browse_picker(sessions):
     return _m()._session_browse_picker(sessions)
 
@@ -508,6 +679,8 @@ def cmd_sessions(args, sessions_parser=None):
         return _sessions_activity(db, args)
     if action == "activity-v2":
         return _sessions_activity_v2(db, args)
+    if action == "activity-v3":
+        return _sessions_activity_v3(db, args)
 
     if action == "list":
         from hermes_state import workspace_key as _ws_key

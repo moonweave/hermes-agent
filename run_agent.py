@@ -3809,6 +3809,7 @@ class AIAgent:
         if force_persist:
             reset_session_activity_persist_window(self)
         self._persist_session_activity_if_due()
+        self._publish_runtime_phase(desc)
 
     def _persist_session_activity_if_due(self) -> None:
         """Best-effort durable activity heartbeat for SessionDB consumers.
@@ -3854,6 +3855,77 @@ class AIAgent:
                 exc_info=True,
             )
 
+    def _publish_runtime_phase(self, activity_description: str) -> None:
+        """Best-effort, rate-limited phase projection for the current owner."""
+        from agent.live_activity import (
+            PHASE_REFRESH_SECONDS,
+            runtime_phase_for_activity,
+        )
+
+        phase = runtime_phase_for_activity(activity_description)
+        now_mono = time.monotonic()
+        last_phase = getattr(self, "_live_phase_last_code", None)
+        last_mono = getattr(self, "_live_phase_last_persist_mono", 0.0)
+        if phase == last_phase and (now_mono - last_mono) < PHASE_REFRESH_SECONDS:
+            return
+        self._live_phase_last_code = phase
+        self._live_phase_last_persist_mono = now_mono
+        observed_at = time.time()
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        try:
+            publish = getattr(session_db, "publish_runtime_phase", None)
+            if session_id and callable(publish):
+                publish(session_id, phase, observed_at=observed_at)
+        except Exception:
+            logger.debug("session runtime phase write failed", exc_info=True)
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                from tools.kanban_tools import publish_current_worker_phase_from_env
+
+                publish_current_worker_phase_from_env(
+                    phase, observed_at=observed_at
+                )
+            except Exception:
+                logger.debug("kanban runtime phase write failed", exc_info=True)
+
+    def _publish_live_caption(self, text: str) -> bool:
+        """Publish one accepted interim sentence to UI delivery and storage."""
+        if not getattr(self, "show_commentary", True):
+            return False
+        from agent.live_activity import sanitize_live_caption
+
+        clean = sanitize_live_caption(text)
+        if not clean:
+            return False
+        lock = getattr(self, "_live_caption_publish_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._live_caption_publish_lock = lock
+        with lock:
+            if clean == getattr(self, "_live_caption_last_text", None):
+                return False
+            self._live_caption_last_text = clean
+            observed_at = time.time()
+            session_id = getattr(self, "session_id", None)
+            session_db = getattr(self, "_session_db", None)
+            try:
+                publish = getattr(session_db, "publish_live_caption", None)
+                if session_id and callable(publish):
+                    publish(session_id, clean, observed_at=observed_at)
+            except Exception:
+                logger.debug("session live caption write failed", exc_info=True)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                try:
+                    from tools.kanban_tools import publish_current_worker_caption_from_env
+
+                    publish_current_worker_caption_from_env(
+                        clean, observed_at=observed_at
+                    )
+                except Exception:
+                    logger.debug("kanban live caption write failed", exc_info=True)
+        return True
+
     def _reset_activity_labels_after_turn(self) -> None:
         """Drop mid-turn activity labels once the turn is no longer running.
 
@@ -3869,16 +3941,19 @@ class AIAgent:
         self._last_activity_provenance = ActivityProvenance.UNKNOWN
         session_id = getattr(self, "session_id", None)
         session_db = getattr(self, "_session_db", None)
-        if not session_id or session_db is None:
-            return
-        clear = getattr(session_db, "clear_session_activity_labels", None)
-        if not callable(clear):
-            return
-        try:
-            clear(session_id)
-        except Exception:
-            # Never let durable cleanup I/O break turn teardown.
-            pass
+        if session_id and session_db is not None:
+            try:
+                clear = getattr(session_db, "clear_session_activity_labels", None)
+                if callable(clear):
+                    clear(session_id)
+                clear_live = getattr(session_db, "clear_session_live_work_state", None)
+                if callable(clear_live):
+                    clear_live(session_id)
+            except Exception:
+                # Never let durable cleanup I/O break turn teardown.
+                pass
+        self._live_caption_last_text = None
+        self._live_phase_last_code = None
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -6342,17 +6417,20 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
         visible = self._strip_think_blocks(text).strip()
         if visible:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        self._publish_live_caption(visible)
+        self._record_delivered_interim_text(visible)
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is None:
+            return
         try:
             cb(visible, already_streamed=False)
-            self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
@@ -6395,6 +6473,7 @@ class AIAgent:
             or self._interim_text_was_delivered(visible)
         ):
             return
+        self._publish_live_caption(visible)
         already_streamed = self._interim_content_was_streamed(visible)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
@@ -6414,6 +6493,11 @@ class AIAgent:
             logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
+            if undelivered_parts:
+                for part in undelivered_parts:
+                    self._record_delivered_interim_text(part)
+            else:
+                self._record_delivered_interim_text(visible)
             return
         try:
             cb(visible, already_streamed=already_streamed)

@@ -363,6 +363,64 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
+def publish_current_worker_caption_from_env(
+    caption: str, *, observed_at: Optional[float] = None
+) -> bool:
+    """Best-effort caption write scoped to the exact dispatcher run."""
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or not _is_dispatcher_owned_worker():
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return False
+    try:
+        kb, conn = _connect()
+        try:
+            return bool(
+                kb.publish_run_caption(
+                    conn,
+                    task_id=tid,
+                    run_id=run_id,
+                    caption=caption,
+                    observed_at=observed_at,
+                )
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("live caption bridge failed", exc_info=True)
+        return False
+
+
+def publish_current_worker_phase_from_env(
+    phase_code: str, *, observed_at: Optional[float] = None
+) -> bool:
+    """Best-effort phase write scoped to the exact dispatcher run."""
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or not _is_dispatcher_owned_worker():
+        return False
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return False
+    try:
+        kb, conn = _connect()
+        try:
+            return bool(
+                kb.publish_run_phase(
+                    conn,
+                    task_id=tid,
+                    run_id=run_id,
+                    phase_code=phase_code,
+                    observed_at=observed_at,
+                )
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("runtime phase bridge failed", exc_info=True)
+        return False
+
+
 # Live operator-note injection: poll the worker's task for new comments and
 # fold them into the running agent via the OUT-OF-BAND steer channel, so a user
 # can "talk to" a running kanban task without the block → comment → unblock

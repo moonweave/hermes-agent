@@ -2576,6 +2576,27 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
+class SendOnceOutcome(str, Enum):
+    """Transport outcome for a call that must never be retried automatically."""
+
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+    DELIVERY_UNCERTAIN = "DELIVERY_UNCERTAIN"
+
+
+@dataclass(frozen=True)
+class SendOnceResult:
+    """Structured receipt for an exactly-one-attempt adapter transport call."""
+
+    outcome: SendOnceOutcome
+    message_id: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def definitive(self) -> bool:
+        return self.outcome is not SendOnceOutcome.DELIVERY_UNCERTAIN
+
+
 # Machine-readable send-failure categories.  Kept platform-neutral so every
 # adapter can populate ``SendResult.error_kind`` from the same vocabulary and
 # the gateway can decide — once, in one place — whether a failure is worth
@@ -4081,6 +4102,24 @@ class BasePlatformAdapter(ABC):
             SendResult with success status and message ID
         """
         pass
+
+    async def send_once(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendOnceResult:
+        """Attempt one transport call, or fail definitively when unsupported.
+
+        This capability is intentionally separate from :meth:`send`, whose
+        platform-specific formatting and recovery paths may retry or fall back.
+        Capability-backed delivery ledgers must use this method exclusively.
+        """
+        return SendOnceResult(
+            outcome=SendOnceOutcome.FAILED,
+            error="send_once_unsupported",
+        )
 
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final

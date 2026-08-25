@@ -194,6 +194,8 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    SendOnceOutcome,
+    SendOnceResult,
     classify_send_error,
     cache_image_from_bytes,
     cache_audio_from_bytes,
@@ -5249,6 +5251,104 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
+
+    @staticmethod
+    def _definitive_send_once_error(exc: BaseException) -> bool:
+        """Whether Telegram definitively rejected a single transport request.
+
+        Bot API response errors prove that Telegram received and rejected the
+        request.  Network and timeout exceptions do not prove whether the
+        request was accepted, so callers must classify them as uncertain.
+        """
+        try:
+            from telegram.error import (  # type: ignore[reportMissingImports]
+                BadRequest,
+                Forbidden,
+                InvalidToken,
+                RetryAfter,
+            )
+
+            return isinstance(exc, (BadRequest, Forbidden, InvalidToken, RetryAfter))
+        except (ImportError, AttributeError, TypeError):
+            return False
+
+    async def send_once(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendOnceResult:
+        """Perform exactly one Telegram Bot API message transport call.
+
+        No rich-message fallback, Markdown fallback, thread fallback, reconnect
+        wait, flood retry, or chunk split is permitted on this surface.  Once
+        ``send_message`` is invoked, any non-definitive exception is reported
+        as ``DELIVERY_UNCERTAIN`` so the durable caller never auto-retries it.
+        """
+        bot = self._bot
+        if not bot:
+            return SendOnceResult(
+                outcome=SendOnceOutcome.FAILED,
+                error="not_connected",
+            )
+        try:
+            if not content or not content.strip():
+                return SendOnceResult(
+                    outcome=SendOnceOutcome.FAILED,
+                    error="empty_content",
+                )
+            formatted = self.format_message(content)
+            if utf16_len(formatted) > self.MAX_MESSAGE_LENGTH:
+                return SendOnceResult(
+                    outcome=SendOnceOutcome.FAILED,
+                    error="content_too_long_for_send_once",
+                )
+
+            thread_id = self._metadata_thread_id(metadata)
+            routing = self._compute_single_send_routing(
+                chat_id, reply_to, metadata, thread_id
+            )
+            if routing is None:
+                return SendOnceResult(
+                    outcome=SendOnceOutcome.FAILED,
+                    error=self._dm_topic_missing_anchor_error(),
+                )
+            reply_to_id, thread_kwargs = routing
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": formatted,
+                "parse_mode": getattr(ParseMode, "MARKDOWN_V2", "MarkdownV2"),
+                "reply_to_message_id": reply_to_id,
+            }
+            send_kwargs.update(thread_kwargs)
+            send_kwargs.update(self._link_preview_kwargs())
+            send_kwargs.update(self._notification_kwargs(metadata))
+        except Exception as exc:
+            return SendOnceResult(
+                outcome=SendOnceOutcome.FAILED,
+                error=_redact_telegram_error_text(exc),
+            )
+
+        try:
+            message = await bot.send_message(**send_kwargs)
+        except Exception as exc:
+            safe_error = _redact_telegram_error_text(exc)
+            if self._definitive_send_once_error(exc):
+                return SendOnceResult(
+                    outcome=SendOnceOutcome.FAILED,
+                    error=safe_error,
+                )
+            return SendOnceResult(
+                outcome=SendOnceOutcome.DELIVERY_UNCERTAIN,
+                error=safe_error,
+            )
+
+        message_id = getattr(message, "message_id", None)
+        return SendOnceResult(
+            outcome=SendOnceOutcome.DELIVERED,
+            message_id=str(message_id) if message_id is not None else None,
+        )
 
     async def send(
         self,

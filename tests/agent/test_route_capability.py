@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import base64
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -11,6 +13,12 @@ from typing import Any, cast
 import pytest
 
 from agent.delegation_context import delegated_child_context
+from agent.secret_scope import (
+    is_multiplex_active,
+    reset_secret_scope,
+    set_multiplex_active,
+    set_secret_scope,
+)
 from agent.route_capability import (
     AccountScope,
     CoordinatorJobState,
@@ -22,6 +30,7 @@ from agent.route_capability import (
     CoordinatorRoleTerminalState,
     CoordinatorRouteError,
     CoordinatorService,
+    TeamMcpBindingToken,
     reset_coordinator_registry_for_tests,
 )
 
@@ -113,6 +122,12 @@ def _reserve(service, capability, **overrides):
     return service.reserve_consultation(**values)
 
 
+def _decode_binding_payload(token):
+    _version, encoded_payload, _signature = token.reveal_for_transport().split(".")
+    padding = "=" * (-len(encoded_payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded_payload + padding))
+
+
 def test_reserve_creates_host_job_handle_without_constructing_aiagent(service_setup):
     _parent_agent, _now, service, built = service_setup
     capability = _capability(service)
@@ -151,6 +166,266 @@ def test_capability_and_handle_repr_omit_secrets(service_setup):
     assert capability.nonce not in repr(capability)
     assert handle.capability not in repr(handle)
     assert handle.capability not in repr(service.status(handle))
+
+
+def test_team_mcp_binding_token_uses_profile_scoped_secret_and_exact_payload(
+    service_setup, monkeypatch, caplog
+):
+    _parent_agent, now, service, _built = service_setup
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setattr(
+        "agent.route_capability.secrets.token_hex", lambda size: "ab" * size
+    )
+    encoded_key = base64.b64encode(bytes(range(32))).decode("ascii")
+    scope_token = set_secret_scope({"KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64": encoded_key})
+    try:
+        token = service.issue_team_mcp_binding_token(
+            handle, personal_portfolio=False, ttl_seconds=60
+        )
+    finally:
+        reset_secret_scope(scope_token)
+
+    wire_token = token.reveal_for_transport()
+    assert not isinstance(token, str)
+    assert wire_token.startswith("v1.")
+    assert wire_token not in str(token)
+    assert wire_token not in f"{token}"
+    assert wire_token not in "%s" % token
+    assert wire_token not in repr(token)
+    assert wire_token not in repr({"token": token})
+    with pytest.raises(TypeError) as json_error:
+        json.dumps({"token": token})
+    assert wire_token not in str(json_error.value)
+    assert wire_token not in caplog.text
+    assert encoded_key not in caplog.text
+    assert _decode_binding_payload(token) == {
+        "version": 1,
+        "key_id": "kospi-team-v2",
+        "type": "coordinator_binding",
+        "issuer_plugin_id": "kospi-team",
+        "coordinator_id": handle.coordinator_id,
+        "consultation_id": "T123",
+        "parent_session_id": "session-1",
+        "parent_turn_id": "turn-1",
+        "user_message_sha256": handle.user_message_sha256,
+        "coordinator_route": "investment.team",
+        "account_scope": "OMITTED",
+        "personal_portfolio": False,
+        "issued_at": int(now[0]),
+        "expires_at": int(now[0]) + 60,
+        "nonce": "ab" * 16,
+    }
+
+
+def test_team_mcp_binding_token_matches_phase2_golden_vector():
+    from agent.route_capability import _build_team_mcp_binding_token
+
+    payload = {
+        "account_scope": "PORTFOLIO",
+        "consultation_id": "T123",
+        "coordinator_id": "coord-0123456789abcdef",
+        "coordinator_route": "portfolio_consultation",
+        "expires_at": 1787652300,
+        "issued_at": 1787652000,
+        "issuer_plugin_id": "kospi-investment-team",
+        "key_id": "kospi-team-v2",
+        "nonce": "0123456789abcdef0123456789abcdef",
+        "parent_session_id": "session-abc",
+        "parent_turn_id": "turn-7",
+        "personal_portfolio": True,
+        "type": "coordinator_binding",
+        "user_message_sha256": (
+            "beaa718106b953f6761305f586ad2dce5318b7b60cfa0b0ba91d04d28d6299ca"
+        ),
+        "version": 1,
+    }
+    expected = (
+        "v1.eyJhY2NvdW50X3Njb3BlIjoiUE9SVEZPTElPIiwiY29uc3VsdGF0aW9uX2lkIjoi"
+        "VDEyMyIsImNvb3JkaW5hdG9yX2lkIjoiY29vcmQtMDEyMzQ1Njc4OWFiY2RlZiIsImNv"
+        "b3JkaW5hdG9yX3JvdXRlIjoicG9ydGZvbGlvX2NvbnN1bHRhdGlvbiIsImV4cGlyZXNf"
+        "YXQiOjE3ODc2NTIzMDAsImlzc3VlZF9hdCI6MTc4NzY1MjAwMCwiaXNzdWVyX3BsdWdp"
+        "bl9pZCI6Imtvc3BpLWludmVzdG1lbnQtdGVhbSIsImtleV9pZCI6Imtvc3BpLXRlYW0t"
+        "djIiLCJub25jZSI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmIiwicGFy"
+        "ZW50X3Nlc3Npb25faWQiOiJzZXNzaW9uLWFiYyIsInBhcmVudF90dXJuX2lkIjoidHVy"
+        "bi03IiwicGVyc29uYWxfcG9ydGZvbGlvIjp0cnVlLCJ0eXBlIjoiY29vcmRpbmF0b3Jf"
+        "YmluZGluZyIsInVzZXJfbWVzc2FnZV9zaGEyNTYiOiJiZWFhNzE4MTA2Yjk1M2Y2NzYx"
+        "MzA1ZjU4NmFkMmRjZTUzMThiN2I2MGNmYTBiMGJhOTFkMDRkMjhkNjI5OWNhIiwidmVy"
+        "c2lvbiI6MX0.V6SXcPxZAU0wbtyPd88hsukI3wI4NUe4UC9TASFmK60"
+    )
+
+    token = TeamMcpBindingToken(
+        _build_team_mcp_binding_token(payload, bytes(range(32)))
+    )
+    assert token.reveal_for_transport() == expected
+
+
+@pytest.mark.parametrize(
+    "encoded_key",
+    [None, "%%%not-base64%%%", base64.b64encode(b"short").decode("ascii")],
+)
+def test_team_mcp_binding_token_missing_or_malformed_key_fails_closed(
+    service_setup, monkeypatch, encoded_key
+):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setattr("agent.secret_scope.get_secret", lambda _name: encoded_key)
+
+    with pytest.raises(CoordinatorRouteError) as exc_info:
+        service.issue_team_mcp_binding_token(
+            handle, personal_portfolio=False, ttl_seconds=60
+        )
+
+    assert str(encoded_key) not in str(exc_info.value)
+    assert built == []
+
+
+def test_team_mcp_binding_token_never_falls_back_to_process_env_in_multiplex(
+    service_setup, monkeypatch
+):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setenv(
+        "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64",
+        base64.b64encode(bytes(range(32))).decode("ascii"),
+    )
+    previous = is_multiplex_active()
+    scope_token = set_secret_scope(None)
+    set_multiplex_active(True)
+    try:
+        with pytest.raises(CoordinatorRouteError, match="unavailable"):
+            service.issue_team_mcp_binding_token(
+                handle, personal_portfolio=False, ttl_seconds=60
+            )
+    finally:
+        set_multiplex_active(previous)
+        reset_secret_scope(scope_token)
+
+    assert built == []
+
+
+@pytest.mark.parametrize("ttl", [True, 0, -1, 301, float("inf"), float("nan")])
+def test_team_mcp_binding_token_rejects_invalid_ttl(service_setup, ttl):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+
+    with pytest.raises(CoordinatorRouteError, match="ttl_seconds"):
+        service.issue_team_mcp_binding_token(
+            handle, personal_portfolio=False, ttl_seconds=ttl
+        )
+
+    assert built == []
+
+
+@pytest.mark.parametrize(
+    ("account_scope", "personal_portfolio"),
+    [(AccountScope.OMITTED, True), (AccountScope.PORTFOLIO, False)],
+)
+def test_team_mcp_binding_token_enforces_portfolio_scope_invariant(
+    service_setup, account_scope, personal_portfolio
+):
+    _parent_agent, _now, service, built = service_setup
+    capability = _capability(service, account_scope=account_scope)
+    handle = _reserve(service, capability, account_scope=account_scope)
+
+    with pytest.raises(CoordinatorRouteError, match="account scope"):
+        service.issue_team_mcp_binding_token(
+            handle, personal_portfolio=personal_portfolio, ttl_seconds=60
+        )
+
+    assert built == []
+
+
+@pytest.mark.parametrize("personal_portfolio", [None, 0, 1, "false"])
+def test_team_mcp_binding_token_requires_closed_boolean(
+    service_setup, personal_portfolio
+):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+
+    with pytest.raises(CoordinatorRouteError, match="bool"):
+        service.issue_team_mcp_binding_token(
+            handle,
+            personal_portfolio=cast(Any, personal_portfolio),
+            ttl_seconds=60,
+        )
+
+    assert built == []
+
+
+def test_team_mcp_binding_token_rechecks_grant_route_and_top_level(
+    service_setup, monkeypatch
+):
+    parent, now, _service, built = service_setup
+    authorized = [True]
+    routes = [["investment.team"]]
+    service = CoordinatorService(
+        issuer_plugin_id="kospi-team",
+        parent_agent_resolver=lambda: parent,
+        allowed_routes_resolver=lambda: tuple(routes[0]),
+        authorization_resolver=lambda: authorized[0],
+        clock=lambda: now[0],
+    )
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda _name: base64.b64encode(bytes(range(32))).decode("ascii"),
+    )
+
+    authorized[0] = False
+    with pytest.raises(CoordinatorRouteError, match="authorized"):
+        service.issue_team_mcp_binding_token(handle, personal_portfolio=False)
+    authorized[0] = True
+    routes[0] = []
+    with pytest.raises(CoordinatorRouteError, match="allowlisted"):
+        service.issue_team_mcp_binding_token(handle, personal_portfolio=False)
+    routes[0] = ["investment.team"]
+    with delegated_child_context("child"):
+        with pytest.raises(CoordinatorRouteError, match="top-level"):
+            service.issue_team_mcp_binding_token(handle, personal_portfolio=False)
+
+    assert built == []
+
+
+def test_team_mcp_binding_token_never_enters_role_construction_input(
+    service_setup, monkeypatch
+):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda _name: base64.b64encode(bytes(range(32))).decode("ascii"),
+    )
+    token = service.issue_team_mcp_binding_token(
+        handle, personal_portfolio=False, ttl_seconds=60
+    )
+
+    service.launch_role(
+        handle,
+        CoordinatorRoleRequest(role=CoordinatorRole.MARKET_MACRO, goal="market"),
+    )
+
+    assert len(built) == 1
+    assert token.reveal_for_transport() not in repr(built[0][0])
+
+
+@pytest.mark.parametrize("nonce", ["a" * 31, "a" * 33, "A" * 32, "g" * 32])
+def test_team_mcp_binding_token_requires_exact_lowercase_hex_nonce(
+    service_setup, monkeypatch, nonce
+):
+    _parent_agent, _now, service, built = service_setup
+    handle = _reserve(service, _capability(service))
+    monkeypatch.setattr("agent.route_capability.secrets.token_hex", lambda _size: nonce)
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret",
+        lambda _name: base64.b64encode(bytes(range(32))).decode("ascii"),
+    )
+
+    with pytest.raises(CoordinatorRouteError, match="nonce"):
+        service.issue_team_mcp_binding_token(
+            handle, personal_portfolio=False, ttl_seconds=60
+        )
+
+    assert built == []
 
 
 def test_role_request_rejects_plugin_selected_model():

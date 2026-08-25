@@ -8,6 +8,8 @@ strictly tool-less.
 from __future__ import annotations
 
 import dataclasses
+import base64
+import binascii
 import enum
 import hashlib
 import hmac
@@ -19,8 +21,33 @@ import time
 from typing import Any, Callable, Mapping, Optional
 
 
+_TEAM_MCP_HMAC_ENV = "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64"
+
+
 class CoordinatorRouteError(ValueError):
     """A coordinator operation cannot be safely accepted."""
+
+
+class TeamMcpBindingToken:
+    """Opaque bearer value requiring explicit transport disclosure."""
+
+    __slots__ = ("__wire_value",)
+
+    def __init__(self, wire_value: str) -> None:
+        object.__setattr__(self, "_TeamMcpBindingToken__wire_value", wire_value)
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("TeamMcpBindingToken is immutable.")
+
+    def __str__(self) -> str:
+        return "TeamMcpBindingToken(<redacted>)"
+
+    def __repr__(self) -> str:
+        return "TeamMcpBindingToken(<redacted>)"
+
+    def reveal_for_transport(self) -> str:
+        """Return wire bytes only at the explicit team-MCP bridge boundary."""
+        return self.__wire_value
 
 
 class AccountScope(str, enum.Enum):
@@ -327,6 +354,67 @@ class CoordinatorService:
             record.state = CoordinatorJobState.ROLES_RUNNING
             return self._public_role_handle(handle, request.role, role_handle)
 
+    def issue_team_mcp_binding_token(
+        self,
+        handle: CoordinatorHandle,
+        *,
+        personal_portfolio: bool,
+        ttl_seconds: float = 300.0,
+    ) -> TeamMcpBindingToken:
+        """Issue a short-lived profile-scoped binding for the team MCP."""
+        self._require_authorized()
+        parent = self._require_top_level_parent()
+        session_id, turn_id = _active_binding(parent)
+        self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
+        self._require_route_allowed(handle.coordinator_route)
+        if not isinstance(personal_portfolio, bool):
+            raise CoordinatorRouteError("personal_portfolio must be a bool.")
+        if (handle.account_scope is AccountScope.OMITTED and personal_portfolio) or (
+            handle.account_scope is AccountScope.PORTFOLIO and not personal_portfolio
+        ):
+            raise CoordinatorRouteError(
+                "personal_portfolio does not match the coordinator account scope."
+            )
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+            or ttl_seconds > 300
+        ):
+            raise CoordinatorRouteError(
+                "ttl_seconds must be greater than 0 and at most 300."
+            )
+        now = float(self._clock())
+        if not math.isfinite(now) or now < 0:
+            raise CoordinatorRouteError("trusted clock returned an invalid time.")
+        issued_at = int(now)
+        expires_at = issued_at + max(1, math.ceil(float(ttl_seconds)))
+        nonce = secrets.token_hex(16)
+        if len(nonce) != 32 or any(char not in "0123456789abcdef" for char in nonce):
+            raise CoordinatorRouteError(
+                "trusted nonce generator returned invalid data."
+            )
+        signing_key = _team_mcp_signing_key()
+        payload = {
+            "version": 1,
+            "key_id": "kospi-team-v2",
+            "type": "coordinator_binding",
+            "issuer_plugin_id": handle.issuer_plugin_id,
+            "coordinator_id": handle.coordinator_id,
+            "consultation_id": handle.consultation_id,
+            "parent_session_id": handle.parent_session_id,
+            "parent_turn_id": handle.parent_turn_id,
+            "user_message_sha256": handle.user_message_sha256,
+            "coordinator_route": handle.coordinator_route,
+            "account_scope": handle.account_scope.value,
+            "personal_portfolio": personal_portfolio,
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+            "nonce": nonce,
+        }
+        return TeamMcpBindingToken(_build_team_mcp_binding_token(payload, signing_key))
+
     def role_status(
         self, handle: CoordinatorHandle, role: CoordinatorRole
     ) -> CoordinatorRoleStatus:
@@ -619,6 +707,42 @@ def _sign_handle(handle: CoordinatorHandle) -> str:
     return hmac.new(
         _HANDLE_SECRET, _canonical_payload(handle, "capability"), hashlib.sha256
     ).hexdigest()
+
+
+def _team_mcp_signing_key() -> bytes:
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        encoded = get_secret(_TEAM_MCP_HMAC_ENV)
+    except UnscopedSecretError as exc:
+        raise CoordinatorRouteError("Team MCP signing key is unavailable.") from exc
+    if not isinstance(encoded, str) or not encoded:
+        raise CoordinatorRouteError("Team MCP signing key is unavailable.")
+    try:
+        signing_key = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CoordinatorRouteError("Team MCP signing key is malformed.") from exc
+    if (
+        len(signing_key) < 32
+        or base64.b64encode(signing_key).decode("ascii") != encoded
+    ):
+        raise CoordinatorRouteError("Team MCP signing key is malformed.")
+    return signing_key
+
+
+def _build_team_mcp_binding_token(
+    payload: Mapping[str, Any], signing_key: bytes
+) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    signature = hmac.new(signing_key, canonical, hashlib.sha256).digest()
+    encoded_payload = base64.urlsafe_b64encode(canonical).rstrip(b"=").decode("ascii")
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"v1.{encoded_payload}.{encoded_signature}"
 
 
 def _validate_capability_shape(capability: RouteCapability) -> None:

@@ -4987,4 +4987,12 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "setting",
     },
+    "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64": {
+        "description": "Profile-scoped base64 HMAC key for KOSPI team MCP coordinator bindings",
+        "prompt": "KOSPI team coordinator HMAC key (base64)",
+        "url": None,
+        "password": True,
+        "category": "setting",
+        "advanced": True,
+    },
 }

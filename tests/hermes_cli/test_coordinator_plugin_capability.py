@@ -61,3 +61,11 @@ def test_generic_subagent_capability_is_separate_and_grant_only():
             }
         },
     )
+
+
+def test_team_mcp_hmac_key_is_registered_as_optional_secret_metadata():
+    from hermes_cli.config import OPTIONAL_ENV_VARS
+
+    metadata = OPTIONAL_ENV_VARS["KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64"]
+    assert metadata["password"] is True
+    assert metadata["category"] == "setting"

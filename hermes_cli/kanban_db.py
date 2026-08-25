@@ -92,6 +92,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from agent.live_activity import sanitize_live_caption
 
 _log = logging.getLogger(__name__)
 
@@ -12584,6 +12585,7 @@ def _board_activity_current(
         stream_rows = conn.execute(
             "SELECT r.id AS run_id, r.profile, r.started_at, r.claim_lock, "
             "       r.worker_pid, r.last_heartbeat_at, r.claim_expires, "
+            "       t.title AS work_title, "
             "       r.live_caption, r.live_caption_observed_at, "
             "       r.live_caption_expires_at, r.runtime_phase_code, "
             "       r.phase_observed_at, r.phase_expires_at "
@@ -12667,6 +12669,9 @@ def _board_activity_current(
             "phase_expires_at": min(int(float(phase_expires_at)), expires_at) if phase_current else None,
         }
         if include_live_caption:
+            stream["work_summary"] = sanitize_live_caption(
+                row["work_title"], max_chars=96
+            ) or None
             caption = row["live_caption"]
             caption_observed_at = row["live_caption_observed_at"]
             caption_expires_at = row["live_caption_expires_at"]

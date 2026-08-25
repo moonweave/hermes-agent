@@ -110,7 +110,11 @@ def test_board_activity_v3_adds_caption_without_changing_v2(kanban_home, monkeyp
     monkeypatch.setattr(kb, "_claimer_id", lambda: "local:claim")
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="private", assignee="reviewer")
+        task_id = kb.create_task(
+            conn,
+            title="Live Work Caption v0.3 브라우저 연결 검증",
+            assignee="reviewer",
+        )
         assert kb.claim_task(conn, task_id, claimer="local:claim")
         run_id = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
@@ -144,6 +148,8 @@ def test_board_activity_v3_adds_caption_without_changing_v2(kanban_home, monkeyp
     }
     assert stream["phase_code"] == "using_tool"
     assert stream["phase_expires_at"] == now + 45
+    assert stream["work_summary"] == "Live Work Caption v0.3 브라우저 연결 검증"
+    assert "work_summary" not in v2["work_streams"][0]
 
     cli_payload = json.loads(kc.run_slash("activity-v3 --json --limit 20"))
     assert cli_payload["contract_version"] == "hermes-kanban-activity-v3"

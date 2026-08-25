@@ -329,6 +329,7 @@ def _sessions_activity_v3(db, args) -> int:
         source=getattr(args, "source", None),
         exclude_sources=excluded_sources,
         limit=_ACTIVITY_SCAN_LIMIT,
+        include_children=True,
         order_by_last_active=True,
     )
 

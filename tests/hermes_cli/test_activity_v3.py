@@ -236,6 +236,57 @@ def test_discord_default_profile_without_workspace_projects_to_hq(capsys):
     }]
 
 
+def test_discord_session_reset_continuation_projects_current_activity(tmp_path, capsys):
+    now = int(time.time())
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        "discord-root",
+        source="discord",
+        profile_name="default",
+    )
+    db.end_session("discord-root", end_reason="session_reset")
+    db.create_session(
+        "discord-current",
+        source="discord",
+        profile_name="default",
+        parent_session_id="discord-root",
+    )
+    db.touch_session_activity(
+        "discord-current",
+        ts=now - 2,
+        description="waiting for provider response",
+        provenance="api_call",
+    )
+    assert db.publish_live_caption(
+        "discord-current",
+        "현재 요청의 다음 응답을 기다리고 있어요.",
+        observed_at=now - 2,
+    )
+    assert db.publish_runtime_phase(
+        "discord-current",
+        "waiting",
+        observed_at=now - 2,
+    )
+
+    assert _sessions_activity_v3(
+        db,
+        argparse.Namespace(source=None, json=True, window=120),
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    db.close()
+
+    assert payload["coverage"]["complete"] is True
+    assert len(payload["aggregates"]) == 1
+    aggregate = payload["aggregates"][0]
+    assert aggregate["profile"] == "default"
+    assert aggregate["context_scope"] == "hq"
+    assert aggregate["recent_session_count"] == 1
+    assert aggregate["phase_code"] == "waiting"
+    assert aggregate["live_caption"]["text"] == "현재 요청의 다음 응답을 기다리고 있어요."
+    assert "discord-root" not in json.dumps(payload)
+    assert "discord-current" not in json.dumps(payload)
+
+
 def test_default_gateway_profile_is_persisted_as_observed_identity(monkeypatch):
     import run_agent
     from run_agent import AIAgent

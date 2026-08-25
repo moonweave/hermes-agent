@@ -542,6 +542,24 @@ def test_board_stats_reports_aggregate_worker_evidence_without_task_content(
         assert private_value not in payload
 
 
+def test_board_stats_treats_malformed_worker_pid_as_unverified(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="malformed pid", assignee="builder")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:worker") is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, last_heartbeat_at = NULL WHERE id = ?",
+            ("not-a-pid", task_id),
+        )
+
+        stats = kb.board_stats(conn)
+
+    assert stats["activity_totals"]["running_rows"] == 1
+    assert stats["activity_totals"]["unverified_worker_rows"] == 1
+    assert stats["activity_totals"]["stale_worker_rows"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Notify subscriptions
 # ---------------------------------------------------------------------------

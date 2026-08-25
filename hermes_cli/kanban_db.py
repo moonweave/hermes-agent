@@ -11340,10 +11340,15 @@ def _running_activity_stats(
             heartbeat is not None
             and max(0, now - int(heartbeat)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
-        pid_alive = bool(host_local and pid and _pid_alive(int(pid)))
+        try:
+            observed_pid = int(pid) if pid else None
+        except (TypeError, ValueError):
+            observed_pid = None
+        pid_observable = bool(host_local and observed_pid and observed_pid > 0)
+        pid_alive = bool(pid_observable and _pid_alive(observed_pid))
         heartbeat_fresh = heartbeat is not None and not heartbeat_stale
         live = pid_alive and heartbeat_fresh
-        stale = heartbeat_stale or bool(host_local and pid and not pid_alive)
+        stale = heartbeat_stale or bool(pid_observable and not pid_alive)
         evidence_key = (
             "live_worker_rows"
             if live

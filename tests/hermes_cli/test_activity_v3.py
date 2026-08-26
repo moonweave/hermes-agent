@@ -203,6 +203,18 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
             kind="needs_input",
             reason="needs_work: fix the deterministic browser assertion",
         )
+        orchestrator_task = kb.create_task(
+            conn, title="Validate local candidate runtime", assignee="webdesignqa"
+        )
+        assert kb.block_task(
+            conn,
+            orchestrator_task,
+            kind="needs_input",
+            reason=(
+                "Awaiting Builder terminal handoff and cto1 exact local "
+                "candidate runtime URL."
+            ),
+        )
         obsolete_task = kb.create_task(
             conn, title="Obsolete browser audit", assignee="webdesignqa"
         )
@@ -225,11 +237,21 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
         payload = kb.board_operator_inbox(conn, limit=20)
 
     assert payload["contract_version"] == "hermes-kanban-operator-inbox-v1"
-    assert [(item["kind"], item["title"]) for item in payload["items"]] == [
+    non_agent_actions = [
+        (item["kind"], item["title"])
+        for item in payload["items"]
+        if item["kind"] != "agent_action"
+    ]
+    assert non_agent_actions == [
         ("needs_user", "Open authenticated Research Grove window"),
-        ("agent_action", "Repair failed browser assertions"),
         ("finished", "Publish verified release"),
     ]
+    assert {
+        item["title"] for item in payload["items"] if item["kind"] == "agent_action"
+    } == {
+        "Repair failed browser assertions",
+        "Validate local candidate runtime",
+    }
     owner = next(item for item in payload["items"] if item["kind"] == "needs_user")
     assert owner["summary"].startswith("Open an already authenticated browser window")
     assert all(len(item["title"]) <= 96 for item in payload["items"])
@@ -238,6 +260,7 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
     for private in (
         owner_task,
         repair_task,
+        orchestrator_task,
         obsolete_task,
         completed_task,
         "/Users/person/private.env",
@@ -280,6 +303,16 @@ def test_operator_inbox_shows_the_reason_in_force_after_a_block_loop(kanban_home
 
     item = next(item for item in payload["items"] if item["kind"] == "needs_user")
     assert item["summary"] == "Two blocking defects need a decision"
+
+
+def test_operator_inbox_keeps_human_approval_visible_when_cto_is_mentioned():
+    assert (
+        kb._operator_inbox_kind(
+            "needs_input",
+            "Awaiting user approval before cto1 publishes the release artifact.",
+        )
+        == "needs_user"
+    )
 
 
 def test_run_caption_cannot_overwrite_sibling_or_resurrect_after_end(kanban_home):

@@ -11818,6 +11818,16 @@ def _unresolved_run_stats(conn: sqlite3.Connection) -> dict:
 _REVIEW_REQUIRED_REASON_PREFIX = "review-required:"
 _NEEDS_WORK_REASON_PREFIX = "needs_work:"
 _REVIEW_HOLD_REASON_RE = re.compile(r"^review_r\d+_hold(?:\b|:)", re.IGNORECASE)
+_INTERNAL_ORCHESTRATOR_DEPENDENCY_RE = re.compile(
+    r"\b(?:awaiting|waiting for)\b.{0,200}\bcto\d+\b"
+    r"(?:\s+[\w-]+){0,5}\s+"
+    r"(?:url|handoff|artifact|evidence|result|output)\b",
+    re.IGNORECASE,
+)
+_HUMAN_INPUT_REASON_RE = re.compile(
+    r"\b(?:human|owner|user)\b|사용자|사람|승인",
+    re.IGNORECASE,
+)
 
 
 def _needs_input_reason_subset_stats(
@@ -12737,6 +12747,10 @@ def _operator_inbox_kind(block_kind: Optional[str], reason: str) -> str:
         lowered.startswith(_REVIEW_REQUIRED_REASON_PREFIX)
         or lowered.startswith(_NEEDS_WORK_REASON_PREFIX)
         or _REVIEW_HOLD_REASON_RE.match(lowered) is not None
+        or (
+            _INTERNAL_ORCHESTRATOR_DEPENDENCY_RE.search(lowered) is not None
+            and _HUMAN_INPUT_REASON_RE.search(lowered) is None
+        )
     ):
         return "agent_action"
     if block_kind in {"needs_input", "capability"}:

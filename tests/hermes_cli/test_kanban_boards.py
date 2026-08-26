@@ -335,11 +335,13 @@ class TestCLI:
         assert project["stats"]["by_status"] == {"ready": 1}
         assert project["activity"]["contract_version"] == "hermes-kanban-activity-v3"
         assert project["operator_inbox"]["contract_version"] == "hermes-kanban-operator-inbox-v1"
+        assert payload["interactive_activity"]["contract_version"] == "hermes-sessions-activity-v3"
         assert payload["coverage"] == {
             "complete": True,
             "total_boards": 2,
             "returned_boards": 2,
             "failed_boards": [],
+            "interactive_complete": True,
         }
 
 
@@ -366,5 +368,3 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
-

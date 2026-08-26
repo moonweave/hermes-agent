@@ -1632,15 +1632,33 @@ def _cmd_boards_dashboard_snapshot(args: argparse.Namespace) -> int:
                 "activity": None,
                 "operator_inbox": None,
             })
+    interactive_activity = None
+    try:
+        from hermes_cli.sessions_cmd import _sessions_activity_v3_payload
+        from hermes_state import SessionDB
+
+        session_db = SessionDB()
+        try:
+            interactive_activity = _sessions_activity_v3_payload(
+                session_db,
+                argparse.Namespace(source=None, window=120, json=True),
+            )
+        finally:
+            session_db.close()
+    except Exception:
+        interactive_activity = None
+
     payload = {
         "contract_version": "hermes-kanban-dashboard-snapshot-v1",
         "generated_at": int(time.time()),
         "boards": rows,
+        "interactive_activity": interactive_activity,
         "coverage": {
-            "complete": not failed_boards,
+            "complete": not failed_boards and interactive_activity is not None,
             "total_boards": len(boards),
             "returned_boards": len(boards) - len(failed_boards),
             "failed_boards": failed_boards,
+            "interactive_complete": interactive_activity is not None,
         },
     }
     if getattr(args, "json", False):

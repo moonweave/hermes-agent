@@ -82,7 +82,6 @@ def _sessions_activity(db, args) -> int:
     does not. Callers name it or withhold it; this command never does.
     """
     import hashlib
-    import json as _json
     import time as _time
 
     from hermes_state import workspace_key as _ws_key
@@ -294,7 +293,7 @@ def _sessions_activity_v2(db, args) -> int:
     if getattr(args, "json", False):
         print(_json.dumps(payload, indent=2))
         return 0
-    print(f"Recent interactive activity groups: {len(aggregates)}")
+    print(f"Recent interactive activity groups: {len(payload['aggregates'])}")
     for aggregate in aggregates:
         print(
             f"  @{aggregate['profile']}  {aggregate['workspace_digest'][:12]}…  "
@@ -303,7 +302,7 @@ def _sessions_activity_v2(db, args) -> int:
     return 0
 
 
-def _sessions_activity_v3(db, args) -> int:
+def _sessions_activity_v3_payload(db, args) -> dict:
     """Aggregate current interactive evidence with ephemeral public captions."""
     import hashlib
     import json as _json
@@ -476,11 +475,19 @@ def _sessions_activity_v3(db, args) -> int:
             "scan_truncated": scan_truncated,
         },
     }
+    return payload
+
+
+def _sessions_activity_v3(db, args) -> int:
+    """Render the reusable v3 interactive activity projection."""
+    import json as _json
+
+    payload = _sessions_activity_v3_payload(db, args)
     if getattr(args, "json", False):
         print(_json.dumps(payload, indent=2))
         return 0
     print(f"Recent interactive activity groups: {len(aggregates)}")
-    for aggregate in aggregates:
+    for aggregate in payload["aggregates"]:
         context_label = (
             "Hermes HQ"
             if aggregate["context_scope"] == "hq"

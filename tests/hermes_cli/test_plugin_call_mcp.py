@@ -7,6 +7,7 @@ through the existing tools.mcp_tool handler machinery (mocked here — no
 live MCP servers).
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -148,8 +149,15 @@ def test_eager_hidden_server_remains_available_to_allowlisted_plugin(monkeypatch
         },
     }
     server = mcp_mod.MCPServerTask("team")
+    watcher_creations = 0
+
+    def watch_stdio_children(_self):
+        nonlocal watcher_creations
+        watcher_creations += 1
+        return asyncio.Event().wait()
+
     monkeypatch.setattr(
-        mcp_mod.MCPServerTask, "_watch_stdio_children", lambda _self: None
+        mcp_mod.MCPServerTask, "_watch_stdio_children", watch_stdio_children
     )
     server._tools = [
         SimpleNamespace(
@@ -182,6 +190,7 @@ def test_eager_hidden_server_remains_available_to_allowlisted_plugin(monkeypatch
     result = _make_ctx().call_mcp("team", "prepare_consultation", {"scope": "omitted"})
 
     assert result == {"ok": True, "result": "prepared"}
+    assert watcher_creations == 1
     server.session.call_tool.assert_awaited_once_with(
         "prepare_consultation", arguments={"scope": "omitted"}
     )

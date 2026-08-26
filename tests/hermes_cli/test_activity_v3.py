@@ -250,6 +250,38 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
     assert cli_payload["contract_version"] == "hermes-kanban-operator-inbox-v1"
 
 
+def test_operator_inbox_shows_the_reason_in_force_after_a_block_loop(kanban_home):
+    with kb.connect() as conn:
+        task = kb.create_task(
+            conn, title="Capability-safe browser audit", assignee="webdesignqa"
+        )
+        assert kb.block_task(
+            conn, task, kind="needs_input", reason="Browser harness unavailable"
+        )
+        assert kb.unblock_task(conn, task)
+        assert kb.block_task(
+            conn,
+            task,
+            kind="needs_input",
+            reason="Two blocking defects need a decision",
+        )
+
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task,)).fetchone()
+        assert row["status"] == "triage"
+        kinds = [
+            event["kind"]
+            for event in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (task,)
+            )
+        ]
+        assert "block_loop_detected" in kinds
+
+        payload = kb.board_operator_inbox(conn, limit=20)
+
+    item = next(item for item in payload["items"] if item["kind"] == "needs_user")
+    assert item["summary"] == "Two blocking defects need a decision"
+
+
 def test_run_caption_cannot_overwrite_sibling_or_resurrect_after_end(kanban_home):
     with kb.connect() as conn:
         first = kb.create_task(conn, title="first", assignee="reviewer")

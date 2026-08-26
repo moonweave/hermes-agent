@@ -12771,6 +12771,12 @@ def board_operator_inbox(
     This contract exposes only sanitized display text and pseudonymous item
     references. Raw task/run/event ids, bodies, paths, comments and payloads
     never leave the board boundary.
+
+    A task that blocks again on the same kind is routed to ``triage`` with a
+    ``block_loop_detected`` event rather than a second ``blocked`` one, so the
+    reason selection must span both kinds — matching
+    ``_needs_input_reason_subset_stats``. Reading only ``blocked`` pins the
+    display to the first block and hides the reason actually in force.
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("operator inbox limit must be an integer between 1 and 100")
@@ -12787,7 +12793,8 @@ def board_operator_inbox(
             "FROM tasks t "
             "LEFT JOIN task_events e ON e.id = ("
             "  SELECT MAX(be.id) FROM task_events be "
-            "  WHERE be.task_id = t.id AND be.kind = 'blocked'"
+            "  WHERE be.task_id = t.id "
+            "    AND be.kind IN ('blocked', 'block_loop_detected')"
             ") "
             "WHERE t.status IN ('blocked', 'triage') "
             "  AND (t.block_kind IS NULL OR t.block_kind IN ('needs_input', 'capability')) "

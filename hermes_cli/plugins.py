@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Type, Union)
+from typing import (Any, Callable, Dict, Generic, Iterable, List, Mapping, Optional, Set, Tuple, Type, TypeVar, Union)
 
 from hermes_constants import (
     get_hermes_home,
@@ -1331,6 +1331,17 @@ def _locked_plugin_state(path: Path):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+_PluginStateResultT = TypeVar("_PluginStateResultT")
+
+
+@dataclass(frozen=True)
+class PluginStateMutation(Generic[_PluginStateResultT]):
+    """One atomic plugin-state replacement and its deterministic result."""
+
+    value: Any
+    result: _PluginStateResultT
+
+
 class PluginState:
     """Atomic, quota-bounded JSON key/value state owned by one plugin."""
 
@@ -1362,17 +1373,18 @@ class PluginState:
                 "numbers, '_', '-', '.', or ':' (without '..')"
             )
 
-    def _read_unlocked(self) -> dict[str, Any]:
+    def _read_unlocked(self, path: Optional[Path] = None) -> dict[str, Any]:
+        state_path = path or self.path
         try:
-            with open(self.path, encoding="utf-8") as handle:
+            with open(state_path, encoding="utf-8") as handle:
                 data = json.load(handle)
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Cannot parse plugin state {self.path}: {exc}") from exc
+            raise RuntimeError(f"Cannot parse plugin state {state_path}: {exc}") from exc
         if not isinstance(data, dict):
             raise RuntimeError(
-                f"Cannot parse plugin state {self.path}: root must be an object"
+                f"Cannot parse plugin state {state_path}: root must be an object"
             )
         return data
 
@@ -1402,6 +1414,50 @@ class PluginState:
             from utils import atomic_json_write
 
             atomic_json_write(self.path, data, mode=0o600)
+
+    def mutate(
+        self,
+        key: str,
+        mutator: Callable[[Any], PluginStateMutation[_PluginStateResultT]],
+        *,
+        default: Any = None,
+    ) -> _PluginStateResultT:
+        """Atomically read, replace, and return within this plugin namespace.
+
+        The trusted thread/interprocess lock remains held across the read,
+        callback, whole-file quota validation, and atomic write. Callback or
+        validation failure leaves the prior state unchanged.
+        """
+        self._validate_key(key)
+        if not callable(mutator):
+            raise TypeError("Plugin state mutator must be callable")
+        state_path = self.path
+        with _locked_plugin_state(state_path):
+            data = self._read_unlocked(state_path)
+            current = copy.deepcopy(data.get(key, default))
+            try:
+                mutation = mutator(current)
+            except Exception:
+                raise RuntimeError("Plugin state mutation callback failed") from None
+            if not isinstance(mutation, PluginStateMutation):
+                raise TypeError("Plugin state mutator must return PluginStateMutation")
+            updated = dict(data)
+            updated[key] = mutation.value
+            try:
+                encoded = json.dumps(updated, ensure_ascii=False, indent=2).encode("utf-8")
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Plugin state mutation for {key!r} is not JSON-serializable"
+                ) from None
+            if len(encoded) > self.quota_bytes:
+                raise ValueError(
+                    f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+                    f"than the {self.quota_bytes}-byte per-plugin quota"
+                )
+            from utils import atomic_json_write
+
+            atomic_json_write(state_path, updated, mode=0o600)
+            return mutation.result
 
 
 class PluginContext:

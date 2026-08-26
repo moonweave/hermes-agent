@@ -3251,6 +3251,9 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
+_STOP_IDENTITY_UNCERTAIN_REPLY = (
+    "⚠️ Stop state uncertain — session identity could not be verified."
+)
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
@@ -16647,6 +16650,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is truly hung — the executor thread is blocked and never checks
         # _interrupt_requested.  Force-clean _running_agents so the session
         # is unlocked and subsequent messages are processed normally.
+        participants = await self._resolve_gateway_stop_participants([quick_key])
         await self._interrupt_and_clear_session(
             quick_key,
             source,
@@ -16654,18 +16658,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
-        session_entry = await self.async_session_store.lookup_by_session_key(quick_key)
-        self._cancel_gateway_plugin_tasks(
-            str(getattr(session_entry, "session_id", "") or "")
-        )
+        if not participants:
+            return EphemeralReply(_STOP_IDENTITY_UNCERTAIN_REPLY)
+        for session_id, _session_key in participants:
+            self._cancel_gateway_plugin_tasks(session_id)
         from hermes_cli.plugins import notify_gateway_stop_observers
 
-        notify_gateway_stop_observers(
-            platform=source.platform.value,
-            session_id="",
-            session_key=quick_key,
-            outcome="stopped",
-        )
+        for session_id, session_key in participants:
+            notify_gateway_stop_observers(
+                platform=source.platform.value,
+                session_id=session_id,
+                session_key=session_key,
+                outcome="stopped",
+            )
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
@@ -17442,23 +17447,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
+                    participants = await self._resolve_gateway_stop_participants(
+                        [_quick_key]
+                    )
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
-                    session_entry = (
-                        await self.async_session_store.lookup_by_session_key(_quick_key)
-                    )
-                    self._cancel_gateway_plugin_tasks(
-                        str(getattr(session_entry, "session_id", "") or "")
-                    )
+                    if not participants:
+                        return EphemeralReply(_STOP_IDENTITY_UNCERTAIN_REPLY)
+                    for session_id, _session_key in participants:
+                        self._cancel_gateway_plugin_tasks(session_id)
                     from hermes_cli.plugins import notify_gateway_stop_observers
 
-                    notify_gateway_stop_observers(
-                        platform=source.platform.value,
-                        session_id="",
-                        session_key=_quick_key,
-                        outcome="stopped_pending",
-                    )
+                    for session_id, session_key in participants:
+                        notify_gateway_stop_observers(
+                            platform=source.platform.value,
+                            session_id=session_id,
+                            session_key=session_key,
+                            outcome="stopped_pending",
+                        )
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
@@ -18978,6 +18985,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).items()
                 if indexed_key == session_key
             )
+
+    async def _resolve_gateway_stop_participants(
+        self,
+        session_keys: List[str],
+        *,
+        known_entries: Tuple[Any, ...] = (),
+    ) -> tuple[tuple[str, str], ...]:
+        """Resolve every authoritative session identity affected by `/stop`."""
+        ordered_keys = tuple(dict.fromkeys(key for key in session_keys if key))
+        key_set = set(ordered_keys)
+        participants: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(session_id: Any, session_key: Any) -> None:
+            pair = (str(session_id or ""), str(session_key or ""))
+            if not pair[0] or pair[1] not in key_set or pair in seen:
+                return
+            seen.add(pair)
+            participants.append(pair)
+
+        resolved_keys = set()
+        for entry in known_entries:
+            entry_key = str(getattr(entry, "session_key", "") or "")
+            if entry_key in key_set:
+                _add(getattr(entry, "session_id", ""), entry_key)
+                resolved_keys.add(entry_key)
+
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            detached = tuple(
+                getattr(self, "_gateway_detached_session_keys", {}).items()
+            )
+        for session_id, session_key in detached:
+            _add(session_id, session_key)
+
+        for session_key in ordered_keys:
+            if session_key in resolved_keys:
+                continue
+            try:
+                entry = await self.async_session_store.lookup_by_session_key(
+                    session_key
+                )
+            except Exception:
+                continue
+            if str(getattr(entry, "session_key", "") or "") != session_key:
+                continue
+            _add(getattr(entry, "session_id", ""), session_key)
+        return tuple(participants)
 
     @property
     def async_session_store(self) -> AsyncSessionStore:
@@ -22164,25 +22219,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             if key == prefix or key.startswith(prefix + ":"):
                 matches.append(key)
-        from agent.route_capability import gateway_dispatch_session_has_live_bindings
-
         lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
         with lock:
             detached_sessions = tuple(
                 getattr(self, "_gateway_detached_session_keys", {}).items()
             )
-        for session_id, key in detached_sessions:
+        for _session_id, key in detached_sessions:
             if key == own_key or key in matches:
                 continue
             if key != prefix and not key.startswith(prefix + ":"):
                 continue
-            active, pending = self._gateway_plugin_task_status(session_id)
-            if (
-                active
-                or pending
-                or gateway_dispatch_session_has_live_bindings(session_id)
-            ):
-                matches.append(key)
+            matches.append(key)
         return matches
 
 

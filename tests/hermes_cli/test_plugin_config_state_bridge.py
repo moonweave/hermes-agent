@@ -13,7 +13,12 @@ import pytest
 import yaml
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+from hermes_cli.plugins import (
+    PluginContext,
+    PluginManager,
+    PluginManifest,
+    PluginStateMutation,
+)
 
 
 def _context(
@@ -251,6 +256,88 @@ for i in range(int(sys.argv[1]), int(sys.argv[2])):
 
     state = json.loads(_context().state.path.read_text(encoding="utf-8"))
     assert state == {f"process_{i}": i for i in range(40)}
+
+
+def test_state_mutation_prevents_multi_instance_lost_updates(
+    isolated_home: Path,
+) -> None:
+    contexts = (_context(), _context())
+
+    def increment(index: int) -> int:
+        def mutate(current: int) -> PluginStateMutation[int]:
+            updated = current + 1
+            return PluginStateMutation(value=updated, result=updated)
+
+        return _in_home(
+            isolated_home,
+            lambda: contexts[index % len(contexts)].state.mutate(
+                "adaptive-count", mutate, default=0
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(increment, range(160)))
+
+    assert sorted(results) == list(range(1, 161))
+    assert _context().state.get("adaptive-count") == 160
+
+
+def test_state_mutation_cross_process_cap_has_no_lost_admissions(
+    isolated_home: Path,
+) -> None:
+    cap = 41
+    script = """
+import sys
+import time
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest, PluginStateMutation
+ctx = PluginContext(PluginManifest(name='fixture-plugin'), PluginManager())
+cap = int(sys.argv[1])
+accepted = 0
+for _ in range(30):
+    def admit(current):
+        time.sleep(0.001)
+        count = current['count']
+        if count >= cap:
+            return PluginStateMutation(value=current, result=False)
+        return PluginStateMutation(value={'count': count + 1}, result=True)
+    accepted += int(ctx.state.mutate('adaptive-cap', admit, default={'count': 0}))
+print(accepted)
+"""
+    env = dict(os.environ, HERMES_HOME=str(isolated_home))
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(cap)],
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    outputs = [process.communicate(timeout=30) for process in processes]
+
+    assert [process.returncode for process in processes] == [0, 0, 0, 0]
+    assert sum(int(stdout.strip()) for stdout, _stderr in outputs) == cap
+    assert _context().state.get("adaptive-cap") == {"count": cap}
+
+
+def test_state_mutation_failure_is_sanitized_and_preserves_prior_bytes(
+    isolated_home: Path,
+) -> None:
+    ctx = _context()
+    ctx.state.set("adaptive", {"count": 7})
+    before = ctx.state.path.read_bytes()
+
+    def fail(_current):
+        raise RuntimeError("sensitive portfolio state")
+
+    with pytest.raises(RuntimeError, match="callback failed") as exc_info:
+        ctx.state.mutate("adaptive", fail)
+
+    assert "sensitive portfolio state" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert ctx.state.path.read_bytes() == before
 
 
 def test_state_quota_failure_preserves_previous_file(isolated_home: Path) -> None:

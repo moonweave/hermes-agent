@@ -8,6 +8,8 @@ nothing and reply "no active task to stop".  Authorized users should be able to
 stop any run in the same thread.
 """
 
+from typing import Any
+
 import pytest
 
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
@@ -43,17 +45,25 @@ def _per_user_key(uid, thread_id="thr1", chat_id="chan1"):
 
 def test_sibling_returns_empty_for_non_thread_source():
     # Non-thread group/channel must NOT trigger the cross-user fallback.
-    runner = object.__new__(GatewayRunner)
+    runner: Any = object.__new__(GatewayRunner)
     nonthread = SessionSource(
         platform=Platform.DISCORD, chat_type="group", chat_id="chan1", user_id="userA"
     )
     grp_b = build_session_key(
         SessionSource(
-            platform=Platform.DISCORD, chat_type="group", chat_id="chan1", user_id="userB"
+            platform=Platform.DISCORD,
+            chat_type="group",
+            chat_id="chan1",
+            user_id="userB",
         )
     )
     runner._running_agents = {grp_b: _FakeAgent()}
-    assert runner._sibling_thread_run_keys(nonthread, "agent:main:discord:group:chan1:userA") == []
+    assert (
+        runner._sibling_thread_run_keys(
+            nonthread, "agent:main:discord:group:chan1:userA"
+        )
+        == []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -64,19 +74,21 @@ def test_sibling_returns_empty_for_non_thread_source():
 class _StoreEntry:
     def __init__(self, session_key):
         self.session_key = session_key
+        self.session_id = "session-authoritative"
 
 
 class _FakeStore:
     def __init__(self, session_key):
         self._key = session_key
+        self.entry = _StoreEntry(session_key)
 
     def get_or_create_session(self, source):
-        return _StoreEntry(self._key)
+        return self.entry
 
 
 @pytest.mark.asyncio
 async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
-    runner = object.__new__(GatewayRunner)
+    runner: Any = object.__new__(GatewayRunner)
     key_a = _per_user_key("userA")
     key_b = _per_user_key("userB")
     runner._running_agents = {key_b: _FakeAgent()}
@@ -84,7 +96,9 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
     interrupted = []
 
-    async def _fake_interrupt(session_key, source, *, interrupt_reason, invalidation_reason):
+    async def _fake_interrupt(
+        session_key, source, *, interrupt_reason, invalidation_reason
+    ):
         interrupted.append(session_key)
 
     runner._interrupt_and_clear_session = _fake_interrupt
@@ -115,7 +129,7 @@ class _FakeStatusAdapter:
 @pytest.mark.asyncio
 async def test_stop_no_active_agent_survives_status_clear_failure():
     """A failing adapter clear must not break the /stop reply."""
-    runner = object.__new__(GatewayRunner)
+    runner: Any = object.__new__(GatewayRunner)
     runner._running_agents = {}
     key = _per_user_key("userA")
     runner.session_store = _FakeStore(key)
@@ -126,9 +140,7 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
             raise RuntimeError("boom")
 
     runner.adapters = {Platform.DISCORD: _BoomAdapter()}
-    runner._thread_metadata_for_source = (
-        lambda source, reply_to_message_id=None: None
-    )
+    runner._thread_metadata_for_source = lambda source, reply_to_message_id=None: None
     runner._reply_anchor_for_event = lambda event: None
 
     event = MessageEvent(
@@ -141,7 +153,7 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
 
 @pytest.mark.asyncio
 async def test_stop_observer_runs_after_core_cancellation(monkeypatch):
-    runner = object.__new__(GatewayRunner)
+    runner: Any = object.__new__(GatewayRunner)
     key = _per_user_key("userA")
     runner._running_agents = {key: _FakeAgent()}
     runner.session_store = _FakeStore(key)
@@ -149,11 +161,18 @@ async def test_stop_observer_runs_after_core_cancellation(monkeypatch):
 
     async def interrupt(*_args, **_kwargs):
         order.append("cancelled")
+        runner.session_store.entry.session_id = ""
 
     runner._interrupt_and_clear_session = interrupt
+    observed = []
+
+    def observer(**payload):
+        order.append(payload["outcome"])
+        observed.append(payload)
+
     monkeypatch.setattr(
         "hermes_cli.plugins.notify_gateway_stop_observers",
-        lambda **payload: order.append(payload["outcome"]),
+        observer,
     )
 
     await runner._handle_stop_command(
@@ -165,20 +184,77 @@ async def test_stop_observer_runs_after_core_cancellation(monkeypatch):
     )
 
     assert order == ["cancelled", "stopped"]
+    assert observed == [
+        {
+            "platform": "discord",
+            "session_id": "session-authoritative",
+            "session_key": key,
+            "outcome": "stopped",
+        }
+    ]
+
+
+@pytest.mark.parametrize("own_state", ["active", "pending"])
+@pytest.mark.asyncio
+async def test_stop_own_run_leaves_live_sibling_untouched(monkeypatch, own_state):
+    runner: Any = object.__new__(GatewayRunner)
+    own_key = _per_user_key("userA")
+    sibling_key = _per_user_key("userB")
+    own_agent = _FakeAgent() if own_state == "active" else _AGENT_PENDING_SENTINEL
+    runner._running_agents = {own_key: own_agent, sibling_key: _FakeAgent()}
+    runner.session_store = _FakeStore(own_key)
+    runner._is_user_authorized = lambda _source: True
+    runner._gateway_detached_session_keys = {
+        "session-authoritative": own_key,
+        "session-sibling": sibling_key,
+    }
+    interrupted = []
+    cancelled = []
+    observed = []
+
+    async def interrupt(session_key, *_args, **_kwargs):
+        interrupted.append(session_key)
+
+    runner._interrupt_and_clear_session = interrupt
+    runner._cancel_gateway_plugin_tasks = lambda session_id: cancelled.append(
+        session_id
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+
+    await runner._handle_stop_command(
+        MessageEvent(
+            text="/stop",
+            message_type=MessageType.TEXT,
+            source=_thread_source("userA"),
+        )
+    )
+
+    assert interrupted == [own_key]
+    assert cancelled == ["session-authoritative"]
+    assert observed == [
+        {
+            "platform": "discord",
+            "session_id": "session-authoritative",
+            "session_key": own_key,
+            "outcome": "stopped" if own_state == "active" else "stopped_pending",
+        }
+    ]
+    assert sibling_key in runner._running_agents
 
 
 @pytest.mark.asyncio
 async def test_stop_observer_runs_after_cold_status_cleanup(monkeypatch):
-    runner = object.__new__(GatewayRunner)
+    runner: Any = object.__new__(GatewayRunner)
     key = _per_user_key("userA")
     runner._running_agents = {}
     runner.session_store = _FakeStore(key)
     runner._is_user_authorized = lambda _source: True
     adapter = _FakeStatusAdapter()
     runner.adapters = {Platform.DISCORD: adapter}
-    runner._thread_metadata_for_source = (
-        lambda _source, reply_to_message_id=None: None
-    )
+    runner._thread_metadata_for_source = lambda _source, reply_to_message_id=None: None
     runner._reply_anchor_for_event = lambda _event: None
     observed = []
     monkeypatch.setattr(

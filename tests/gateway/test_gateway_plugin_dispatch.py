@@ -638,6 +638,52 @@ async def test_cold_stop_cancels_detached_tasks_before_observer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cold_stop_cancels_current_and_turnover_detached_sessions(monkeypatch):
+    runner: Any = GatewayRunner.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner.adapters = {}
+    source = _telegram_source(thread_id="topic-7")
+    entry = SimpleNamespace(session_key="session-key-1", session_id="session-new")
+
+    class Store:
+        def get_or_create_session(self, _source):
+            return entry
+
+        def lookup_by_session_key(self, _session_key):
+            return entry
+
+    setattr(runner, "session_store", Store())
+    runner._gateway_detached_session_keys = {"session-old": entry.session_key}
+    cancelled = []
+    runner._cancel_gateway_plugin_tasks = lambda session_id: cancelled.append(
+        session_id
+    )
+    observed = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+
+    await runner._handle_stop_command(MessageEvent(text="/stop", source=source))
+
+    assert cancelled == ["session-new", "session-old"]
+    assert observed == [
+        {
+            "platform": "telegram",
+            "session_id": "session-new",
+            "session_key": "session-key-1",
+            "outcome": "no_active",
+        },
+        {
+            "platform": "telegram",
+            "session_id": "session-old",
+            "session_key": "session-key-1",
+            "outcome": "no_active",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cold_stop_revokes_retained_binding_after_task_completed(monkeypatch):
     from agent.route_capability import GatewayTaskService
 
@@ -710,17 +756,31 @@ async def test_active_and_pending_stop_revoke_retained_session_binding(
             object() if run_state == "active" else _AGENT_PENDING_SENTINEL
         )
     }
-    runner._interrupt_and_clear_session = AsyncMock()
+
+    async def interrupt(*_args, **_kwargs):
+        entry.session_id = ""
+
+    runner._interrupt_and_clear_session = interrupt
     binding = _task_binding()
     bound_tasks = GatewayTaskService(
         "fixture-dispatch", authorization_resolver=lambda: True
     ).for_gateway_binding(binding)
+    observed = []
     monkeypatch.setattr(
-        "hermes_cli.plugins.notify_gateway_stop_observers", lambda **_payload: None
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
     )
 
     await runner._handle_stop_command(MessageEvent(text="/stop", source=source))
 
+    assert observed == [
+        {
+            "platform": "telegram",
+            "session_id": "session-1",
+            "session_key": "session-key-1",
+            "outcome": "stopped" if run_state == "active" else "stopped_pending",
+        }
+    ]
     with pytest.raises(Exception, match="Unknown gateway dispatch binding"):
         bound_tasks.spawn(lambda: asyncio.sleep(0), name="after-stop")
 
@@ -800,8 +860,10 @@ async def test_sibling_stop_revokes_retained_sibling_session_binding(monkeypatch
         record for record in task_records if record.state == "pending"
     )
     assert runner._gateway_plugin_task_status("session-sibling") == (1, 1)
+    observed = []
     monkeypatch.setattr(
-        "hermes_cli.plugins.notify_gateway_stop_observers", lambda **_payload: None
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
     )
 
     await runner._handle_stop_command(MessageEvent(text="/stop", source=source))
@@ -811,8 +873,276 @@ async def test_sibling_stop_revokes_retained_sibling_session_binding(monkeypatch
     assert all(record.suppress_result for record in task_records)
     assert active_record.task is not None and active_record.task.cancelled()
     assert pending_record.task is None
+    assert observed == [
+        {
+            "platform": "telegram",
+            "session_id": "session-1",
+            "session_key": own_entry.session_key,
+            "outcome": "stopped_siblings",
+        },
+        {
+            "platform": "telegram",
+            "session_id": "session-sibling",
+            "session_key": sibling_entry.session_key,
+            "outcome": "stopped_siblings",
+        },
+    ]
     with pytest.raises(Exception, match="Unknown gateway dispatch binding"):
         bound_tasks.spawn(lambda: asyncio.sleep(0), name="after-stop")
+
+
+def test_sibling_discovery_includes_detached_participation_without_task_record():
+    runner: Any = GatewayRunner.__new__(GatewayRunner)
+    runner._running_agents = {}
+    source = _telegram_source(thread_id="topic-7")
+    own_key = "agent:main:telegram:dm:chat-1:topic-7:user-1"
+    sibling_key = "agent:main:telegram:dm:chat-1:topic-7:user-2"
+    runner._gateway_detached_session_keys = {"session-sibling": sibling_key}
+
+    assert runner._sibling_thread_run_keys(source, own_key) == [sibling_key]
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_uses_detached_identity_when_store_lookup_fails(monkeypatch):
+    runner: Any = GatewayRunner.__new__(GatewayRunner)
+    source = _telegram_source(thread_id="topic-7")
+    session_key = "session-key-1"
+
+    class Store:
+        _store = object()
+
+        async def lookup_by_session_key(self, _session_key):
+            raise RuntimeError("session store unavailable")
+
+    runner.session_store = Store._store
+    runner._async_session_store = Store()
+    runner._gateway_detached_session_keys = {"session-old": session_key}
+    order = []
+
+    async def interrupt(*_args, **_kwargs):
+        order.append("core-cancelled")
+
+    runner._interrupt_and_clear_session = interrupt
+    runner._cancel_gateway_plugin_tasks = lambda session_id: order.append((
+        "detached-cancelled",
+        session_id,
+    ))
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: order.append(("observed", payload)),
+    )
+
+    result = await runner._busy_stop_command(
+        MessageEvent(text="/stop", source=source), session_key, source
+    )
+
+    assert "stopped" in str(getattr(result, "text", result)).lower()
+    assert order == [
+        "core-cancelled",
+        ("detached-cancelled", "session-old"),
+        (
+            "observed",
+            {
+                "platform": "telegram",
+                "session_id": "session-old",
+                "session_key": session_key,
+                "outcome": "stopped",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_own_active_leaves_live_sibling_untouched(monkeypatch):
+    from gateway.session import build_session_key
+
+    runner: Any = GatewayRunner.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        chat_type="forum",
+        thread_id="thread-1",
+        user_id="user-1",
+    )
+    own_key = build_session_key(source, thread_sessions_per_user=True)
+    sibling_key = build_session_key(
+        dataclasses.replace(source, user_id="user-2"),
+        thread_sessions_per_user=True,
+    )
+    runner._running_agents = {own_key: object(), sibling_key: object()}
+    runner._gateway_detached_session_keys = {
+        "session-own": own_key,
+        "session-sibling": sibling_key,
+    }
+    interrupted = []
+    cancelled = []
+    observed = []
+
+    async def interrupt(session_key, *_args, **_kwargs):
+        interrupted.append(session_key)
+
+    runner._interrupt_and_clear_session = interrupt
+    runner._cancel_gateway_plugin_tasks = lambda session_id: cancelled.append(
+        session_id
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+
+    await runner._busy_stop_command(
+        MessageEvent(text="/stop", source=source), own_key, source
+    )
+
+    assert interrupted == [own_key]
+    assert cancelled == ["session-own"]
+    assert observed == [
+        {
+            "platform": "discord",
+            "session_id": "session-own",
+            "session_key": own_key,
+            "outcome": "stopped",
+        }
+    ]
+    assert sibling_key in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_busy_stop_without_authoritative_identity_is_uncertain(monkeypatch):
+    runner: Any = GatewayRunner.__new__(GatewayRunner)
+    source = _telegram_source(thread_id="topic-7")
+
+    class Store:
+        _store = object()
+
+        async def lookup_by_session_key(self, _session_key):
+            raise RuntimeError("session store unavailable")
+
+    runner.session_store = Store._store
+    runner._async_session_store = Store()
+    runner._gateway_detached_session_keys = {}
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._cancel_gateway_plugin_tasks = AsyncMock()
+    observed = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+
+    result = await runner._busy_stop_command(
+        MessageEvent(text="/stop", source=source), "session-key-1", source
+    )
+
+    assert "uncertain" in str(getattr(result, "text", result)).lower()
+    runner._cancel_gateway_plugin_tasks.assert_not_called()
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_eager_pending_stop_uses_detached_identity_when_lookup_fails(
+    monkeypatch,
+):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.session import build_session_key
+    from tests.gateway.test_session_race_guard import _make_event, _make_runner
+
+    runner: Any = _make_runner()
+    event = _make_event(text="/stop")
+    session_key = build_session_key(event.source)
+    runner._running_agents[session_key] = _AGENT_PENDING_SENTINEL
+
+    class Store:
+        _store = runner.session_store
+
+        async def lookup_by_session_key(self, _session_key):
+            raise RuntimeError("session store unavailable")
+
+    runner._async_session_store = Store()
+    runner._gateway_detached_session_keys = {"session-old": session_key}
+    cancelled = []
+    runner._cancel_gateway_plugin_tasks = lambda session_id: cancelled.append(
+        session_id
+    )
+    observed = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+
+    result = await runner._handle_message(event)
+
+    assert "stopped" in str(getattr(result, "text", result)).lower()
+    assert session_key not in runner._running_agents
+    assert cancelled == ["session-old"]
+    assert observed == [
+        {
+            "platform": "telegram",
+            "session_id": "session-old",
+            "session_key": session_key,
+            "outcome": "stopped",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_eager_pending_stop_leaves_live_sibling_untouched(monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.session import build_session_key
+    from tests.gateway.test_session_race_guard import _make_event, _make_runner
+
+    runner: Any = _make_runner()
+    event = _make_event(text="/stop")
+    event.source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        chat_type="forum",
+        thread_id="thread-1",
+        user_id="u1",
+    )
+    own_key = build_session_key(event.source, thread_sessions_per_user=True)
+    sibling_key = build_session_key(
+        dataclasses.replace(event.source, user_id="u2"),
+        thread_sessions_per_user=True,
+    )
+    runner.config.thread_sessions_per_user = True
+    runner._running_agents = {
+        own_key: _AGENT_PENDING_SENTINEL,
+        sibling_key: object(),
+    }
+    runner._gateway_detached_session_keys = {
+        "session-own": own_key,
+        "session-sibling": sibling_key,
+    }
+    interrupted = []
+    cancelled = []
+    observed = []
+
+    async def interrupt(session_key, *_args, **_kwargs):
+        interrupted.append(session_key)
+
+    runner._interrupt_and_clear_session = interrupt
+    runner._cancel_gateway_plugin_tasks = lambda session_id: cancelled.append(
+        session_id
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append(payload),
+    )
+    monkeypatch.setattr("hermes_cli.commands.resolve_command", lambda _name: None)
+
+    await runner._handle_message(event)
+
+    assert interrupted == []
+    assert cancelled == ["session-own"]
+    assert observed == [
+        {
+            "platform": "discord",
+            "session_id": "session-own",
+            "session_key": own_key,
+            "outcome": "stopped_pending",
+        }
+    ]
+    assert sibling_key in runner._running_agents
 
 
 @pytest.mark.asyncio

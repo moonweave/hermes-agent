@@ -278,6 +278,26 @@ def build_parser(
         "--all", action="store_true", help="Include archived boards too"
     )
 
+    b_dashboard_snapshot = boards_sub.add_parser(
+        "dashboard-snapshot",
+        help="Read every active board for a local dashboard in one process",
+    )
+    b_dashboard_snapshot.add_argument(
+        "--activity-limit",
+        type=int,
+        default=80,
+        choices=range(1, 201),
+        metavar="1..200",
+    )
+    b_dashboard_snapshot.add_argument(
+        "--inbox-limit",
+        type=int,
+        default=40,
+        choices=range(1, 101),
+        metavar="1..100",
+    )
+    b_dashboard_snapshot.add_argument("--json", action="store_true")
+
     b_create = boards_sub.add_parser(
         "create",
         aliases=["new"],
@@ -1512,6 +1532,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     sub = getattr(args, "boards_action", None) or "list"
     if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
+    if sub == "dashboard-snapshot":
+        return _cmd_boards_dashboard_snapshot(args)
     if sub in {"create", "new"}:
         return _cmd_boards_create(args)
     if sub in {"rm", "remove", "delete"}:
@@ -1574,6 +1596,60 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"Current board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    return 0
+
+
+def _cmd_boards_dashboard_snapshot(args: argparse.Namespace) -> int:
+    """Return the read-only dashboard projections for every active board.
+
+    Keeping these SQLite reads inside one Hermes process avoids spawning three
+    CLI processes per board on every dashboard refresh. Individual board
+    failures remain isolated and are reported without leaking exception text.
+    """
+    boards = kb.list_boards(include_archived=False)
+    rows = []
+    failed_boards = []
+    for board in boards:
+        slug = board["slug"]
+        try:
+            kb.init_db(board=slug)
+            with kb.connect_closing(board=slug) as conn:
+                rows.append({
+                    **board,
+                    "stats": kb.board_stats(conn),
+                    "activity": kb.board_activity_v3(
+                        conn, limit=args.activity_limit
+                    ),
+                    "operator_inbox": kb.board_operator_inbox(
+                        conn, limit=args.inbox_limit
+                    ),
+                })
+        except Exception:
+            failed_boards.append(slug)
+            rows.append({
+                **board,
+                "stats": None,
+                "activity": None,
+                "operator_inbox": None,
+            })
+    payload = {
+        "contract_version": "hermes-kanban-dashboard-snapshot-v1",
+        "generated_at": int(time.time()),
+        "boards": rows,
+        "coverage": {
+            "complete": not failed_boards,
+            "total_boards": len(boards),
+            "returned_boards": len(boards) - len(failed_boards),
+            "failed_boards": failed_boards,
+        },
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    print(
+        f"Dashboard snapshot: {payload['coverage']['returned_boards']}/"
+        f"{payload['coverage']['total_boards']} boards ready"
+    )
     return 0
 
 

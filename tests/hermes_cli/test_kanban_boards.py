@@ -317,6 +317,31 @@ class TestCLI:
         assert slugs == ["default"]
         assert data[0]["is_current"] is True
 
+    def test_boards_dashboard_snapshot_reads_all_boards_in_one_command(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "project-one"], env_extra=env).returncode == 0
+        assert _cli(["--board", "project-one", "create", "Active task", "--assignee", "builder"], env_extra=env).returncode == 0
+
+        result = _cli([
+            "boards", "dashboard-snapshot", "--json",
+            "--activity-limit", "80", "--inbox-limit", "40",
+        ], env_extra=env)
+
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["contract_version"] == "hermes-kanban-dashboard-snapshot-v1"
+        assert [board["slug"] for board in payload["boards"]] == ["default", "project-one"]
+        project = payload["boards"][1]
+        assert project["stats"]["by_status"] == {"ready": 1}
+        assert project["activity"]["contract_version"] == "hermes-kanban-activity-v3"
+        assert project["operator_inbox"]["contract_version"] == "hermes-kanban-operator-inbox-v1"
+        assert payload["coverage"] == {
+            "complete": True,
+            "total_boards": 2,
+            "returned_boards": 2,
+            "failed_boards": [],
+        }
+
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
@@ -341,6 +366,5 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
 
 

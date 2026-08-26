@@ -64,12 +64,26 @@ class GatewayDispatchDecision:
     response: Optional[str] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class GatewayDeliveryResult:
+    """Bounded public result from one host-owned delivery attempt."""
+
+    outcome: str
+    transport_attempted: bool
+    delivery_id: Optional[str] = None
+    error_code: Optional[str] = None
+
+
 @dataclasses.dataclass
 class _GatewayDispatchRecord:
     binding: GatewayDispatchBinding
     parent_resolver: Callable[[], Any]
     schedule: Callable[[Callable[[], Awaitable[Any]], str, GatewayDispatchBinding], str]
     validity_resolver: Callable[[], bool]
+    delivery: Optional[
+        Callable[[str, str, float, str, str], Awaitable[GatewayDeliveryResult]]
+    ] = None
+    delivery_binding_handle: str = dataclasses.field(default="", repr=False)
     consultation_binding: Optional[tuple[str, str, AccountScope]] = None
     revocation_callbacks: list[Callable[[], None]] = dataclasses.field(
         default_factory=list
@@ -246,6 +260,9 @@ def issue_gateway_dispatch_binding(
         [Callable[[], Awaitable[Any]], str, GatewayDispatchBinding], str
     ],
     validity_resolver: Callable[[], bool],
+    delivery: Optional[
+        Callable[[str, str, float, str, str], Awaitable[GatewayDeliveryResult]]
+    ] = None,
     clock: Callable[[], float] = time.time,
     ttl_seconds: float = 300.0,
 ) -> GatewayDispatchBinding:
@@ -260,6 +277,7 @@ def issue_gateway_dispatch_binding(
         or not isinstance(user_message, str)
         or not callable(schedule)
         or not callable(validity_resolver)
+        or (delivery is not None and not callable(delivery))
         or (parent is None and not callable(parent_resolver))
         or (parent is not None and parent_resolver is not None)
     ):
@@ -296,6 +314,8 @@ def issue_gateway_dispatch_binding(
             ),
             schedule=schedule,
             validity_resolver=validity_resolver,
+            delivery=delivery,
+            delivery_binding_handle=_gateway_delivery_binding_handle(binding),
         )
     return binding
 
@@ -551,6 +571,67 @@ class GatewayTaskService:
             raise PermissionError("Gateway task capability is not granted.")
         _gateway_dispatch_record(binding, issuer_plugin_id=self._issuer_plugin_id)
         return GatewayBoundTaskService(
+            issuer_plugin_id=self._issuer_plugin_id,
+            binding=binding,
+            authorization_resolver=self._authorization_resolver,
+        )
+
+
+class GatewayBoundDeliveryService:
+    """At-most-once delivery surface bound to one signed gateway message."""
+
+    def __init__(
+        self,
+        *,
+        issuer_plugin_id: str,
+        binding: GatewayDispatchBinding,
+        authorization_resolver: Callable[[], bool],
+    ) -> None:
+        self._issuer_plugin_id = issuer_plugin_id
+        self._binding = binding
+        self._authorization_resolver = authorization_resolver
+
+    async def deliver_once(
+        self, *, delivery_key: str, content: str
+    ) -> GatewayDeliveryResult:
+        """Attempt one logical delivery without exposing its destination."""
+        if self._authorization_resolver() is not True:
+            raise PermissionError("Gateway delivery capability is not granted.")
+        if not _valid_text(delivery_key, 256) or not _valid_text(content, 100_000):
+            raise ValueError("Gateway delivery request is malformed.")
+        record = _gateway_dispatch_record(
+            self._binding,
+            issuer_plugin_id=self._issuer_plugin_id,
+        )
+        if record.activated is not True:
+            raise CoordinatorRouteError("Gateway delivery binding is not active.")
+        if record.delivery is None or not record.delivery_binding_handle:
+            raise CoordinatorRouteError("Gateway delivery is unavailable.")
+        return await record.delivery(
+            self._issuer_plugin_id,
+            record.delivery_binding_handle,
+            self._binding.expires_at,
+            delivery_key,
+            content,
+        )
+
+
+class GatewayDeliveryService:
+    """Unbound delivery facade; a live signed gateway binding is mandatory."""
+
+    def __init__(
+        self, issuer_plugin_id: str, authorization_resolver: Callable[[], bool]
+    ) -> None:
+        self._issuer_plugin_id = issuer_plugin_id
+        self._authorization_resolver = authorization_resolver
+
+    def for_gateway_binding(
+        self, binding: GatewayDispatchBinding
+    ) -> GatewayBoundDeliveryService:
+        if self._authorization_resolver() is not True:
+            raise PermissionError("Gateway delivery capability is not granted.")
+        _gateway_dispatch_record(binding, issuer_plugin_id=self._issuer_plugin_id)
+        return GatewayBoundDeliveryService(
             issuer_plugin_id=self._issuer_plugin_id,
             binding=binding,
             authorization_resolver=self._authorization_resolver,
@@ -1218,6 +1299,15 @@ def _sign_gateway_binding(binding: GatewayDispatchBinding) -> str:
     return hmac.new(
         _GATEWAY_BINDING_SECRET,
         _canonical_payload(binding, "signature"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _gateway_delivery_binding_handle(binding: GatewayDispatchBinding) -> str:
+    """Derive a private stable handle without exposing binding capability bytes."""
+    return hmac.new(
+        _GATEWAY_BINDING_SECRET,
+        b"gateway-delivery\0" + _canonical_payload(binding, "signature"),
         hashlib.sha256,
     ).hexdigest()
 

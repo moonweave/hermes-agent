@@ -1,16 +1,38 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import multiprocessing
 import os
 import sqlite3
 import stat
+import threading
 from pathlib import Path
 
 import pytest
 
 from gateway import plugin_delivery_ledger as ledger
+
+
+def _recovery_context_digest(
+    *,
+    session: str = "session-1",
+    chat: str = "chat-1",
+    topic: str = "topic-1",
+    user: str = "user-1",
+    profile: str = "profile-1",
+) -> str:
+    canonical = "\0".join((session, chat, topic, user, profile))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+_DEFAULT_RECOVERY_CONTEXT_DIGEST = _recovery_context_digest()
+
+
+def _required_record_context(record: ledger.DeliveryRecord) -> str:
+    assert record.recovery_context_digest is not None
+    return record.recovery_context_digest
 
 
 @pytest.fixture(autouse=True)
@@ -22,13 +44,17 @@ def _isolated_db(tmp_path, monkeypatch):
 
 
 def _reserve(
-    *, content: str = "sanitized final", binding: str = "opaque.secret.binding"
+    *,
+    content: str = "sanitized final",
+    binding: str = "opaque.secret.binding",
+    recovery_context_digest: str | None = _DEFAULT_RECOVERY_CONTEXT_DIGEST,
 ):
     return ledger.reserve_delivery(
         plugin_id="test.plugin",
         binding_handle=binding,
         delivery_key="turn-1",
         sanitized_content=content,
+        recovery_context_digest=recovery_context_digest,
         now=1_000.0,
     )
 
@@ -44,15 +70,33 @@ def _claim_in_process(start, results):
     results.put(claim is not None)
 
 
-def _recovery_claim_in_process(start, results, delivery_id, binding_digest):
+def _recovery_claim_in_process(
+    start, results, delivery_id, binding_digest, recovery_context_digest
+):
     start.wait()
     claim = ledger.claim_pending_delivery(
         delivery_id=delivery_id,
         plugin_id="test.plugin",
         binding_digest=binding_digest,
+        recovery_context_digest=recovery_context_digest,
         now=1_002.0,
     )
     results.put(claim is not None)
+
+
+def _cancel_pending_in_process(
+    start, results, delivery_id, binding_digest, recovery_context_digest
+):
+    start.wait()
+    cancelled = ledger.cancel_pending_delivery(
+        delivery_id=delivery_id,
+        plugin_id="test.plugin",
+        binding_digest=binding_digest,
+        recovery_context_digest=recovery_context_digest,
+        reason="process_cancelled",
+        now=1_002.0,
+    )
+    results.put(cancelled)
 
 
 def _page_spanning_content(label: str) -> str:
@@ -119,6 +163,7 @@ def test_recovery_claim_securely_erases_multirow_content_from_database_image(
         delivery_id=record.delivery_id,
         plugin_id=record.plugin_id,
         binding_digest=record.binding_digest,
+        recovery_context_digest=_required_record_context(record),
         now=1_002.0,
     )
 
@@ -161,6 +206,7 @@ def test_recovery_claim_expiry_securely_erases_content_from_database_image(
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_000.0 + ledger.CONTENT_RETENTION_SECONDS + 1,
         )
         is None
@@ -940,6 +986,7 @@ def test_restart_resumes_only_pending_and_claimed_becomes_uncertain():
         "delivery_id": pending.delivery_id,
         "content": "sanitized final",
         "binding_digest": pending.binding_digest,
+        "recovery_context_digest": pending.recovery_context_digest,
     }
     restarted = ledger.get_delivery(claimed.delivery_id)
     assert restarted is not None
@@ -963,6 +1010,7 @@ def test_recovered_pending_delivery_can_be_claimed_and_completed(_isolated_db):
         delivery_id=pending.delivery_id,
         plugin_id="test.plugin",
         binding_digest=pending.binding_digest,
+        recovery_context_digest=pending.recovery_context_digest,
         now=1_002.0,
     )
 
@@ -991,10 +1039,265 @@ def test_recovered_pending_delivery_can_be_claimed_and_completed(_isolated_db):
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_004.0,
         )
         is None
     )
+
+
+def test_recovery_claim_is_bound_to_original_host_context_without_raw_storage(
+    _isolated_db,
+):
+    original = _recovery_context_digest()
+    record = ledger.reserve_delivery(
+        plugin_id="test.plugin",
+        binding_handle="opaque.secret.binding",
+        delivery_key="context-bound-turn",
+        sanitized_content="context-bound final",
+        recovery_context_digest=original,
+        now=1_000.0,
+    )
+    [pending] = ledger.recover_after_restart(now=1_001.0)
+
+    for moved in (
+        _recovery_context_digest(session="session-2"),
+        _recovery_context_digest(chat="chat-2"),
+        _recovery_context_digest(topic="topic-2"),
+        _recovery_context_digest(user="user-2"),
+        _recovery_context_digest(profile="profile-2"),
+    ):
+        assert (
+            ledger.claim_pending_delivery(
+                delivery_id=record.delivery_id,
+                plugin_id=record.plugin_id,
+                binding_digest=record.binding_digest,
+                recovery_context_digest=moved,
+                now=1_002.0,
+            )
+            is None
+        )
+        unchanged = ledger.get_delivery(record.delivery_id)
+        assert unchanged is not None
+        assert unchanged.state is ledger.DeliveryState.PENDING
+        assert unchanged.sanitized_content == "context-bound final"
+
+    claim = ledger.claim_pending_delivery(
+        delivery_id=pending.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=pending.binding_digest,
+        recovery_context_digest=pending.recovery_context_digest,
+        now=1_003.0,
+    )
+
+    assert claim is not None
+    raw = _isolated_db.read_bytes()
+    for raw_context in (b"session-1", b"chat-1", b"topic-1", b"user-1", b"profile-1"):
+        assert raw_context not in raw
+
+
+def test_recovery_context_is_immutable_for_idempotent_reservation():
+    record = _reserve()
+
+    with pytest.raises(ledger.DeliveryConflictError, match="recovery context"):
+        _reserve(recovery_context_digest=_recovery_context_digest(session="moved"))
+
+    unchanged = ledger.get_delivery(record.delivery_id)
+    assert unchanged is not None
+    assert unchanged.recovery_context_digest == _DEFAULT_RECOVERY_CONTEXT_DIGEST
+
+
+def test_missing_recovery_context_is_fail_closed_only_at_restart(_isolated_db):
+    record = _reserve(recovery_context_digest=None)
+    claim = ledger.claim_for_send(
+        plugin_id=record.plugin_id,
+        binding_handle="opaque.secret.binding",
+        delivery_key="turn-1",
+        now=1_001.0,
+    )
+    assert claim is not None
+    assert ledger.mark_failed(
+        claim.delivery_id, claim.claim_token, error="immediate path", now=1_002.0
+    )
+
+    pending = _reserve(
+        binding="legacy-pending-binding",
+        content="legacy recovery secret",
+        recovery_context_digest=None,
+    )
+    assert ledger.recover_after_restart(now=1_003.0) == []
+    failed = ledger.get_delivery(pending.delivery_id)
+    assert failed is not None
+    assert failed.state is ledger.DeliveryState.FAILED
+    assert failed.last_error == "recovery_context_missing"
+    assert failed.sanitized_content is None
+    assert b"legacy recovery secret" not in _isolated_db.read_bytes()
+
+
+def test_reservation_rejects_malformed_recovery_context_before_database_write(
+    _isolated_db,
+):
+    with pytest.raises(ValueError, match="recovery_context_digest"):
+        _reserve(recovery_context_digest="not-a-sha256")
+
+    assert not _isolated_db.exists()
+
+
+def test_cancel_pending_delivery_is_durable_and_securely_erases_content(
+    _isolated_db, monkeypatch
+):
+    _force_secure_delete_default_off(monkeypatch)
+    needle = b"cancel-pending-sensitive-Q"
+    record = _reserve(content=_page_spanning_content(needle.decode()))
+    assert needle in _isolated_db.read_bytes()
+
+    assert ledger.cancel_pending_delivery(
+        delivery_id=record.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=record.binding_digest,
+        recovery_context_digest=_required_record_context(record),
+        reason="resolver_cleanup_cancelled",
+        now=1_001.0,
+    )
+
+    cancelled = ledger.get_delivery(record.delivery_id)
+    assert cancelled is not None
+    assert cancelled.state is ledger.DeliveryState.FAILED
+    assert cancelled.last_error == "resolver_cleanup_cancelled"
+    assert cancelled.sanitized_content is None
+    assert needle not in _isolated_db.read_bytes()
+    assert not ledger.cancel_pending_delivery(
+        delivery_id=record.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=record.binding_digest,
+        recovery_context_digest=_required_record_context(record),
+        reason="must_not_replace_terminal_reason",
+        now=1_001.5,
+    )
+    unchanged = ledger.get_delivery(record.delivery_id)
+    assert unchanged is not None
+    assert unchanged.last_error == "resolver_cleanup_cancelled"
+    assert ledger.recover_after_restart(now=1_002.0) == []
+
+
+def test_cancel_pending_delivery_mismatch_and_nonpending_are_noops():
+    record = _reserve()
+    context = _required_record_context(record)
+    mismatches = (
+        {"delivery_id": "0" * 32},
+        {"plugin_id": "wrong.plugin"},
+        {"binding_digest": "0" * 64},
+        {"recovery_context_digest": "0" * 64},
+    )
+    base = {
+        "delivery_id": record.delivery_id,
+        "plugin_id": record.plugin_id,
+        "binding_digest": record.binding_digest,
+        "recovery_context_digest": context,
+    }
+    for mismatch in mismatches:
+        assert not ledger.cancel_pending_delivery(
+            **(base | mismatch), reason="must_not_mutate", now=1_001.0
+        )
+        unchanged = ledger.get_delivery(record.delivery_id)
+        assert unchanged is not None
+        assert unchanged.state is ledger.DeliveryState.PENDING
+        assert unchanged.sanitized_content == "sanitized final"
+
+    claim = ledger.claim_pending_delivery(**base, now=1_002.0)
+    assert claim is not None
+    assert not ledger.cancel_pending_delivery(**base, now=1_003.0)
+    claimed = ledger.get_delivery(record.delivery_id)
+    assert claimed is not None
+    assert claimed.state is ledger.DeliveryState.SEND_CLAIMED
+
+
+def test_thread_claim_cancel_race_has_exactly_one_winner():
+    record = _reserve()
+    context = _required_record_context(record)
+    start = threading.Event()
+
+    def claim() -> bool:
+        start.wait()
+        return (
+            ledger.claim_pending_delivery(
+                delivery_id=record.delivery_id,
+                plugin_id=record.plugin_id,
+                binding_digest=record.binding_digest,
+                recovery_context_digest=context,
+                now=1_001.0,
+            )
+            is not None
+        )
+
+    def cancel() -> bool:
+        start.wait()
+        return ledger.cancel_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            recovery_context_digest=context,
+            now=1_001.0,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(claim), pool.submit(cancel)]
+        start.set()
+        outcomes = [future.result() for future in futures]
+
+    assert outcomes.count(True) == 1
+    final = ledger.get_delivery(record.delivery_id)
+    assert final is not None
+    assert final.state in {
+        ledger.DeliveryState.SEND_CLAIMED,
+        ledger.DeliveryState.FAILED,
+    }
+    assert final.sanitized_content is None
+
+
+def test_process_claim_cancel_race_has_exactly_one_winner():
+    record = _reserve()
+    context_digest = _required_record_context(record)
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_recovery_claim_in_process,
+            args=(
+                start,
+                results,
+                record.delivery_id,
+                record.binding_digest,
+                context_digest,
+            ),
+        ),
+        context.Process(
+            target=_cancel_pending_in_process,
+            args=(
+                start,
+                results,
+                record.delivery_id,
+                record.binding_digest,
+                context_digest,
+            ),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert [results.get(timeout=1) for _ in processes].count(True) == 1
+    final = ledger.get_delivery(record.delivery_id)
+    assert final is not None
+    assert final.state in {
+        ledger.DeliveryState.SEND_CLAIMED,
+        ledger.DeliveryState.FAILED,
+    }
+    assert final.sanitized_content is None
 
 
 @pytest.mark.parametrize(
@@ -1013,6 +1316,7 @@ def test_recovered_claim_supports_non_delivery_terminal_markers(
         delivery_id=record.delivery_id,
         plugin_id=record.plugin_id,
         binding_digest=record.binding_digest,
+        recovery_context_digest=_required_record_context(record),
         now=1_002.0,
     )
     assert claim is not None
@@ -1032,6 +1336,7 @@ def test_recovered_claim_supports_non_delivery_terminal_markers(
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_004.0,
         )
         is None
@@ -1046,6 +1351,7 @@ def test_recovery_claim_mismatch_does_not_mutate_pending_delivery():
             delivery_id=record.delivery_id,
             plugin_id="wrong.plugin",
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_001.0,
         )
         is None
@@ -1055,6 +1361,7 @@ def test_recovery_claim_mismatch_does_not_mutate_pending_delivery():
             delivery_id=record.delivery_id,
             plugin_id="test.plugin",
             binding_digest="0" * 64,
+            recovery_context_digest=_required_record_context(record),
             now=1_001.0,
         )
         is None
@@ -1064,6 +1371,7 @@ def test_recovery_claim_mismatch_does_not_mutate_pending_delivery():
             delivery_id="0" * 32,
             plugin_id="test.plugin",
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_001.0,
         )
         is None
@@ -1102,9 +1410,16 @@ def test_recovery_claim_mismatch_does_not_mutate_pending_delivery():
             "plugin_id": "test.plugin",
             "binding_digest": "A" * 64,
         },
+        {
+            "delivery_id": "a" * 32,
+            "plugin_id": "test.plugin",
+            "binding_digest": "a" * 64,
+            "recovery_context_digest": "short",
+        },
     ],
 )
 def test_recovery_claim_rejects_malformed_identifiers(_isolated_db, kwargs):
+    kwargs.setdefault("recovery_context_digest", _DEFAULT_RECOVERY_CONTEXT_DIGEST)
     with pytest.raises(ValueError):
         ledger.claim_pending_delivery(**kwargs, now=1_001.0)
 
@@ -1120,6 +1435,7 @@ def test_simultaneous_recovery_claim_has_exactly_one_thread_winner():
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_002.0,
         )
 
@@ -1138,7 +1454,13 @@ def test_simultaneous_recovery_claim_has_exactly_one_process_winner():
     processes = [
         context.Process(
             target=_recovery_claim_in_process,
-            args=(start, results, record.delivery_id, record.binding_digest),
+            args=(
+                start,
+                results,
+                record.delivery_id,
+                record.binding_digest,
+                _required_record_context(record),
+            ),
         )
         for _ in range(6)
     ]
@@ -1159,6 +1481,7 @@ def test_recovered_claim_becomes_uncertain_after_next_restart():
         delivery_id=record.delivery_id,
         plugin_id=record.plugin_id,
         binding_digest=record.binding_digest,
+        recovery_context_digest=_required_record_context(record),
         now=1_002.0,
     )
     assert claim is not None
@@ -1172,6 +1495,7 @@ def test_recovered_claim_becomes_uncertain_after_next_restart():
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_004.0,
         )
         is None
@@ -1186,6 +1510,7 @@ def test_recovery_claim_expires_pending_content_without_returning_it():
             delivery_id=record.delivery_id,
             plugin_id=record.plugin_id,
             binding_digest=record.binding_digest,
+            recovery_context_digest=_required_record_context(record),
             now=1_000.0 + ledger.CONTENT_RETENTION_SECONDS + 1,
         )
         is None

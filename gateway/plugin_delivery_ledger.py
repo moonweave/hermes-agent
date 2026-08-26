@@ -186,6 +186,7 @@ class DeliveryRecord:
     plugin_id: str
     binding_digest: str
     delivery_key_digest: str
+    recovery_context_digest: str | None
     state: DeliveryState
     sanitized_content: str | None
     created_at: float
@@ -206,6 +207,7 @@ class PendingDelivery:
     delivery_id: str
     content: str
     binding_digest: str
+    recovery_context_digest: str
 
 
 @dataclass(frozen=True)
@@ -581,6 +583,7 @@ def _memory_connection(image: bytes | None) -> sqlite3.Connection:
                 plugin_id TEXT NOT NULL,
                 binding_digest TEXT NOT NULL,
                 delivery_key_digest TEXT NOT NULL,
+                recovery_context_digest TEXT,
                 content_digest TEXT NOT NULL,
                 sanitized_content TEXT,
                 state TEXT NOT NULL,
@@ -593,6 +596,13 @@ def _memory_connection(image: bytes | None) -> sqlite3.Connection:
                 UNIQUE(plugin_id, binding_digest, delivery_key_digest)
             )"""
         )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(plugin_deliveries)")
+        }
+        if "recovery_context_digest" not in columns:
+            conn.execute(
+                "ALTER TABLE plugin_deliveries ADD COLUMN recovery_context_digest TEXT"
+            )
         return conn
     except LedgerTrustError:
         if conn is not None:
@@ -796,6 +806,7 @@ def _row_to_record(row: sqlite3.Row) -> DeliveryRecord:
         plugin_id=row["plugin_id"],
         binding_digest=row["binding_digest"],
         delivery_key_digest=row["delivery_key_digest"],
+        recovery_context_digest=row["recovery_context_digest"],
         state=DeliveryState(row["state"]),
         sanitized_content=row["sanitized_content"],
         created_at=float(row["created_at"]),
@@ -811,6 +822,7 @@ def reserve_delivery(
     binding_handle: str,
     delivery_key: str,
     sanitized_content: str,
+    recovery_context_digest: str | None = None,
     now: float | None = None,
 ) -> DeliveryRecord:
     """Persist one logical final result without retaining capability material."""
@@ -818,6 +830,11 @@ def reserve_delivery(
         raise ValueError("invalid plugin_id")
     if not binding_handle or not delivery_key:
         raise ValueError("binding_handle and delivery_key are required")
+    if recovery_context_digest is not None and (
+        not isinstance(recovery_context_digest, str)
+        or not _SHA256_DIGEST_RE.fullmatch(recovery_context_digest)
+    ):
+        raise ValueError("invalid recovery_context_digest")
     content = _sanitize_text(sanitized_content, limit=100_000)
     if not content.strip():
         raise ValueError("sanitized_content must not be empty")
@@ -831,9 +848,9 @@ def reserve_delivery(
         conn.execute(
             """INSERT INTO plugin_deliveries (
                    delivery_id, plugin_id, binding_digest, delivery_key_digest,
-                   content_digest, sanitized_content, state, created_at,
-                   updated_at, content_expires_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   recovery_context_digest, content_digest, sanitized_content,
+                   state, created_at, updated_at, content_expires_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(plugin_id, binding_digest, delivery_key_digest)
                DO NOTHING""",
             (
@@ -841,6 +858,7 @@ def reserve_delivery(
                 plugin_id,
                 binding_digest,
                 key_digest,
+                recovery_context_digest,
                 content_digest,
                 content,
                 DeliveryState.PENDING.value,
@@ -859,6 +877,10 @@ def reserve_delivery(
         if row["content_digest"] != content_digest:
             raise DeliveryConflictError(
                 "logical delivery already reserved with different content"
+            )
+        if row["recovery_context_digest"] != recovery_context_digest:
+            raise DeliveryConflictError(
+                "logical delivery already reserved with different recovery context"
             )
         return _row_to_record(row)
 
@@ -925,6 +947,7 @@ def claim_pending_delivery(
     delivery_id: str,
     plugin_id: str,
     binding_digest: str,
+    recovery_context_digest: str,
     now: float | None = None,
 ) -> DeliveryClaim | None:
     """Claim recovered pending work without reconstructing opaque identifiers."""
@@ -936,6 +959,10 @@ def claim_pending_delivery(
         binding_digest
     ):
         raise ValueError("invalid binding_digest")
+    if not isinstance(recovery_context_digest, str) or not _SHA256_DIGEST_RE.fullmatch(
+        recovery_context_digest
+    ):
+        raise ValueError("invalid recovery_context_digest")
 
     timestamp = time.time() if now is None else float(now)
     with _LOCK, _transaction(immediate=True) as conn:
@@ -943,11 +970,13 @@ def claim_pending_delivery(
             """SELECT delivery_id, sanitized_content, content_expires_at
                FROM plugin_deliveries
                WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                 AND recovery_context_digest=?
                  AND state=?""",
             (
                 delivery_id,
                 plugin_id,
                 binding_digest,
+                recovery_context_digest,
                 DeliveryState.PENDING.value,
             ),
         ).fetchone()
@@ -959,6 +988,7 @@ def claim_pending_delivery(
                    SET state=?, sanitized_content=NULL, updated_at=?,
                        last_error='content_retention_expired'
                    WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                     AND recovery_context_digest=?
                      AND state=?""",
                 (
                     DeliveryState.FAILED.value,
@@ -966,6 +996,7 @@ def claim_pending_delivery(
                     delivery_id,
                     plugin_id,
                     binding_digest,
+                    recovery_context_digest,
                     DeliveryState.PENDING.value,
                 ),
             )
@@ -976,6 +1007,7 @@ def claim_pending_delivery(
             """UPDATE plugin_deliveries
                SET state=?, claim_digest=?, sanitized_content=NULL, updated_at=?
                WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                 AND recovery_context_digest=?
                  AND state=?""",
             (
                 DeliveryState.SEND_CLAIMED.value,
@@ -984,6 +1016,7 @@ def claim_pending_delivery(
                 delivery_id,
                 plugin_id,
                 binding_digest,
+                recovery_context_digest,
                 DeliveryState.PENDING.value,
             ),
         ).rowcount
@@ -994,6 +1027,53 @@ def claim_pending_delivery(
             claim_token=claim_token,
             sanitized_content=row["sanitized_content"],
         )
+
+
+def cancel_pending_delivery(
+    *,
+    delivery_id: str,
+    plugin_id: str,
+    binding_digest: str,
+    recovery_context_digest: str,
+    reason: str = "cancelled",
+    now: float | None = None,
+) -> bool:
+    """Durably cancel exact pending recovery work before transport dispatch."""
+    if not isinstance(delivery_id, str) or not _DELIVERY_ID_RE.fullmatch(delivery_id):
+        raise ValueError("invalid delivery_id")
+    if not isinstance(plugin_id, str) or not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise ValueError("invalid plugin_id")
+    if not isinstance(binding_digest, str) or not _SHA256_DIGEST_RE.fullmatch(
+        binding_digest
+    ):
+        raise ValueError("invalid binding_digest")
+    if not isinstance(recovery_context_digest, str) or not _SHA256_DIGEST_RE.fullmatch(
+        recovery_context_digest
+    ):
+        raise ValueError("invalid recovery_context_digest")
+
+    safe_reason = _sanitize_text(reason, limit=500).strip() or "cancelled"
+    timestamp = time.time() if now is None else float(now)
+    with _LOCK, _transaction(immediate=True) as conn:
+        changed = conn.execute(
+            """UPDATE plugin_deliveries
+               SET state=?, claim_digest=NULL, sanitized_content=NULL,
+                   updated_at=?, last_error=?
+               WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                 AND recovery_context_digest=?
+                 AND state=?""",
+            (
+                DeliveryState.FAILED.value,
+                timestamp,
+                safe_reason,
+                delivery_id,
+                plugin_id,
+                binding_digest,
+                recovery_context_digest,
+                DeliveryState.PENDING.value,
+            ),
+        ).rowcount
+        return changed == 1
 
 
 def _finish_claim(
@@ -1107,10 +1187,23 @@ def recover_after_restart(*, now: float | None = None) -> list[PendingDelivery]:
                 timestamp,
             ),
         )
+        conn.execute(
+            """UPDATE plugin_deliveries
+               SET state=?, sanitized_content=NULL, updated_at=?,
+                   last_error='recovery_context_missing'
+               WHERE state=? AND recovery_context_digest IS NULL""",
+            (
+                DeliveryState.FAILED.value,
+                timestamp,
+                DeliveryState.PENDING.value,
+            ),
+        )
         rows = conn.execute(
-            """SELECT delivery_id, sanitized_content, binding_digest
+            """SELECT delivery_id, sanitized_content, binding_digest,
+                      recovery_context_digest
                FROM plugin_deliveries
                WHERE state=? AND sanitized_content IS NOT NULL
+                 AND recovery_context_digest IS NOT NULL
                ORDER BY created_at, delivery_id""",
             (DeliveryState.PENDING.value,),
         ).fetchall()
@@ -1119,6 +1212,7 @@ def recover_after_restart(*, now: float | None = None) -> list[PendingDelivery]:
                 delivery_id=row["delivery_id"],
                 content=row["sanitized_content"],
                 binding_digest=row["binding_digest"],
+                recovery_context_digest=row["recovery_context_digest"],
             )
             for row in rows
         ]

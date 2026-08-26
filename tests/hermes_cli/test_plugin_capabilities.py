@@ -51,6 +51,7 @@ class TestRegistry:
                 "delegation.subagents",
                 "gateway.control_observer",
                 "gateway.message_dispatch",
+                "gateway.message_delivery",
             }:
                 assert spec.legacy_path == ()
             else:

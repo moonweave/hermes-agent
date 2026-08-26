@@ -11,7 +11,10 @@ from agent.route_capability import (
     CoordinatorRole,
     CoordinatorRoleRequest,
     CoordinatorService,
+    GatewayDeliveryResult,
+    GatewayDeliveryService,
     GatewayTaskService,
+    activate_gateway_dispatch_binding,
     issue_gateway_dispatch_binding,
     reset_coordinator_registry_for_tests,
     revoke_gateway_dispatch_binding,
@@ -25,7 +28,9 @@ def _reset_registry():
     reset_coordinator_registry_for_tests()
 
 
-def _binding(*, parent=None, parent_resolver=None, schedule=None):
+def _binding(
+    *, parent=None, parent_resolver=None, schedule=None, delivery=None, validity=None
+):
     if parent is None and parent_resolver is None:
         parent = SimpleNamespace(
             session_id="session-1", _delegate_depth=0, _subagent_id=None
@@ -40,7 +45,8 @@ def _binding(*, parent=None, parent_resolver=None, schedule=None):
         platform="telegram",
         message_id="message-1",
         schedule=schedule or (lambda _factory, _name, _binding: "task-1"),
-        validity_resolver=lambda: True,
+        validity_resolver=validity or (lambda: True),
+        delivery=delivery,
     )
 
 
@@ -146,6 +152,64 @@ def test_bound_task_and_coordinator_fail_after_live_revocation():
     authorized[0] = True
     with pytest.raises(CoordinatorRouteError, match="Unknown"):
         tasks.spawn(lambda: None, name="consultation")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_bound_delivery_rechecks_grant_issuer_and_binding_revocation():
+    authorized = [True]
+    calls = []
+
+    async def deliver(plugin_id, binding_handle, _expires_at, delivery_key, content):
+        calls.append((plugin_id, binding_handle, delivery_key, content))
+        return GatewayDeliveryResult("DELIVERED", True, "delivery-1")
+
+    binding = _binding(delivery=deliver)
+    service = GatewayDeliveryService(
+        "fixture", authorization_resolver=lambda: authorized[0]
+    )
+    bound = service.for_gateway_binding(binding)
+    assert not any("adapter" in name for name in vars(bound))
+
+    with pytest.raises(CoordinatorRouteError, match="verification failed"):
+        GatewayDeliveryService(
+            "other", authorization_resolver=lambda: True
+        ).for_gateway_binding(binding)
+
+    with pytest.raises(CoordinatorRouteError, match="not active"):
+        await bound.deliver_once(delivery_key="final", content="answer")
+    assert calls == []
+    activate_gateway_dispatch_binding(binding)
+
+    authorized[0] = False
+    with pytest.raises(PermissionError, match="not granted"):
+        await bound.deliver_once(delivery_key="final", content="answer")
+    assert calls == []
+
+    authorized[0] = True
+    revoke_gateway_dispatch_binding(binding)
+    with pytest.raises(CoordinatorRouteError, match="Unknown"):
+        await bound.deliver_once(delivery_key="final", content="answer")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_bound_delivery_rechecks_session_liveness_before_callback():
+    live = [True]
+    calls = []
+
+    async def deliver(*args):
+        calls.append(args)
+        return GatewayDeliveryResult("DELIVERED", True)
+
+    binding = _binding(delivery=deliver, validity=lambda: live[0])
+    bound = GatewayDeliveryService(
+        "fixture", authorization_resolver=lambda: True
+    ).for_gateway_binding(binding)
+    live[0] = False
+
+    with pytest.raises(CoordinatorRouteError, match="no longer live"):
+        await bound.deliver_once(delivery_key="final", content="answer")
+    assert calls == []
 
 
 def test_gateway_bound_coordinator_launches_strict_toolless_leaf(monkeypatch):

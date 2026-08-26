@@ -27,6 +27,7 @@ Capability id                Legacy config gate (``plugins.entries.<id>.…``)
 ``llm.task_override``        ``llm.allow_task_override``
 ``gateway.platform_actions`` ``allow_platform_actions``
 ``gateway.message_dispatch`` none; explicit capability grant only
+``gateway.message_delivery`` none; explicit capability grant only
 ``gateway.control_observer`` none; explicit capability grant only
 ``delegation.coordinator``   none; explicit capability grant only
 ``delegation.subagents``     none; explicit capability grant only
@@ -140,6 +141,14 @@ CAPABILITY_REGISTRY: Dict[str, CapabilitySpec] = {
             description=(
                 "Intercept authorized non-command gateway messages before the "
                 "conversation model runs and schedule host-owned background work"
+            ),
+        ),
+        CapabilitySpec(
+            id="gateway.message_delivery",
+            legacy_path=(),
+            description=(
+                "Deliver one capability-bound Telegram response through a "
+                "host-owned at-most-once single-send facade"
             ),
         ),
         CapabilitySpec(

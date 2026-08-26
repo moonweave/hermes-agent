@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.route_capability import GatewayDispatchDecision
+from agent.route_capability import GatewayDeliveryResult, GatewayDispatchDecision
 from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import (
     LoadedPlugin,
@@ -81,6 +81,76 @@ def test_gateway_hooks_require_declared_and_live_grants(monkeypatch):
     )
     with pytest.raises(PermissionError, match="must declare"):
         undeclared.register_hook("gateway_status_contributor", lambda **_: "x")
+
+
+def test_gateway_delivery_requires_declared_and_live_grant(monkeypatch):
+    manager = PluginManager()
+    undeclared_manifest = PluginManifest(name="plain", key="plain", capabilities=[])
+    undeclared = PluginContext(undeclared_manifest, manager)
+    monkeypatch.setattr(plugins_mod, "plugin_capability_granted", lambda *_: True)
+    with pytest.raises(PermissionError, match="gateway.message_delivery"):
+        _ = undeclared.gateway_delivery
+
+    declared_manifest = PluginManifest(
+        name="delivery",
+        key="delivery",
+        capabilities=["gateway.message_delivery"],
+    )
+    declared = PluginContext(declared_manifest, manager)
+    monkeypatch.setattr(plugins_mod, "plugin_capability_granted", lambda *_: False)
+    with pytest.raises(PermissionError, match="gateway.message_delivery"):
+        _ = declared.gateway_delivery
+
+
+@pytest.mark.asyncio
+async def test_gateway_delivery_facade_binds_only_host_callback(monkeypatch):
+    plugin_id = "fixture-delivery"
+    manifest = PluginManifest(
+        name=plugin_id,
+        key=plugin_id,
+        capabilities=["gateway.message_dispatch", "gateway.message_delivery"],
+    )
+    manager = PluginManager()
+    manager._plugins[plugin_id] = LoadedPlugin(manifest=manifest, enabled=True)
+    plugin_context = PluginContext(manifest, manager)
+    monkeypatch.setattr(plugins_mod, "plugin_capability_granted", lambda *_: True)
+    captured = {}
+
+    def dispatch(*, context):
+        captured["delivery"] = plugin_context.gateway_delivery.for_gateway_binding(
+            context.binding
+        )
+        return {"action": "handled"}
+
+    async def delivery(plugin, handle, expires_at, delivery_key, content):
+        captured["callback"] = (plugin, handle, expires_at, delivery_key, content)
+        return GatewayDeliveryResult("DELIVERED", True, "delivery-1")
+
+    plugin_context.register_hook("gateway_pre_agent_dispatch", dispatch)
+    decision = manager.invoke_gateway_pre_agent_dispatch(
+        message="sensitive portfolio question",
+        platform="telegram",
+        session_id="session-1",
+        parent_turn_id="gateway-turn-1",
+        message_id="message-1",
+        parent=SimpleNamespace(session_id="session-1"),
+        schedule=lambda *_: "task-1",
+        binding_validity=lambda: True,
+        delivery=delivery,
+    )
+
+    result = await captured["delivery"].deliver_once(
+        delivery_key="final", content="safe answer"
+    )
+
+    assert decision.action == "handled"
+    assert result == GatewayDeliveryResult("DELIVERED", True, "delivery-1")
+    callback = captured["callback"]
+    assert callback[0] == plugin_id
+    assert callback[3:] == ("final", "safe answer")
+    assert isinstance(callback[1], str) and len(callback[1]) == 64
+    assert isinstance(callback[2], float)
+    assert not any("adapter" in name for name in vars(captured["delivery"]))
 
 
 def test_dispatch_error_and_malformed_result_allow(monkeypatch, caplog):

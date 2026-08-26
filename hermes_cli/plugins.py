@@ -1415,6 +1415,7 @@ class PluginContext:
         self._subagent_lifecycle: Any = None
         self._coordinator_service: Any = None
         self._gateway_tasks: Any = None
+        self._gateway_delivery: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
         self._platform_actions: Any = None
@@ -1710,6 +1711,38 @@ class PluginContext:
                 self.plugin_id, authorization_resolver=_authorized
             )
         return self._gateway_tasks
+
+    @property
+    def gateway_delivery(self) -> Any:
+        """Return grant-only at-most-once delivery bound to gateway messages.
+
+        Plugins receive no adapter, destination, transport token, or private
+        delivery handle. Every binding and delivery call re-checks the live
+        declaration, grant, and signed gateway dispatch authority.
+        """
+        capability_id = "gateway.message_delivery"
+        if (
+            capability_id not in self.manifest.capabilities
+            or not plugin_capability_granted(self.plugin_id, capability_id)
+        ):
+            raise PermissionError(
+                f"Plugin {self.plugin_id!r} requires declared and granted "
+                f"capability {capability_id!r}"
+            )
+        if self._gateway_delivery is None:
+            from agent.route_capability import GatewayDeliveryService
+
+            def _authorized() -> bool:
+                return (
+                    capability_id in self.manifest.capabilities
+                    and plugin_capability_granted(self.plugin_id, capability_id)
+                )
+
+            self._gateway_delivery = GatewayDeliveryService(
+                self.plugin_id,
+                authorization_resolver=_authorized,
+            )
+        return self._gateway_delivery
 
     # -- profile awareness --------------------------------------------------
 
@@ -5468,6 +5501,7 @@ class PluginManager:
         parent_resolver: Optional[Callable[[], Any]] = None,
         schedule: Callable,
         binding_validity: Callable[[], bool],
+        delivery: Optional[Callable] = None,
     ) -> Any:
         """Run the one authorized dispatch owner; every failure means allow."""
         from agent.route_capability import (
@@ -5504,6 +5538,7 @@ class PluginManager:
                     message_id=message_id,
                     schedule=schedule,
                     validity_resolver=binding_validity,
+                    delivery=delivery,
                 )
                 context = GatewayDispatchContext(
                     binding=binding,

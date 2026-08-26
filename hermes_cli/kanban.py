@@ -1614,8 +1614,14 @@ def _cmd_boards_dashboard_snapshot(args: argparse.Namespace) -> int:
         try:
             kb.init_db(board=slug)
             with kb.connect_closing(board=slug) as conn:
+                count_rows = conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                ).fetchall()
+                counts = {row["status"]: int(row["n"]) for row in count_rows}
                 rows.append({
                     **board,
+                    "counts": counts,
+                    "total": sum(counts.values()),
                     "stats": kb.board_stats(conn),
                     "activity": kb.board_activity_v3(
                         conn, limit=args.activity_limit
@@ -1628,6 +1634,8 @@ def _cmd_boards_dashboard_snapshot(args: argparse.Namespace) -> int:
             failed_boards.append(slug)
             rows.append({
                 **board,
+                "counts": {},
+                "total": 0,
                 "stats": None,
                 "activity": None,
                 "operator_inbox": None,

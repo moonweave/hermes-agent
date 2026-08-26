@@ -332,6 +332,8 @@ class TestCLI:
         assert payload["contract_version"] == "hermes-kanban-dashboard-snapshot-v1"
         assert [board["slug"] for board in payload["boards"]] == ["default", "project-one"]
         project = payload["boards"][1]
+        assert project["counts"] == {"ready": 1}
+        assert project["total"] == 1
         assert project["stats"]["by_status"] == {"ready": 1}
         assert project["activity"]["contract_version"] == "hermes-kanban-activity-v3"
         assert project["operator_inbox"]["contract_version"] == "hermes-kanban-operator-inbox-v1"

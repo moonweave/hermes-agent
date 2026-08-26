@@ -36,6 +36,8 @@ _MAX_DATABASE_BYTES = 64 * 1024 * 1024
 _MAX_CANONICAL_INPUT_BYTES = 200_000
 _MAX_CANONICALIZATION_PASSES = 8
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_DELIVERY_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_SHA256_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACCOUNT_VALUE_PART = r"[A-Za-z0-9*._-]*\d[A-Za-z0-9*._-]*"
 _ACCOUNT_LABEL_RE = re.compile(
     r"(?i)(account(?:[\s_-]*(?:number|no\.?))?|계좌(?:\s*번호)?)"
@@ -548,14 +550,23 @@ def _sqlite_snapshot_supported() -> bool:
     )
 
 
+def _require_secure_delete(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA secure_delete=ON")
+    enabled = conn.execute("PRAGMA secure_delete").fetchone()
+    if not enabled or str(enabled[0]).lower() not in {"1", "on"}:
+        raise LedgerTrustError("SQLite secure deletion is required")
+
+
 def _memory_connection(image: bytes | None) -> sqlite3.Connection:
     if not _sqlite_snapshot_supported():
         raise LedgerTrustError("SQLite serialize/deserialize support is required")
     conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(":memory:", isolation_level=None)
+        _require_secure_delete(conn)
         if image is not None:
             conn.deserialize(image)
+            _require_secure_delete(conn)
         conn.row_factory = sqlite3.Row
         journal_mode = conn.execute("PRAGMA journal_mode=MEMORY").fetchone()
         if not journal_mode or str(journal_mode[0]).lower() != "memory":
@@ -897,6 +908,82 @@ def claim_for_send(
                 _digest(claim_token),
                 timestamp,
                 row["delivery_id"],
+                DeliveryState.PENDING.value,
+            ),
+        ).rowcount
+        if changed != 1:
+            return None
+        return DeliveryClaim(
+            delivery_id=row["delivery_id"],
+            claim_token=claim_token,
+            sanitized_content=row["sanitized_content"],
+        )
+
+
+def claim_pending_delivery(
+    *,
+    delivery_id: str,
+    plugin_id: str,
+    binding_digest: str,
+    now: float | None = None,
+) -> DeliveryClaim | None:
+    """Claim recovered pending work without reconstructing opaque identifiers."""
+    if not isinstance(delivery_id, str) or not _DELIVERY_ID_RE.fullmatch(delivery_id):
+        raise ValueError("invalid delivery_id")
+    if not isinstance(plugin_id, str) or not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise ValueError("invalid plugin_id")
+    if not isinstance(binding_digest, str) or not _SHA256_DIGEST_RE.fullmatch(
+        binding_digest
+    ):
+        raise ValueError("invalid binding_digest")
+
+    timestamp = time.time() if now is None else float(now)
+    with _LOCK, _transaction(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT delivery_id, sanitized_content, content_expires_at
+               FROM plugin_deliveries
+               WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                 AND state=?""",
+            (
+                delivery_id,
+                plugin_id,
+                binding_digest,
+                DeliveryState.PENDING.value,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["sanitized_content"] is None or row["content_expires_at"] <= timestamp:
+            conn.execute(
+                """UPDATE plugin_deliveries
+                   SET state=?, sanitized_content=NULL, updated_at=?,
+                       last_error='content_retention_expired'
+                   WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                     AND state=?""",
+                (
+                    DeliveryState.FAILED.value,
+                    timestamp,
+                    delivery_id,
+                    plugin_id,
+                    binding_digest,
+                    DeliveryState.PENDING.value,
+                ),
+            )
+            return None
+
+        claim_token = secrets.token_hex(24)
+        changed = conn.execute(
+            """UPDATE plugin_deliveries
+               SET state=?, claim_digest=?, sanitized_content=NULL, updated_at=?
+               WHERE delivery_id=? AND plugin_id=? AND binding_digest=?
+                 AND state=?""",
+            (
+                DeliveryState.SEND_CLAIMED.value,
+                _digest(claim_token),
+                timestamp,
+                delivery_id,
+                plugin_id,
+                binding_digest,
                 DeliveryState.PENDING.value,
             ),
         ).rowcount

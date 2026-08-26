@@ -44,6 +44,45 @@ def _claim_in_process(start, results):
     results.put(claim is not None)
 
 
+def _recovery_claim_in_process(start, results, delivery_id, binding_digest):
+    start.wait()
+    claim = ledger.claim_pending_delivery(
+        delivery_id=delivery_id,
+        plugin_id="test.plugin",
+        binding_digest=binding_digest,
+        now=1_002.0,
+    )
+    results.put(claim is not None)
+
+
+def _page_spanning_content(label: str) -> str:
+    return (f"{label}|" * 400)[:10_000]
+
+
+def _force_secure_delete_default_off(monkeypatch) -> None:
+    real_connect = sqlite3.connect
+
+    class InsecureDefaultConnection:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+            conn.execute("PRAGMA secure_delete=OFF")
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+        def deserialize(self, image):
+            self._conn.deserialize(image)
+            self._conn.execute("PRAGMA secure_delete=OFF")
+
+    def insecure_default_connect(*args, **kwargs):
+        return InsecureDefaultConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(ledger.sqlite3, "connect", insecure_default_connect)
+
+
 def test_database_is_private_and_does_not_store_opaque_handles_or_keys(_isolated_db):
     record = _reserve()
 
@@ -63,6 +102,108 @@ def test_database_is_atomic_sqlite_image_without_sqlite_sidecars(_isolated_db):
     assert not Path(f"{_isolated_db}-wal").exists()
     assert not Path(f"{_isolated_db}-shm").exists()
     assert not Path(f"{_isolated_db}-journal").exists()
+
+
+def test_recovery_claim_securely_erases_multirow_content_from_database_image(
+    _isolated_db, monkeypatch
+):
+    _force_secure_delete_default_off(monkeypatch)
+    needle = b"recovery-claim-sensitive-Z"
+    erased = _page_spanning_content(needle.decode())
+    record = _reserve(content=erased, binding="erase-binding")
+    _reserve(content=_page_spanning_content("retained-row-Y"), binding="retain-binding")
+    assert needle in _isolated_db.read_bytes()
+    ledger.recover_after_restart(now=1_001.0)
+
+    claim = ledger.claim_pending_delivery(
+        delivery_id=record.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=record.binding_digest,
+        now=1_002.0,
+    )
+
+    assert claim is not None
+    assert needle not in _isolated_db.read_bytes()
+
+
+def test_restart_expiry_securely_erases_multirow_content_from_database_image(
+    _isolated_db, monkeypatch
+):
+    _force_secure_delete_default_off(monkeypatch)
+    needle = b"restart-expiry-sensitive-X"
+    erased = _page_spanning_content(needle.decode())
+    _reserve(content=erased, binding="expiring-binding")
+    _reserve(
+        content=_page_spanning_content("other-expiring-row-W"), binding="other-binding"
+    )
+    assert needle in _isolated_db.read_bytes()
+
+    assert (
+        ledger.recover_after_restart(now=1_000.0 + ledger.CONTENT_RETENTION_SECONDS + 1)
+        == []
+    )
+
+    assert needle not in _isolated_db.read_bytes()
+
+
+def test_recovery_claim_expiry_securely_erases_content_from_database_image(
+    _isolated_db, monkeypatch
+):
+    _force_secure_delete_default_off(monkeypatch)
+    needle = b"claim-expiry-sensitive-V"
+    erased = _page_spanning_content(needle.decode())
+    record = _reserve(content=erased, binding="claim-expiry-binding")
+    _reserve(content=_page_spanning_content("retained-row-U"), binding="retain-binding")
+    assert needle in _isolated_db.read_bytes()
+
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_000.0 + ledger.CONTENT_RETENTION_SECONDS + 1,
+        )
+        is None
+    )
+
+    assert needle not in _isolated_db.read_bytes()
+
+
+def test_secure_delete_pragma_failure_is_fail_closed(_isolated_db, monkeypatch):
+    real_connect = sqlite3.connect
+
+    class SecureDeleteDisabledConnection:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+        def execute(self, statement, *args, **kwargs):
+            cursor = self._conn.execute(statement, *args, **kwargs)
+            if statement.strip().lower() == "pragma secure_delete":
+                return type(
+                    "DisabledPragmaResult",
+                    (),
+                    {"fetchone": staticmethod(lambda: (0,))},
+                )()
+            return cursor
+
+    monkeypatch.setattr(
+        ledger.sqlite3,
+        "connect",
+        lambda *args, **kwargs: SecureDeleteDisabledConnection(
+            real_connect(*args, **kwargs)
+        ),
+    )
+
+    with pytest.raises(ledger.LedgerTrustError, match="secure deletion"):
+        _reserve()
+
+    assert not _isolated_db.exists()
 
 
 def test_new_sqlite_entries_fsync_the_trusted_parent_directory(monkeypatch):
@@ -812,6 +953,247 @@ def test_restart_resumes_only_pending_and_claimed_becomes_uncertain():
         )
         is None
     )
+
+
+def test_recovered_pending_delivery_can_be_claimed_and_completed(_isolated_db):
+    record = _reserve()
+    [pending] = ledger.recover_after_restart(now=1_001.0)
+
+    claim = ledger.claim_pending_delivery(
+        delivery_id=pending.delivery_id,
+        plugin_id="test.plugin",
+        binding_digest=pending.binding_digest,
+        now=1_002.0,
+    )
+
+    assert claim is not None
+    assert claim.delivery_id == record.delivery_id
+    assert claim.sanitized_content == "sanitized final"
+    claimed = ledger.get_delivery(record.delivery_id)
+    assert claimed is not None
+    assert claimed.state is ledger.DeliveryState.SEND_CLAIMED
+    assert claimed.sanitized_content is None
+    raw = _isolated_db.read_bytes()
+    assert b"sanitized final" not in raw
+    assert claim.claim_token.encode() not in raw
+    assert ledger._digest(claim.claim_token).encode() in raw
+    assert ledger.mark_delivered(
+        claim.delivery_id,
+        claim.claim_token,
+        receipt_id="recovery-42",
+        now=1_003.0,
+    )
+    delivered = ledger.get_delivery(record.delivery_id)
+    assert delivered is not None
+    assert delivered.state is ledger.DeliveryState.DELIVERED
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_004.0,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "marker_name, expected_state",
+    [
+        ("mark_failed", ledger.DeliveryState.FAILED),
+        ("mark_uncertain", ledger.DeliveryState.DELIVERY_UNCERTAIN),
+    ],
+)
+def test_recovered_claim_supports_non_delivery_terminal_markers(
+    marker_name, expected_state
+):
+    record = _reserve()
+    ledger.recover_after_restart(now=1_001.0)
+    claim = ledger.claim_pending_delivery(
+        delivery_id=record.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=record.binding_digest,
+        now=1_002.0,
+    )
+    assert claim is not None
+
+    marker = getattr(ledger, marker_name)
+    assert marker(
+        claim.delivery_id,
+        claim.claim_token,
+        error="recovery terminal",
+        now=1_003.0,
+    )
+    terminal = ledger.get_delivery(record.delivery_id)
+    assert terminal is not None
+    assert terminal.state is expected_state
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_004.0,
+        )
+        is None
+    )
+
+
+def test_recovery_claim_mismatch_does_not_mutate_pending_delivery():
+    record = _reserve()
+
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id="wrong.plugin",
+            binding_digest=record.binding_digest,
+            now=1_001.0,
+        )
+        is None
+    )
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id="test.plugin",
+            binding_digest="0" * 64,
+            now=1_001.0,
+        )
+        is None
+    )
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id="0" * 32,
+            plugin_id="test.plugin",
+            binding_digest=record.binding_digest,
+            now=1_001.0,
+        )
+        is None
+    )
+    unchanged = ledger.get_delivery(record.delivery_id)
+    assert unchanged is not None
+    assert unchanged.state is ledger.DeliveryState.PENDING
+    assert unchanged.sanitized_content == "sanitized final"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "delivery_id": "short",
+            "plugin_id": "test.plugin",
+            "binding_digest": "a" * 64,
+        },
+        {
+            "delivery_id": "A" * 32,
+            "plugin_id": "test.plugin",
+            "binding_digest": "a" * 64,
+        },
+        {
+            "delivery_id": "a" * 32,
+            "plugin_id": "bad plugin",
+            "binding_digest": "a" * 64,
+        },
+        {
+            "delivery_id": "a" * 32,
+            "plugin_id": "test.plugin",
+            "binding_digest": "short",
+        },
+        {
+            "delivery_id": "a" * 32,
+            "plugin_id": "test.plugin",
+            "binding_digest": "A" * 64,
+        },
+    ],
+)
+def test_recovery_claim_rejects_malformed_identifiers(_isolated_db, kwargs):
+    with pytest.raises(ValueError):
+        ledger.claim_pending_delivery(**kwargs, now=1_001.0)
+
+    assert not _isolated_db.exists()
+
+
+def test_simultaneous_recovery_claim_has_exactly_one_thread_winner():
+    record = _reserve()
+    ledger.recover_after_restart(now=1_001.0)
+
+    def claim():
+        return ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_002.0,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        claims = list(pool.map(lambda _: claim(), range(8)))
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+
+
+def test_simultaneous_recovery_claim_has_exactly_one_process_winner():
+    record = _reserve()
+    ledger.recover_after_restart(now=1_001.0)
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_recovery_claim_in_process,
+            args=(start, results, record.delivery_id, record.binding_digest),
+        )
+        for _ in range(6)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert [results.get(timeout=1) for _ in processes].count(True) == 1
+
+
+def test_recovered_claim_becomes_uncertain_after_next_restart():
+    record = _reserve()
+    ledger.recover_after_restart(now=1_001.0)
+    claim = ledger.claim_pending_delivery(
+        delivery_id=record.delivery_id,
+        plugin_id=record.plugin_id,
+        binding_digest=record.binding_digest,
+        now=1_002.0,
+    )
+    assert claim is not None
+
+    assert ledger.recover_after_restart(now=1_003.0) == []
+    restarted = ledger.get_delivery(record.delivery_id)
+    assert restarted is not None
+    assert restarted.state is ledger.DeliveryState.DELIVERY_UNCERTAIN
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_004.0,
+        )
+        is None
+    )
+
+
+def test_recovery_claim_expires_pending_content_without_returning_it():
+    record = _reserve()
+
+    assert (
+        ledger.claim_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=record.plugin_id,
+            binding_digest=record.binding_digest,
+            now=1_000.0 + ledger.CONTENT_RETENTION_SECONDS + 1,
+        )
+        is None
+    )
+    expired = ledger.get_delivery(record.delivery_id)
+    assert expired is not None
+    assert expired.state is ledger.DeliveryState.FAILED
+    assert expired.sanitized_content is None
 
 
 def test_claim_completion_requires_matching_claim_token():

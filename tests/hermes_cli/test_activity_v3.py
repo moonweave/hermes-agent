@@ -75,6 +75,16 @@ def test_live_caption_sanitizer_keeps_status_but_removes_private_material():
     assert "/Users/" not in rendered
 
 
+def test_live_caption_sanitizer_honors_browser_length_after_ellipsis():
+    rendered = sanitize_live_caption("가" * 200)
+    emoji_rendered = sanitize_live_caption("🧭" * 100)
+
+    assert rendered.endswith("…")
+    assert len(rendered.encode("utf-16-le")) // 2 <= 160
+    assert emoji_rendered.endswith("…")
+    assert len(emoji_rendered.encode("utf-16-le")) // 2 <= 160
+
+
 def test_session_caption_is_owner_scoped_and_export_omits_ephemeral_fields(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("open", source="desktop")
@@ -138,6 +148,11 @@ def test_board_activity_v3_adds_caption_without_changing_v2(kanban_home, monkeyp
         )
         v2 = kb.board_activity_v2(conn, limit=20)
         v3 = kb.board_activity_v3(conn, limit=20)
+        conn.execute(
+            "UPDATE task_runs SET live_caption = ? WHERE id = ?",
+            ("가" * 161, run_id),
+        )
+        legacy_v3 = kb.board_activity_v3(conn, limit=20)
 
     assert "live_caption" not in v2["work_streams"][0]
     assert v2["contract_version"] == "hermes-kanban-activity-v2"
@@ -153,6 +168,9 @@ def test_board_activity_v3_adds_caption_without_changing_v2(kanban_home, monkeyp
     assert stream["phase_expires_at"] == now + 45
     assert stream["work_summary"] == "Live Work Caption v0.3 브라우저 연결 검증"
     assert "work_summary" not in v2["work_streams"][0]
+    legacy_caption = legacy_v3["work_streams"][0]["live_caption"]["text"]
+    assert legacy_caption.endswith("…")
+    assert len(legacy_caption.encode("utf-16-le")) // 2 <= 160
 
     cli_payload = json.loads(kc.run_slash("activity-v3 --json --limit 20"))
     assert cli_payload["contract_version"] == "hermes-kanban-activity-v3"
@@ -270,6 +288,26 @@ def test_sessions_activity_v3_uses_latest_open_caption_and_keeps_v2_private(caps
     assert "older" not in json.dumps(payload)
     assert "newer" not in json.dumps(payload)
     assert "worker" not in json.dumps(payload)
+
+
+def test_sessions_activity_v3_repairs_legacy_overlong_caption(capsys, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    db = _Sessions([
+        _session(
+            session_id="legacy",
+            active=now - 3,
+            caption="가" * 161,
+            caption_at=now - 3,
+        ),
+    ])
+
+    assert _sessions_activity_v3(db, argparse.Namespace(source=None, json=True, window=120)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    rendered = payload["aggregates"][0]["live_caption"]["text"]
+
+    assert rendered.endswith("…")
+    assert len(rendered.encode("utf-16-le")) // 2 <= 160
 
 
 def test_discord_default_profile_without_workspace_projects_to_hq(capsys):

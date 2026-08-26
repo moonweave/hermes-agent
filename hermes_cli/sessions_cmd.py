@@ -308,7 +308,7 @@ def _sessions_activity_v3_payload(db, args) -> dict:
     import json as _json
     import time as _time
 
-    from agent.live_activity import valid_runtime_phase
+    from agent.live_activity import sanitize_live_caption, valid_runtime_phase
     from hermes_state import workspace_key as _ws_key
 
     window = max(
@@ -401,7 +401,7 @@ def _sessions_activity_v3_payload(db, args) -> dict:
             )
         ):
             bucket["_caption"] = {
-                "text": caption.strip(),
+                "text": sanitize_live_caption(caption),
                 "observed_at": int(caption_observed),
                 "expires_at": int(caption_expires),
                 "provenance": "agent_commentary",

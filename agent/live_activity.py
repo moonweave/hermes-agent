@@ -26,6 +26,22 @@ _BARE_URL_RE = re.compile(r"https?://[^\s<>)\]]+", re.IGNORECASE)
 _SPACE_RE = re.compile(r"\s+")
 
 
+def _utf16_units(value: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _take_utf16_units(value: str, limit: int) -> str:
+    units = 0
+    characters = []
+    for character in value:
+        width = 2 if ord(character) > 0xFFFF else 1
+        if units + width > limit:
+            break
+        characters.append(character)
+        units += width
+    return "".join(characters)
+
+
 def sanitize_live_caption(text: object, *, max_chars: int = 160) -> str:
     """Return one short public commentary sentence, never raw code or paths."""
     if not isinstance(text, str) or not text.strip():
@@ -40,13 +56,14 @@ def sanitize_live_caption(text: object, *, max_chars: int = 160) -> str:
     value = _ABSOLUTE_PATH_RE.sub("[로컬 경로]", value)
     value = _BARE_URL_RE.sub("[웹 주소]", value)
     value = _SPACE_RE.sub(" ", value).strip()
-    if len(value) <= max_chars:
+    if _utf16_units(value) <= max_chars:
         return value
-    bounded = value[:max_chars].rstrip()
+    bounded = _take_utf16_units(value, max_chars).rstrip()
     sentence_end = max(bounded.rfind(mark) for mark in (".", "!", "?", "。", "요."))
-    if sentence_end >= max_chars // 2:
+    if sentence_end >= 0 and _utf16_units(bounded[: sentence_end + 1]) >= max_chars // 2:
         return bounded[: sentence_end + 1]
-    return bounded.rstrip(" ,.;:—-") + "…"
+    prefix = _take_utf16_units(bounded.rstrip(" ,.;:—-"), max_chars - 1).rstrip()
+    return prefix + "…"
 
 
 def runtime_phase_for_activity(description: object) -> str:

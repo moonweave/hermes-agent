@@ -12685,7 +12685,7 @@ def _board_activity_current(
             )
             stream["live_caption"] = (
                 {
-                    "text": caption,
+                    "text": sanitize_live_caption(caption),
                     "observed_at": int(float(caption_observed_at)),
                     "expires_at": min(int(float(caption_expires_at)), expires_at),
                     "provenance": "agent_commentary",

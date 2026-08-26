@@ -365,6 +365,13 @@ VALID_HOOKS: Set[str] = {
     #       payload contracts; no inert VALID_HOOKS surface is registered
     #       ahead of implementation.
     "gateway_platform_event",
+    # Grant-only, single-owner interception of an already-authorized ordinary
+    # gateway message. Slash commands and internal events never reach it.
+    "gateway_pre_agent_dispatch",
+    # Grant-only control observers. Stop return values are ignored; status
+    # contributors are bounded and appended after the core status card.
+    "gateway_stop_observer",
+    "gateway_status_contributor",
     # Slash-command dispatch observer (#64204, observer-first per #64182
     # ground rule 3). Fired when a recognized slash command is about to be
     # dispatched, BEFORE the handler runs, on both the interactive CLI
@@ -1407,6 +1414,7 @@ class PluginContext:
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
         self._coordinator_service: Any = None
+        self._gateway_tasks: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
         self._platform_actions: Any = None
@@ -1676,6 +1684,32 @@ class PluginContext:
                 authorization_resolver=_authorized,
             )
         return self._coordinator_service
+
+    @property
+    def gateway_tasks(self) -> Any:
+        """Return the grant-only host scheduler for bound gateway work."""
+        capability_id = "gateway.message_dispatch"
+        if (
+            capability_id not in self.manifest.capabilities
+            or not plugin_capability_granted(self.plugin_id, capability_id)
+        ):
+            raise PermissionError(
+                f"Plugin {self.plugin_id!r} requires declared and granted "
+                f"capability {capability_id!r}"
+            )
+        if self._gateway_tasks is None:
+            from agent.route_capability import GatewayTaskService
+
+            def _authorized() -> bool:
+                return (
+                    capability_id in self.manifest.capabilities
+                    and plugin_capability_granted(self.plugin_id, capability_id)
+                )
+
+            self._gateway_tasks = GatewayTaskService(
+                self.plugin_id, authorization_resolver=_authorized
+            )
+        return self._gateway_tasks
 
     # -- profile awareness --------------------------------------------------
 
@@ -3261,19 +3295,46 @@ class PluginContext:
         """
         if hook_name not in VALID_HOOKS:
             logger.warning(
-                "Plugin '%s' registered unknown hook '%s' "
-                "(valid: %s)",
+                "Plugin '%s' registered unknown hook '%s' (valid: %s)",
                 self.manifest.name,
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
+        required_capability = {
+            "gateway_pre_agent_dispatch": "gateway.message_dispatch",
+            "gateway_stop_observer": "gateway.control_observer",
+            "gateway_status_contributor": "gateway.control_observer",
+        }.get(hook_name)
+        plugin_id = self.plugin_id
+        if (
+            required_capability
+            and required_capability not in self.manifest.capabilities
+        ):
+            raise PermissionError(
+                f"Plugin {plugin_id!r} must declare capability "
+                f"{required_capability!r} to register {hook_name!r}"
+            )
+        if required_capability and not plugin_capability_granted(
+            plugin_id, required_capability
+        ):
+            raise PermissionError(
+                f"Plugin {plugin_id!r} requires a live grant for capability "
+                f"{required_capability!r} to register {hook_name!r}"
+            )
+        if hook_name == "gateway_pre_agent_dispatch":
+            owners = self._manager._hook_owners.get(hook_name, {})
+            foreign = {owner for owner in owners.values() if owner != plugin_id}
+            if foreign:
+                raise ValueError(
+                    "gateway_pre_agent_dispatch already has a different owner"
+                )
         callbacks = self._manager._hooks.setdefault(hook_name, [])
         callbacks.append(callback)
+        self._manager._hook_owners.setdefault(hook_name, {})[id(callback)] = plugin_id
         handle = self._track(
-            "hook", hook_name,
-            lambda: self._manager._remove_callback(
-                self._manager._hooks, hook_name, callback
-            ),
+            "hook",
+            hook_name,
+            lambda: self._manager._remove_owned_hook(hook_name, callback),
         )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
@@ -3544,12 +3605,15 @@ class PluginManager:
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_owners: Dict[str, Dict[int, str]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
-        self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        self._plugin_commands: Dict[
+            str, dict
+        ] = {}  # Slash commands registered by plugins
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
@@ -3718,6 +3782,14 @@ class PluginManager:
         self._remove_identity(callbacks, callback)
         if not callbacks:
             mapping.pop(key, None)
+
+    def _remove_owned_hook(self, hook_name: str, callback: Callable) -> None:
+        self._remove_callback(self._hooks, hook_name, callback)
+        owners = self._hook_owners.get(hook_name)
+        if owners is not None:
+            owners.pop(id(callback), None)
+            if not owners:
+                self._hook_owners.pop(hook_name, None)
 
     def _restore_mapping(
         self,
@@ -3949,6 +4021,7 @@ class PluginManager:
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_owners.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -5383,6 +5456,154 @@ class PluginManager:
                 )
         return results
 
+    def invoke_gateway_pre_agent_dispatch(
+        self,
+        *,
+        message: str,
+        platform: str,
+        session_id: str,
+        parent_turn_id: str,
+        message_id: str,
+        parent: Any = None,
+        parent_resolver: Optional[Callable[[], Any]] = None,
+        schedule: Callable,
+        binding_validity: Callable[[], bool],
+    ) -> Any:
+        """Run the one authorized dispatch owner; every failure means allow."""
+        from agent.route_capability import (
+            GatewayDispatchContext,
+            GatewayDispatchDecision,
+            activate_gateway_dispatch_binding,
+            issue_gateway_dispatch_binding,
+            revoke_gateway_dispatch_binding,
+        )
+
+        callbacks = tuple(self._hooks.get("gateway_pre_agent_dispatch", ()))
+        owners = self._hook_owners.get("gateway_pre_agent_dispatch", {})
+        for callback in callbacks:
+            binding = None
+            owner = owners.get(id(callback))
+            loaded = self._plugins.get(owner or "")
+            if (
+                not owner
+                or loaded is None
+                or not loaded.enabled
+                or "gateway.message_dispatch" not in loaded.manifest.capabilities
+                or not plugin_capability_granted(owner, "gateway.message_dispatch")
+            ):
+                continue
+            try:
+                binding = issue_gateway_dispatch_binding(
+                    issuer_plugin_id=owner,
+                    parent=parent,
+                    parent_resolver=parent_resolver,
+                    parent_session_id=session_id,
+                    parent_turn_id=parent_turn_id,
+                    user_message=message,
+                    platform=platform,
+                    message_id=message_id,
+                    schedule=schedule,
+                    validity_resolver=binding_validity,
+                )
+                context = GatewayDispatchContext(
+                    binding=binding,
+                    message=message,
+                    platform=platform,
+                    session_id=session_id,
+                    message_id=message_id,
+                )
+                raw = self._invoke_hook_callback(callback, {"context": context})
+            except Exception as exc:
+                logger.warning(
+                    "gateway_pre_agent_dispatch owner %s failed open (%s)",
+                    owner,
+                    type(exc).__name__,
+                )
+                if binding is not None:
+                    revoke_gateway_dispatch_binding(binding)
+                return GatewayDispatchDecision()
+            if isinstance(raw, GatewayDispatchDecision):
+                decision = raw
+            elif isinstance(raw, Mapping):
+                action = raw.get("action")
+                response = raw.get("response")
+                if action not in {"allow", "handled", "skip"} or (
+                    response is not None and not isinstance(response, str)
+                ):
+                    revoke_gateway_dispatch_binding(binding)
+                    return GatewayDispatchDecision()
+                decision = GatewayDispatchDecision(action=action, response=response)
+            else:
+                revoke_gateway_dispatch_binding(binding)
+                return GatewayDispatchDecision()
+            if (
+                decision.action not in {"allow", "handled", "skip"}
+                or (decision.response is not None and len(decision.response) > 8_000)
+                or (decision.action == "skip" and decision.response is not None)
+            ):
+                revoke_gateway_dispatch_binding(binding)
+                return GatewayDispatchDecision()
+            if decision.action == "allow":
+                revoke_gateway_dispatch_binding(binding)
+            else:
+                try:
+                    activate_gateway_dispatch_binding(binding)
+                except Exception as exc:
+                    logger.warning(
+                        "gateway_pre_agent_dispatch owner %s start failed open (%s)",
+                        owner,
+                        type(exc).__name__,
+                    )
+                    revoke_gateway_dispatch_binding(binding)
+                    return GatewayDispatchDecision()
+            return decision
+        return GatewayDispatchDecision()
+
+    def notify_gateway_stop_observers(self, **payload: Any) -> None:
+        """Best-effort observer delivery after the core stop path completes."""
+        self._invoke_granted_control_hooks("gateway_stop_observer", payload)
+
+    def gateway_status_contributions(self, **payload: Any) -> list[str]:
+        """Return bounded additive status lines from granted plugins."""
+        results = self._invoke_granted_control_hooks(
+            "gateway_status_contributor", payload, collect=True
+        )
+        lines: list[str] = []
+        used = 0
+        for result in results:
+            if not isinstance(result, str):
+                continue
+            text = result.strip()
+            if not text or len(text) > 800 or used + len(text) > 2_000:
+                continue
+            lines.append(text)
+            used += len(text)
+        return lines
+
+    def _invoke_granted_control_hooks(
+        self, hook_name: str, payload: Mapping[str, Any], *, collect: bool = False
+    ) -> list[Any]:
+        results: list[Any] = []
+        owners = self._hook_owners.get(hook_name, {})
+        for callback in tuple(self._hooks.get(hook_name, ())):
+            owner = owners.get(id(callback))
+            loaded = self._plugins.get(owner or "")
+            if (
+                not owner
+                or loaded is None
+                or not loaded.enabled
+                or "gateway.control_observer" not in loaded.manifest.capabilities
+                or not plugin_capability_granted(owner, "gateway.control_observer")
+            ):
+                continue
+            try:
+                result = self._invoke_hook_callback(callback, dict(payload))
+                if collect and result is not None:
+                    results.append(result)
+            except Exception as exc:
+                logger.warning("Hook '%s' owner %s raised: %s", hook_name, owner, exc)
+        return results
+
     def _subscribe_event(
         self,
         owner: str,
@@ -6131,6 +6352,34 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_gateway_pre_agent_dispatch(**kwargs: Any) -> Any:
+    """Invoke the authorized single dispatch owner, failing open."""
+    try:
+        return _delivery_manager().invoke_gateway_pre_agent_dispatch(**kwargs)
+    except Exception:
+        logger.warning("Gateway pre-agent dispatch failed open", exc_info=True)
+        from agent.route_capability import GatewayDispatchDecision
+
+        return GatewayDispatchDecision()
+
+
+def notify_gateway_stop_observers(**payload: Any) -> None:
+    """Notify granted stop observers without changing core stop semantics."""
+    try:
+        _delivery_manager().notify_gateway_stop_observers(**payload)
+    except Exception:
+        logger.warning("Gateway stop observer delivery failed", exc_info=True)
+
+
+def gateway_status_contributions(**payload: Any) -> list[str]:
+    """Return bounded plugin status lines without replacing core status."""
+    try:
+        return _delivery_manager().gateway_status_contributions(**payload)
+    except Exception:
+        logger.warning("Gateway status contribution failed", exc_info=True)
+        return []
 
 
 def render_system_prompt_sections(

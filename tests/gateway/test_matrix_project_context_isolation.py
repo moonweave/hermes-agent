@@ -303,6 +303,42 @@ async def test_matrix_status_reports_current_matrix_room_scope():
 
 
 @pytest.mark.asyncio
+async def test_status_appends_bounded_plugin_contribution(monkeypatch):
+    source = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    runner = _make_runner(source, [_entry(source, "session-b", "Project B Plan")])
+    captured = {}
+
+    def contribute(**payload):
+        captured.update(payload)
+        return ["Investment team: preparing"]
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.gateway_status_contributions", contribute
+    )
+
+    result = await runner._handle_status_command(_event("/status", source))
+
+    assert result.endswith("Investment team: preparing")
+    assert captured["session_id"] == "session-b"
+    assert captured["platform"] == "matrix"
+
+
+@pytest.mark.asyncio
+async def test_status_appends_bounded_host_detached_task_counts(monkeypatch):
+    source = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
+    runner = _make_runner(source, [_entry(source, "session-b", "Project B Plan")])
+    runner._gateway_plugin_task_status = MagicMock(return_value=(1, 1))
+    monkeypatch.setattr(
+        "hermes_cli.plugins.gateway_status_contributions", lambda **_: []
+    )
+
+    result = await runner._handle_status_command(_event("/status", source))
+
+    assert "Detached tasks: active=1, pending=1" in result
+    runner._gateway_plugin_task_status.assert_called_once_with("session-b")
+
+
+@pytest.mark.asyncio
 async def test_matrix_resume_quoted_title_same_room():
     source_b = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
     entry_b = _entry(source_b, "session-b-old", "Project B Plan")
@@ -338,5 +374,3 @@ async def test_matrix_resume_cross_room_requires_explicit_flag_and_warns():
     assert "Cross-room resume" in result
     assert PROJECT_B_NAME in result
     runner.session_store.switch_session.assert_called_once()
-
-

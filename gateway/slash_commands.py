@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union, cast
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -768,6 +768,33 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
 
+        task_status = cast(
+            Optional[Callable[[str], tuple[int, int]]],
+            getattr(self, "_gateway_plugin_task_status", None),
+        )
+        detached_active, detached_pending = (
+            task_status(session_entry.session_id)
+            if callable(task_status)
+            else (0, 0)
+        )
+        if detached_active or detached_pending:
+            lines.append(
+                f"Detached tasks: active={detached_active}, pending={detached_pending}"
+            )
+
+        from hermes_cli.plugins import gateway_status_contributions
+
+        contributions = gateway_status_contributions(
+            platform=source.platform.value,
+            session_id=session_entry.session_id,
+            session_key=session_key,
+            is_running=is_running,
+            queue_depth=queue_depth,
+        )
+        if contributions:
+            lines.append("")
+            lines.extend(contributions)
+
         return "\n".join(lines)
 
     @staticmethod
@@ -1438,6 +1465,24 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        detached_session_id = str(
+            getattr(session_entry, "session_id", "") or session_key
+        )
+        cancel_detached = getattr(self, "_cancel_gateway_plugin_tasks", None)
+
+        def _cancel_detached(session_id: str) -> None:
+            if callable(cancel_detached):
+                cancel_detached(session_id)
+
+        def _notify(outcome: str) -> None:
+            from hermes_cli.plugins import notify_gateway_stop_observers
+
+            notify_gateway_stop_observers(
+                platform=source.platform.value,
+                session_id=str(getattr(session_entry, "session_id", "") or ""),
+                session_key=session_key,
+                outcome=outcome,
+            )
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
@@ -1449,6 +1494,8 @@ class GatewaySlashCommandsMixin:
                 invalidation_reason="stop_command_pending",
             )
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
+            _cancel_detached(detached_session_id)
+            _notify("stopped_pending")
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:
             # Force-clean the session lock so a truly hung agent doesn't
@@ -1459,6 +1506,8 @@ class GatewaySlashCommandsMixin:
                 interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason="stop_command_handler",
             )
+            _cancel_detached(detached_session_id)
+            _notify("stopped")
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own session key.  In a per-user thread
@@ -1469,6 +1518,7 @@ class GatewaySlashCommandsMixin:
         # agent(s) that share this thread, gated on authorization.
         sibling_keys = self._sibling_thread_run_keys(source, session_key)
         if sibling_keys and self._is_user_authorized(source):
+            detached_session_ids = {detached_session_id}
             for sibling_key in sibling_keys:
                 await self._interrupt_and_clear_session(
                     sibling_key,
@@ -1476,12 +1526,36 @@ class GatewaySlashCommandsMixin:
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command_thread_sibling",
                 )
+                indexed_session_ids = getattr(
+                    self, "_gateway_detached_session_ids_for_key", None
+                )
+                if callable(indexed_session_ids):
+                    resolver = cast(
+                        Callable[[str], tuple[str, ...]], indexed_session_ids
+                    )
+                    detached_session_ids.update(resolver(sibling_key))
+                try:
+                    sibling_entry = (
+                        await self.async_session_store.lookup_by_session_key(
+                            sibling_key
+                        )
+                    )
+                except Exception:
+                    sibling_entry = None
+                sibling_session_id = str(
+                    getattr(sibling_entry, "session_id", "") or ""
+                )
+                if sibling_session_id:
+                    detached_session_ids.add(sibling_session_id)
             logger.info(
                 "STOP (thread sibling) by %s — interrupted %d run(s) in thread: %s",
                 session_key,
                 len(sibling_keys),
                 ", ".join(sibling_keys),
             )
+            for session_id in detached_session_ids:
+                _cancel_detached(session_id)
+            _notify("stopped_siblings")
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No running agent anywhere for this scope. A platform status
@@ -1504,6 +1578,8 @@ class GatewaySlashCommandsMixin:
                     exc_info=True,
                 )
 
+        _cancel_detached(detached_session_id)
+        _notify("no_active")
         return t("gateway.stop.no_active")
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:

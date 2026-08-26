@@ -137,3 +137,61 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
     result = await runner._handle_stop_command(event)
 
     assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_observer_runs_after_core_cancellation(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    key = _per_user_key("userA")
+    runner._running_agents = {key: _FakeAgent()}
+    runner.session_store = _FakeStore(key)
+    order = []
+
+    async def interrupt(*_args, **_kwargs):
+        order.append("cancelled")
+
+    runner._interrupt_and_clear_session = interrupt
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: order.append(payload["outcome"]),
+    )
+
+    await runner._handle_stop_command(
+        MessageEvent(
+            text="/stop",
+            message_type=MessageType.TEXT,
+            source=_thread_source("userA"),
+        )
+    )
+
+    assert order == ["cancelled", "stopped"]
+
+
+@pytest.mark.asyncio
+async def test_stop_observer_runs_after_cold_status_cleanup(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    key = _per_user_key("userA")
+    runner._running_agents = {}
+    runner.session_store = _FakeStore(key)
+    runner._is_user_authorized = lambda _source: True
+    adapter = _FakeStatusAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._thread_metadata_for_source = (
+        lambda _source, reply_to_message_id=None: None
+    )
+    runner._reply_anchor_for_event = lambda _event: None
+    observed = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.notify_gateway_stop_observers",
+        lambda **payload: observed.append((payload["outcome"], list(adapter.cleared))),
+    )
+
+    await runner._handle_stop_command(
+        MessageEvent(
+            text="/stop",
+            message_type=MessageType.TEXT,
+            source=_thread_source("userA"),
+        )
+    )
+
+    assert observed == [("no_active", [("chan1", None)])]

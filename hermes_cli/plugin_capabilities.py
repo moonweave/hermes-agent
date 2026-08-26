@@ -26,6 +26,8 @@ Capability id                Legacy config gate (``plugins.entries.<id>.…``)
 ``llm.profile_override``     ``llm.allow_profile_override``
 ``llm.task_override``        ``llm.allow_task_override``
 ``gateway.platform_actions`` ``allow_platform_actions``
+``gateway.message_dispatch`` none; explicit capability grant only
+``gateway.control_observer`` none; explicit capability grant only
 ``delegation.coordinator``   none; explicit capability grant only
 ``delegation.subagents``     none; explicit capability grant only
 ===========================  ==================================================
@@ -130,6 +132,22 @@ CAPABILITY_REGISTRY: Dict[str, CapabilitySpec] = {
             description=(
                 "Act on connected chat platforms as the gateway bot "
                 "(add reactions, rename threads) via ctx.platform_actions"
+            ),
+        ),
+        CapabilitySpec(
+            id="gateway.message_dispatch",
+            legacy_path=(),
+            description=(
+                "Intercept authorized non-command gateway messages before the "
+                "conversation model runs and schedule host-owned background work"
+            ),
+        ),
+        CapabilitySpec(
+            id="gateway.control_observer",
+            legacy_path=(),
+            description=(
+                "Append bounded gateway status details and observe completed "
+                "operator stop actions"
             ),
         ),
         CapabilitySpec(

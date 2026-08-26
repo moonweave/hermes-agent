@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -38,6 +39,7 @@ import shlex
 import site
 import sys
 import signal
+import secrets
 import threading
 import time
 import traceback
@@ -4287,6 +4289,90 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
     return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
+def _log_gateway_inbound_metadata(event: Any, source: Any) -> None:
+    """Log an inbound turn without retaining user-authored text."""
+    message = event.text or ""
+    reply_text = getattr(event, "reply_to_text", None) or ""
+    platform = (
+        source.platform.value
+        if hasattr(source.platform, "value")
+        else str(source.platform)
+    )
+    logger.info(
+        "inbound message: platform=%s user=%s chat=%s "
+        "message_sha256=%s message_chars=%d reply_to_id=%s "
+        "reply_sha256=%s reply_chars=%d",
+        platform,
+        source.user_name or source.user_id or "unknown",
+        source.chat_id or "unknown",
+        hashlib.sha256(message.encode("utf-8")).hexdigest()[:16],
+        len(message),
+        getattr(event, "reply_to_message_id", None),
+        hashlib.sha256(reply_text.encode("utf-8")).hexdigest()[:16]
+        if reply_text
+        else "",
+        len(reply_text),
+    )
+
+
+def _gateway_dispatch_eligible(event: Any) -> bool:
+    """Only authorized-path ordinary user messages may reach dispatch."""
+    if bool(getattr(event, "internal", False)):
+        return False
+    try:
+        return not bool(event.is_command())
+    except Exception:
+        return False
+
+
+@dataclasses.dataclass
+class _GatewayDetachedParent:
+    """Host-only parent descriptor resolved lazily after dispatch acceptance."""
+
+    session_id: str
+    _current_turn_id: str
+    model: str
+    base_url: str
+    provider: Optional[str] = None
+    api_key: Optional[str] = dataclasses.field(default=None, repr=False)
+    api_mode: Optional[str] = None
+    max_tokens: Optional[int] = None
+    request_overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
+    reasoning_config: Any = None
+    providers_allowed: Any = None
+    providers_ignored: Any = None
+    providers_order: Any = None
+    provider_sort: Any = None
+    _fallback_chain: Any = None
+    enabled_toolsets: tuple[str, ...] = ()
+    disabled_toolsets: tuple[str, ...] = ()
+    valid_tool_names: frozenset[str] = frozenset()
+    _delegate_depth: int = 0
+    _subagent_id: None = None
+    _session_db: Any = dataclasses.field(default=None, repr=False)
+    _active_children: list[Any] = dataclasses.field(default_factory=list, repr=False)
+    _active_children_lock: Any = dataclasses.field(
+        default_factory=threading.RLock, repr=False
+    )
+    _client_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
+
+
+@dataclasses.dataclass
+class _GatewayPluginTaskRecord:
+    task_id: str
+    plugin_id: str
+    session_id: str
+    binding_nonce: str
+    name: str
+    factory: Callable[[], Awaitable[Any]] = dataclasses.field(repr=False)
+    binding: Any = dataclasses.field(repr=False)
+    awaitable: Optional[Awaitable[Any]] = dataclasses.field(default=None, repr=False)
+    task: Optional[asyncio.Task[Any]] = dataclasses.field(default=None, repr=False)
+    approved: bool = False
+    state: str = "pending"
+    suppress_result: bool = False
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -7255,6 +7341,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._gateway_plugin_tasks_lock = threading.RLock()
+        self._gateway_plugin_tasks: dict[
+            tuple[str, str, str, str], _GatewayPluginTaskRecord
+        ] = {}
+        self._gateway_plugin_task_slots: dict[str, list[str]] = {}
+        self._gateway_detached_session_keys: "OrderedDict[str, str]" = OrderedDict()
+        self._gateway_detached_session_keys_max = 512
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -16559,6 +16652,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+        session_entry = await self.async_session_store.lookup_by_session_key(quick_key)
+        self._cancel_gateway_plugin_tasks(
+            str(getattr(session_entry, "session_id", "") or "")
+        )
+        from hermes_cli.plugins import notify_gateway_stop_observers
+
+        notify_gateway_stop_observers(
+            platform=source.platform.value,
+            session_id="",
+            session_key=quick_key,
+            outcome="stopped",
+        )
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
@@ -17338,6 +17443,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
+                    session_entry = (
+                        await self.async_session_store.lookup_by_session_key(_quick_key)
+                    )
+                    self._cancel_gateway_plugin_tasks(
+                        str(getattr(session_entry, "session_id", "") or "")
+                    )
+                    from hermes_cli.plugins import notify_gateway_stop_observers
+
+                    notify_gateway_stop_observers(
+                        platform=source.platform.value,
+                        session_id="",
+                        session_key=_quick_key,
+                        outcome="stopped_pending",
+                    )
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
@@ -18207,6 +18326,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # Trusted plugin dispatch runs after gateway authorization and stable
+        # session resolution, but before the ordinary turn claims a lease,
+        # persists an active sentinel, or advances its generation. A handled
+        # consultation therefore cannot be delayed by agent/MCP construction
+        # and never enters the normal transcript path.
+        if _gateway_dispatch_eligible(event):
+            _log_gateway_inbound_metadata(event, source)
+            try:
+                setattr(event, "_gateway_inbound_metadata_logged", True)
+            except Exception:
+                pass
+            dispatch_decision = await self._dispatch_authorized_gateway_message(
+                event, source
+            )
+            if dispatch_decision.action in {"handled", "skip"}:
+                logger.info(
+                    "gateway dispatch completed: platform=%s session=%s action=%s",
+                    _gateway_platform_value(source.platform),
+                    _quick_key,
+                    dispatch_decision.action,
+                )
+                if dispatch_decision.action == "skip":
+                    return None
+                return dispatch_decision.response or ""
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -18799,6 +18943,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _register_gateway_detached_session(
+        self, session_id: str, session_key: str
+    ) -> None:
+        """Index detached gateway participation without exposing transport state."""
+        if not session_id or not session_key:
+            return
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            sessions = getattr(self, "_gateway_detached_session_keys", None)
+            if sessions is None:
+                sessions = OrderedDict()
+                self._gateway_detached_session_keys = sessions
+            sessions[session_id] = session_key
+            sessions.move_to_end(session_id)
+            max_size = getattr(self, "_gateway_detached_session_keys_max", 512)
+            while len(sessions) > max_size:
+                sessions.popitem(last=False)
+
+    def _gateway_detached_session_ids_for_key(
+        self, session_key: str
+    ) -> tuple[str, ...]:
+        """Return authoritative detached session IDs indexed for a routing key."""
+        if not session_key:
+            return ()
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            return tuple(
+                session_id
+                for session_id, indexed_key in getattr(
+                    self, "_gateway_detached_session_keys", {}
+                ).items()
+                if indexed_key == session_key
+            )
+
     @property
     def async_session_store(self) -> AsyncSessionStore:
         """Return the single async facade for this runner's SessionStore."""
@@ -19038,18 +19216,523 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _schedule_gateway_plugin_task(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        factory: Callable[[], Awaitable[Any]],
+        name: str,
+        binding: Any,
+    ) -> str:
+        """Reserve bounded work without running its factory before dispatch commit."""
+        task_id = f"gateway-plugin-{secrets.token_hex(8)}"
+        plugin_id = str(getattr(binding, "issuer_plugin_id", "") or "")
+        session_id = str(getattr(binding, "parent_session_id", "") or "")
+        binding_nonce = str(getattr(binding, "nonce", "") or "")
+        if not plugin_id or not session_id or not binding_nonce or not callable(factory):
+            raise ValueError("Gateway task binding is malformed.")
+
+        def _registry() -> tuple[
+            threading.RLock,
+            dict[tuple[str, str, str, str], _GatewayPluginTaskRecord],
+            dict[str, list[str]],
+        ]:
+            lock = getattr(self, "_gateway_plugin_tasks_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._gateway_plugin_tasks_lock = lock
+                self._gateway_plugin_tasks = {}
+                self._gateway_plugin_task_slots = {}
+            return (
+                lock,
+                self._gateway_plugin_tasks,
+                self._gateway_plugin_task_slots,
+            )
+
+        record = _GatewayPluginTaskRecord(
+            task_id=task_id,
+            plugin_id=plugin_id,
+            session_id=session_id,
+            binding_nonce=binding_nonce,
+            name=name[:128],
+            factory=factory,
+            binding=binding,
+        )
+        lock, records, slots_by_session = _registry()
+        with lock:
+            slots = slots_by_session.setdefault(session_id, [])
+            if len(slots) >= 2:
+                raise RuntimeError(
+                    "Gateway session already has an active and pending task."
+                )
+            key = (plugin_id, session_id, binding_nonce, task_id)
+            records[key] = record
+            slots.append(task_id)
+            if len(slots) == 1:
+                record.state = "active"
+
+        def _binding_revoked() -> None:
+            self._cancel_gateway_plugin_tasks_for_binding(binding_nonce)
+
+        def _binding_activated() -> None:
+            self._activate_gateway_plugin_task(loop, record)
+
+        from agent.route_capability import (
+            register_gateway_dispatch_activation_callback,
+            register_gateway_dispatch_revocation_callback,
+        )
+
+        try:
+            register_gateway_dispatch_revocation_callback(binding, _binding_revoked)
+            register_gateway_dispatch_activation_callback(binding, _binding_activated)
+        except Exception:
+            self._remove_gateway_plugin_task_record(record)
+            raise
+        return task_id
+
+    def _activate_gateway_plugin_task(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        record: _GatewayPluginTaskRecord,
+    ) -> None:
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            records = getattr(self, "_gateway_plugin_tasks", {})
+            key = (
+                record.plugin_id,
+                record.session_id,
+                record.binding_nonce,
+                record.task_id,
+            )
+            if records.get(key) is not record or record.suppress_result:
+                return
+            record.approved = True
+            if record.state != "active" or record.task is not None:
+                return
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            try:
+                self._start_gateway_plugin_task(loop, record)
+            except Exception:
+                self._remove_gateway_plugin_task_record(record)
+                raise
+            return
+
+        acknowledged: concurrent.futures.Future[None] = concurrent.futures.Future()
+        admission_lock = threading.Lock()
+        admission_state = ["pending"]
+
+        def _start_on_loop() -> None:
+            with admission_lock:
+                if admission_state[0] == "abandoned":
+                    return
+                admission_state[0] = "creating"
+            try:
+                awaitable = record.factory()
+            except BaseException as exc:
+                with admission_lock:
+                    if admission_state[0] == "abandoned":
+                        return
+                    admission_state[0] = "settled"
+                    if not acknowledged.done():
+                        acknowledged.set_exception(exc)
+                return
+            with admission_lock:
+                if admission_state[0] == "abandoned" or record.suppress_result:
+                    if inspect.iscoroutine(awaitable):
+                        awaitable.close()
+                    return
+                try:
+                    self._start_gateway_plugin_task(
+                        loop, record, prepared_awaitable=awaitable
+                    )
+                except BaseException as exc:
+                    admission_state[0] = "settled"
+                    if not acknowledged.done():
+                        acknowledged.set_exception(exc)
+                    return
+                admission_state[0] = "admitted"
+                if not acknowledged.done():
+                    acknowledged.set_result(None)
+
+        loop.call_soon_threadsafe(_start_on_loop)
+        try:
+            acknowledged.result(timeout=2.5)
+        except concurrent.futures.TimeoutError as exc:
+            with admission_lock:
+                if admission_state[0] in {"admitted", "settled"}:
+                    try:
+                        acknowledged.result()
+                    except Exception:
+                        self._remove_gateway_plugin_task_record(record)
+                        raise
+                    return
+                admission_state[0] = "abandoned"
+            record.suppress_result = True
+            self._remove_gateway_plugin_task_record(record)
+            raise TimeoutError("Gateway task start acknowledgement timed out.") from exc
+        except Exception:
+            self._remove_gateway_plugin_task_record(record)
+            raise
+
+    def _start_gateway_plugin_task(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        record: _GatewayPluginTaskRecord,
+        *,
+        prepared_awaitable: Optional[Awaitable[Any]] = None,
+    ) -> None:
+        awaitable = prepared_awaitable
+        if awaitable is None:
+            awaitable = record.factory()
+        if not inspect.isawaitable(awaitable):
+            raise TypeError("Gateway task factory must return an awaitable.")
+        if record.suppress_result or not record.approved:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise RuntimeError("Gateway task activation was revoked.")
+        record.awaitable = awaitable
+        try:
+            task = asyncio.ensure_future(awaitable, loop=loop)
+        except Exception:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            record.awaitable = None
+            raise
+        if hasattr(task, "set_name"):
+            task.set_name(f"{record.name}-{record.task_id[-8:]}")
+        record.task = task
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(
+            lambda completed: self._finish_gateway_plugin_task(record, completed)
+        )
+
+    def _finish_gateway_plugin_task(
+        self,
+        record: _GatewayPluginTaskRecord,
+        completed: asyncio.Task[Any],
+    ) -> None:
+        getattr(self, "_background_tasks", set()).discard(completed)
+        error: Optional[BaseException] = None
+        if not completed.cancelled():
+            try:
+                error = completed.exception()
+            except BaseException as exc:
+                error = exc
+
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        next_record: Optional[_GatewayPluginTaskRecord] = None
+        with lock:
+            records = getattr(self, "_gateway_plugin_tasks", {})
+            slots_by_session = getattr(self, "_gateway_plugin_task_slots", {})
+            key = (
+                record.plugin_id,
+                record.session_id,
+                record.binding_nonce,
+                record.task_id,
+            )
+            records.pop(key, None)
+            slots = slots_by_session.get(record.session_id, [])
+            if record.task_id in slots:
+                slots.remove(record.task_id)
+            if slots:
+                next_id = slots[0]
+                next_record = next(
+                    (
+                        item
+                        for item in records.values()
+                        if item.session_id == record.session_id
+                        and item.task_id == next_id
+                    ),
+                    None,
+                )
+                if next_record is not None and not next_record.suppress_result:
+                    next_record.state = "active"
+                    if not next_record.approved:
+                        next_record = None
+                else:
+                    next_record = None
+            else:
+                slots_by_session.pop(record.session_id, None)
+
+        if error is not None and not record.suppress_result:
+            logger.warning(
+                "Gateway plugin task %s failed (%s)",
+                record.task_id,
+                type(error).__name__,
+            )
+        if next_record is not None:
+            try:
+                self._start_gateway_plugin_task(completed.get_loop(), next_record)
+            except Exception as exc:
+                if next_record.awaitable is not None and inspect.iscoroutine(
+                    next_record.awaitable
+                ):
+                    next_record.awaitable.close()
+                logger.warning(
+                    "Gateway pending task %s could not start (%s)",
+                    next_record.task_id,
+                    type(exc).__name__,
+                )
+                self._remove_gateway_plugin_task_record(next_record)
+
+    def _remove_gateway_plugin_task_record(
+        self, record: _GatewayPluginTaskRecord
+    ) -> None:
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            records = getattr(self, "_gateway_plugin_tasks", {})
+            records.pop(
+                (
+                    record.plugin_id,
+                    record.session_id,
+                    record.binding_nonce,
+                    record.task_id,
+                ),
+                None,
+            )
+            slots_by_session = getattr(self, "_gateway_plugin_task_slots", {})
+            slots = slots_by_session.get(record.session_id, [])
+            if record.task_id in slots:
+                slots.remove(record.task_id)
+            if not slots:
+                slots_by_session.pop(record.session_id, None)
+
+    def _gateway_plugin_task_status(self, session_id: str) -> tuple[int, int]:
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            records = tuple(
+                record
+                for record in getattr(self, "_gateway_plugin_tasks", {}).values()
+                if record.session_id == session_id
+            )
+        return (
+            sum(record.state == "active" for record in records),
+            sum(record.state == "pending" for record in records),
+        )
+
+    def _cancel_gateway_plugin_tasks(self, session_id: str) -> tuple[int, int]:
+        from agent.route_capability import revoke_gateway_dispatch_bindings_for_session
+
+        before = self._gateway_plugin_task_status(session_id)
+        revoke_gateway_dispatch_bindings_for_session(session_id)
+        remaining = self._cancel_gateway_plugin_task_records(session_id=session_id)
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            getattr(self, "_gateway_detached_session_keys", {}).pop(session_id, None)
+        return max(before[0], remaining[0]), max(before[1], remaining[1])
+
+    def _cancel_gateway_plugin_tasks_for_binding(
+        self, binding_nonce: str
+    ) -> tuple[int, int]:
+        return self._cancel_gateway_plugin_task_records(binding_nonce=binding_nonce)
+
+    def _cancel_gateway_plugin_task_records(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        binding_nonce: Optional[str] = None,
+    ) -> tuple[int, int]:
+        """Atomically suppress and detach matching work before cancellation."""
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            records = [
+                record
+                for record in getattr(self, "_gateway_plugin_tasks", {}).values()
+                if (session_id is None or record.session_id == session_id)
+                and (binding_nonce is None or record.binding_nonce == binding_nonce)
+            ]
+            active = sum(record.state == "active" for record in records)
+            pending = sum(record.state == "pending" for record in records)
+            for record in records:
+                record.suppress_result = True
+                self._remove_gateway_plugin_task_record(record)
+        for record in records:
+            if record.task is not None:
+                record.task.cancel()
+            elif record.awaitable is not None and inspect.iscoroutine(record.awaitable):
+                record.awaitable.close()
+        return active, pending
+
+    def _gateway_detached_parent_resolver(
+        self,
+        *,
+        message: str,
+        source: SessionSource,
+        session_id: str,
+        session_key: str,
+        parent_turn_id: str,
+    ) -> Callable[[], _GatewayDetachedParent]:
+        """Return a lazy, profile-scoped parent descriptor for detached roles."""
+        resolved: list[_GatewayDetachedParent] = []
+        lock = threading.Lock()
+
+        def _build() -> _GatewayDetachedParent:
+            user_config = _load_gateway_config()
+            model, runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=user_config,
+            )
+            route = self._resolve_turn_agent_config(message, model, runtime)
+            route_runtime = route.get("runtime") or {}
+            agent_config = user_config.get("agent") or {}
+            from agent.skill_utils import parse_config_string_list
+
+            disabled = tuple(
+                parse_config_string_list(agent_config.get("disabled_toolsets")) or ()
+            )
+            api_key = route_runtime.get("api_key")
+            provider_routing = self._provider_routing
+            return _GatewayDetachedParent(
+                session_id=session_id,
+                _current_turn_id=parent_turn_id,
+                model=str(route.get("model") or model),
+                provider=route_runtime.get("provider"),
+                base_url=str(route_runtime.get("base_url") or ""),
+                api_key=api_key,
+                api_mode=route_runtime.get("api_mode"),
+                max_tokens=route_runtime.get("max_tokens"),
+                request_overrides=dict(route.get("request_overrides") or {}),
+                reasoning_config=self._resolve_session_reasoning_config(
+                    source=source,
+                    session_key=session_key,
+                    model=str(route.get("model") or model),
+                ),
+                providers_allowed=provider_routing.get("only"),
+                providers_ignored=provider_routing.get("ignore"),
+                providers_order=provider_routing.get("order"),
+                provider_sort=provider_routing.get("sort"),
+                _fallback_chain=get_fallback_chain(user_config),
+                disabled_toolsets=disabled,
+                _session_db=getattr(self._session_db, "_db", self._session_db),
+                _client_kwargs={"api_key": api_key} if api_key else {},
+            )
+
+        def _resolve() -> _GatewayDetachedParent:
+            with lock:
+                if resolved:
+                    return resolved[0]
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    profile_home = self._resolve_profile_home_for_source(source)
+                    with _profile_runtime_scope(profile_home):
+                        parent = _build()
+                else:
+                    parent = _build()
+                resolved.append(parent)
+                return parent
+
+        return _resolve
+
+    def _invoke_gateway_dispatch_before_agent(
+        self,
+        *,
+        message: str,
+        source: SessionSource,
+        session_id: str,
+        session_key: str,
+        message_id: str,
+        parent_resolver: Callable[[], Any],
+        loop: asyncio.AbstractEventLoop,
+        binding_validity: Optional[Callable[[], bool]] = None,
+    ) -> Any:
+        """Invoke dispatch after auth/session binding but before agent construction."""
+        from agent.route_capability import GatewayDispatchDecision
+
+        if not isinstance(message, str):
+            return GatewayDispatchDecision()
+        if not session_id or not session_key:
+            return GatewayDispatchDecision()
+        turn_component = (
+            message_id or hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+        )
+        parent_turn_id = f"gateway:{session_id}:{turn_component}"
+
+        validity_check = binding_validity
+        if validity_check is None:
+
+            def _binding_is_live() -> bool:
+                try:
+                    current = self.session_store.lookup_by_session_key(session_key)
+                except Exception:
+                    return False
+                return (
+                    current is not None
+                    and str(getattr(current, "session_id", "") or "") == session_id
+                )
+
+            validity_check = _binding_is_live
+
+        from hermes_cli.plugins import invoke_gateway_pre_agent_dispatch
+
+        return invoke_gateway_pre_agent_dispatch(
+            message=message,
+            platform=_gateway_platform_value(source.platform),
+            session_id=session_id,
+            parent_turn_id=parent_turn_id,
+            message_id=message_id,
+            parent_resolver=parent_resolver,
+            schedule=lambda factory, name, binding: self._schedule_gateway_plugin_task(
+                loop, factory, name, binding
+            ),
+            binding_validity=validity_check,
+        )
+
+    async def _dispatch_authorized_gateway_message(
+        self, event: MessageEvent, source: SessionSource
+    ) -> Any:
+        """Resolve and invoke the trusted dispatch seam before turn ownership."""
+        from agent.route_capability import GatewayDispatchDecision
+
+        dispatch_entry = await self.async_session_store.get_or_create_session(
+            source,
+            touch_activity=True,
+        )
+        session_key = dispatch_entry.session_key
+        self._cache_session_source(session_key, source)
+        self._register_gateway_detached_session(
+            dispatch_entry.session_id,
+            session_key,
+        )
+        message = str(event.text or "")
+        message_id = str(getattr(event, "message_id", None) or "")
+        turn_component = (
+            message_id or hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+        )
+        parent_turn_id = f"gateway:{dispatch_entry.session_id}:{turn_component}"
+        parent_resolver = self._gateway_detached_parent_resolver(
+            message=message,
+            source=source,
+            session_id=dispatch_entry.session_id,
+            session_key=session_key,
+            parent_turn_id=parent_turn_id,
+        )
+        decision = self._invoke_gateway_dispatch_before_agent(
+            message=message,
+            source=source,
+            session_id=dispatch_entry.session_id,
+            session_key=session_key,
+            message_id=message_id,
+            parent_resolver=parent_resolver,
+            loop=asyncio.get_running_loop(),
+        )
+        if not isinstance(decision, GatewayDispatchDecision):
+            return GatewayDispatchDecision()
+        return decision
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
-        _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
-        logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
-        )
+        if not bool(getattr(event, "_gateway_inbound_metadata_logged", False)):
+            _log_gateway_inbound_metadata(event, source)
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -19176,6 +19859,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -21281,23 +21965,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
-
-
-
-
-
-
     def _sibling_thread_run_keys(self, source: SessionSource, own_key: str) -> list:
-        """Find running-agent keys for OTHER participants in the same thread.
+        """Find live run keys for OTHER participants in the same thread.
 
         Only applies when the message originates in a thread.  In per-user
         thread mode (``thread_sessions_per_user=True``) each participant gets
         an isolated session key of the form
         ``agent:main:{platform}:{chat_type}:{chat_id}:{thread_id}:{user_id}``,
         so a run started by another user is invisible to the caller's own
-        ``/stop``.  This returns the keys of any *actually running* agents
-        (not the pending sentinel, not the caller's own key) whose key shares
-        the caller's ``{chat_id}:{thread_id}`` prefix.
+        ``/stop``.  This returns keys for actually running agents and detached
+        gateway consultations (including retained live bindings) whose key
+        shares the caller's ``{chat_id}:{thread_id}`` prefix.
 
         Returns an empty list when the source is not in a thread, or when no
         sibling runs exist — callers must still gate on authorization.
@@ -21313,9 +21991,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # shared-thread key or any key with a further (user_id) segment
         # (prefix + ":") avoids cross-matching an unrelated thread whose id
         # merely starts with this one.
-        prefix = ":".join(
-            ["agent:main", platform, chat_type, str(chat_id), str(thread_id)]
-        )
+        prefix = ":".join([
+            "agent:main",
+            platform,
+            chat_type,
+            str(chat_id),
+            str(thread_id),
+        ])
         matches = []
         for key, agent in self._running_agent_items():
             if key == own_key:
@@ -21323,6 +22005,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is _AGENT_PENDING_SENTINEL or not agent:
                 continue
             if key == prefix or key.startswith(prefix + ":"):
+                matches.append(key)
+        from agent.route_capability import gateway_dispatch_session_has_live_bindings
+
+        lock = getattr(self, "_gateway_plugin_tasks_lock", threading.RLock())
+        with lock:
+            detached_sessions = tuple(
+                getattr(self, "_gateway_detached_session_keys", {}).items()
+            )
+        for session_id, key in detached_sessions:
+            if key == own_key or key in matches:
+                continue
+            if key != prefix and not key.startswith(prefix + ":"):
+                continue
+            active, pending = self._gateway_plugin_task_status(session_id)
+            if (
+                active
+                or pending
+                or gateway_dispatch_session_has_live_bindings(session_id)
+            ):
                 matches.append(key)
         return matches
 

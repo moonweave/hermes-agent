@@ -18,7 +18,7 @@ import math
 import secrets
 import threading
 import time
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 
 _TEAM_MCP_HMAC_ENV = "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64"
@@ -26,6 +26,58 @@ _TEAM_MCP_HMAC_ENV = "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64"
 
 class CoordinatorRouteError(ValueError):
     """A coordinator operation cannot be safely accepted."""
+
+
+@dataclasses.dataclass(frozen=True)
+class GatewayDispatchBinding:
+    """Opaque, process-local proof of one authorized gateway message."""
+
+    version: int
+    issuer_plugin_id: str
+    parent_session_id: str
+    parent_turn_id: str
+    user_message_sha256: str
+    platform: str
+    message_id: str
+    issued_at: float
+    expires_at: float
+    nonce: str = dataclasses.field(repr=False)
+    signature: str = dataclasses.field(repr=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class GatewayDispatchContext:
+    """Frozen message projection delivered to a dispatch owner."""
+
+    binding: GatewayDispatchBinding
+    message: str = dataclasses.field(repr=False)
+    platform: str
+    session_id: str
+    message_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class GatewayDispatchDecision:
+    """Validated result of the single-owner gateway dispatch hook."""
+
+    action: str = "allow"
+    response: Optional[str] = None
+
+
+@dataclasses.dataclass
+class _GatewayDispatchRecord:
+    binding: GatewayDispatchBinding
+    parent_resolver: Callable[[], Any]
+    schedule: Callable[[Callable[[], Awaitable[Any]], str, GatewayDispatchBinding], str]
+    validity_resolver: Callable[[], bool]
+    consultation_binding: Optional[tuple[str, str, AccountScope]] = None
+    revocation_callbacks: list[Callable[[], None]] = dataclasses.field(
+        default_factory=list
+    )
+    activation_callbacks: list[Callable[[], None]] = dataclasses.field(
+        default_factory=list
+    )
+    activated: bool = False
 
 
 class TeamMcpBindingToken:
@@ -175,6 +227,334 @@ class _CoordinatorRegistry:
 _REGISTRY = _CoordinatorRegistry()
 _ROUTE_SECRET = secrets.token_bytes(32)
 _HANDLE_SECRET = secrets.token_bytes(32)
+_GATEWAY_BINDING_SECRET = secrets.token_bytes(32)
+_GATEWAY_BINDINGS_LOCK = threading.RLock()
+_GATEWAY_BINDINGS: dict[str, _GatewayDispatchRecord] = {}
+
+
+def issue_gateway_dispatch_binding(
+    *,
+    issuer_plugin_id: str,
+    parent: Any = None,
+    parent_resolver: Optional[Callable[[], Any]] = None,
+    parent_session_id: str,
+    parent_turn_id: str,
+    user_message: str,
+    platform: str,
+    message_id: str,
+    schedule: Callable[
+        [Callable[[], Awaitable[Any]], str, GatewayDispatchBinding], str
+    ],
+    validity_resolver: Callable[[], bool],
+    clock: Callable[[], float] = time.time,
+    ttl_seconds: float = 300.0,
+) -> GatewayDispatchBinding:
+    """Create a host-owned binding after gateway authorization succeeds."""
+    if (
+        not _valid_text(issuer_plugin_id)
+        or not _valid_text(parent_session_id)
+        or not _valid_text(parent_turn_id)
+        or not _valid_text(platform)
+        or not isinstance(message_id, str)
+        or len(message_id) > 512
+        or not isinstance(user_message, str)
+        or not callable(schedule)
+        or not callable(validity_resolver)
+        or (parent is None and not callable(parent_resolver))
+        or (parent is not None and parent_resolver is not None)
+    ):
+        raise CoordinatorRouteError("Malformed gateway dispatch binding request.")
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, (int, float))
+        or not math.isfinite(float(ttl_seconds))
+    ):
+        raise CoordinatorRouteError("Invalid gateway dispatch binding lifetime.")
+    now = float(clock())
+    if not math.isfinite(now) or ttl_seconds <= 0 or ttl_seconds > 300:
+        raise CoordinatorRouteError("Invalid gateway dispatch binding lifetime.")
+    unsigned = GatewayDispatchBinding(
+        version=1,
+        issuer_plugin_id=issuer_plugin_id,
+        parent_session_id=parent_session_id,
+        parent_turn_id=parent_turn_id,
+        user_message_sha256=_message_hash(user_message),
+        platform=platform,
+        message_id=message_id,
+        issued_at=now,
+        expires_at=now + ttl_seconds,
+        nonce=secrets.token_hex(16),
+        signature="",
+    )
+    binding = dataclasses.replace(unsigned, signature=_sign_gateway_binding(unsigned))
+    with _GATEWAY_BINDINGS_LOCK:
+        _cleanup_gateway_bindings_locked(now)
+        _GATEWAY_BINDINGS[binding.nonce] = _GatewayDispatchRecord(
+            binding=binding,
+            parent_resolver=(
+                parent_resolver if parent_resolver is not None else lambda: parent
+            ),
+            schedule=schedule,
+            validity_resolver=validity_resolver,
+        )
+    return binding
+
+
+def revoke_gateway_dispatch_binding(binding: GatewayDispatchBinding) -> None:
+    """Invalidate a dispatch binding that fell through to the normal agent."""
+    callbacks: tuple[Callable[[], None], ...] = ()
+    if isinstance(binding, GatewayDispatchBinding):
+        with _GATEWAY_BINDINGS_LOCK:
+            record = _GATEWAY_BINDINGS.get(binding.nonce)
+            if record is not None and record.binding == binding:
+                _GATEWAY_BINDINGS.pop(binding.nonce, None)
+                callbacks = tuple(record.revocation_callbacks)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            continue
+
+
+def register_gateway_dispatch_revocation_callback(
+    binding: GatewayDispatchBinding,
+    callback: Callable[[], None],
+) -> None:
+    """Attach host cleanup that runs synchronously when a binding is revoked."""
+    if not callable(callback):
+        raise CoordinatorRouteError("Gateway revocation callback is invalid.")
+    record = _gateway_dispatch_record(
+        binding,
+        issuer_plugin_id=binding.issuer_plugin_id,
+    )
+    with _GATEWAY_BINDINGS_LOCK:
+        current = _GATEWAY_BINDINGS.get(binding.nonce)
+        if current is None or current is not record or current.binding != binding:
+            raise CoordinatorRouteError("Unknown gateway dispatch binding.")
+        current.revocation_callbacks.append(callback)
+
+
+def register_gateway_dispatch_activation_callback(
+    binding: GatewayDispatchBinding,
+    callback: Callable[[], None],
+) -> None:
+    """Attach host work that is released only after a handled decision."""
+    if not callable(callback):
+        raise CoordinatorRouteError("Gateway activation callback is invalid.")
+    record = _gateway_dispatch_record(
+        binding,
+        issuer_plugin_id=binding.issuer_plugin_id,
+    )
+    invoke_now = False
+    with _GATEWAY_BINDINGS_LOCK:
+        current = _GATEWAY_BINDINGS.get(binding.nonce)
+        if current is None or current is not record or current.binding != binding:
+            raise CoordinatorRouteError("Unknown gateway dispatch binding.")
+        if current.activated:
+            invoke_now = True
+        else:
+            current.activation_callbacks.append(callback)
+    if invoke_now:
+        callback()
+
+
+def activate_gateway_dispatch_binding(binding: GatewayDispatchBinding) -> None:
+    """Release tasks admitted by the owner after a valid handled decision."""
+    if not isinstance(binding, GatewayDispatchBinding):
+        raise CoordinatorRouteError("Malformed gateway dispatch binding.")
+    callbacks: tuple[Callable[[], None], ...] = ()
+    with _GATEWAY_BINDINGS_LOCK:
+        record = _GATEWAY_BINDINGS.get(binding.nonce)
+        if record is None or record.binding != binding:
+            raise CoordinatorRouteError("Unknown gateway dispatch binding.")
+        if not record.activated:
+            record.activated = True
+            callbacks = tuple(record.activation_callbacks)
+            record.activation_callbacks.clear()
+    for callback in callbacks:
+        callback()
+
+
+def revoke_gateway_dispatch_bindings_for_session(session_id: str) -> int:
+    """Revoke every live binding owned by one authorized gateway session."""
+    if not _valid_text(session_id):
+        return 0
+    callbacks: list[Callable[[], None]] = []
+    with _GATEWAY_BINDINGS_LOCK:
+        nonces = [
+            nonce
+            for nonce, record in _GATEWAY_BINDINGS.items()
+            if record.binding.parent_session_id == session_id
+        ]
+        for nonce in nonces:
+            record = _GATEWAY_BINDINGS.pop(nonce)
+            callbacks.extend(record.revocation_callbacks)
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            continue
+    return len(nonces)
+
+
+def gateway_dispatch_session_has_live_bindings(session_id: str) -> bool:
+    """Return whether an authorized gateway session still owns a live binding."""
+    if not _valid_text(session_id):
+        return False
+    with _GATEWAY_BINDINGS_LOCK:
+        _cleanup_gateway_bindings_locked(time.time())
+        return any(
+            record.binding.parent_session_id == session_id
+            for record in _GATEWAY_BINDINGS.values()
+        )
+
+
+def _gateway_dispatch_record(
+    binding: GatewayDispatchBinding,
+    *,
+    issuer_plugin_id: str,
+    clock: Callable[[], float] = time.time,
+) -> _GatewayDispatchRecord:
+    if not isinstance(binding, GatewayDispatchBinding):
+        raise CoordinatorRouteError("Malformed gateway dispatch binding.")
+    if (
+        binding.version != 1
+        or not _valid_text(binding.issuer_plugin_id)
+        or not _valid_text(binding.parent_session_id)
+        or not _valid_text(binding.parent_turn_id)
+        or not _valid_text(binding.platform)
+        or not isinstance(binding.message_id, str)
+        or len(binding.message_id) > 512
+        or not isinstance(binding.user_message_sha256, str)
+        or len(binding.user_message_sha256) != 64
+        or not isinstance(binding.nonce, str)
+        or len(binding.nonce) != 32
+        or not isinstance(binding.signature, str)
+        or len(binding.signature) != 64
+        or not isinstance(binding.issued_at, (int, float))
+        or not isinstance(binding.expires_at, (int, float))
+        or isinstance(binding.issued_at, bool)
+        or isinstance(binding.expires_at, bool)
+        or not math.isfinite(float(binding.issued_at))
+        or not math.isfinite(float(binding.expires_at))
+    ):
+        raise CoordinatorRouteError("Malformed gateway dispatch binding.")
+    expected = _sign_gateway_binding(dataclasses.replace(binding, signature=""))
+    if binding.issuer_plugin_id != issuer_plugin_id or not hmac.compare_digest(
+        binding.signature, expected
+    ):
+        raise CoordinatorRouteError("Gateway dispatch binding verification failed.")
+    now = float(clock())
+    if binding.issued_at > now or binding.expires_at <= now:
+        raise CoordinatorRouteError(
+            "Gateway dispatch binding is expired or not yet valid."
+        )
+    with _GATEWAY_BINDINGS_LOCK:
+        _cleanup_gateway_bindings_locked(now)
+        record = _GATEWAY_BINDINGS.get(binding.nonce)
+        if record is None or record.binding != binding:
+            raise CoordinatorRouteError("Unknown gateway dispatch binding.")
+        try:
+            still_valid = record.validity_resolver()
+        except Exception as exc:
+            raise CoordinatorRouteError(
+                "Gateway dispatch binding liveness check failed."
+            ) from exc
+        if still_valid is not True:
+            raise CoordinatorRouteError("Gateway dispatch binding is no longer live.")
+        return record
+
+
+def _gateway_dispatch_parent(record: _GatewayDispatchRecord) -> Any:
+    try:
+        parent = record.parent_resolver()
+    except Exception as exc:
+        raise CoordinatorRouteError(
+            "Gateway detached parent resolution failed."
+        ) from exc
+    if parent is None:
+        raise CoordinatorRouteError("Gateway detached parent is unavailable.")
+    if str(getattr(parent, "session_id", "") or "") != record.binding.parent_session_id:
+        raise CoordinatorRouteError("Gateway parent session binding changed.")
+    return parent
+
+
+def _bind_gateway_consultation(
+    binding: GatewayDispatchBinding,
+    *,
+    issuer_plugin_id: str,
+    coordinator_route: str,
+    consultation_id: str,
+    account_scope: AccountScope,
+) -> None:
+    """Atomically bind one gateway message to its first consultation tuple."""
+    record = _gateway_dispatch_record(binding, issuer_plugin_id=issuer_plugin_id)
+    requested = (coordinator_route, consultation_id, account_scope)
+    with _GATEWAY_BINDINGS_LOCK:
+        if record.consultation_binding is None:
+            record.consultation_binding = requested
+        elif record.consultation_binding != requested:
+            raise CoordinatorRouteError(
+                "Gateway dispatch binding is already bound to another consultation."
+            )
+
+
+def _cleanup_gateway_bindings_locked(now: float) -> None:
+    for nonce in [
+        nonce
+        for nonce, record in _GATEWAY_BINDINGS.items()
+        if record.binding.expires_at <= now
+    ]:
+        _GATEWAY_BINDINGS.pop(nonce, None)
+
+
+class GatewayBoundTaskService:
+    """Host-owned scheduler bound to one signed gateway message."""
+
+    def __init__(
+        self,
+        *,
+        issuer_plugin_id: str,
+        binding: GatewayDispatchBinding,
+        authorization_resolver: Callable[[], bool],
+    ) -> None:
+        self._issuer_plugin_id = issuer_plugin_id
+        self._binding = binding
+        self._authorization_resolver = authorization_resolver
+
+    def spawn(
+        self, factory: Callable[[], Awaitable[Any]], *, name: str = "plugin-task"
+    ) -> str:
+        if self._authorization_resolver() is not True:
+            raise PermissionError("Gateway task capability is not granted.")
+        if not callable(factory) or not _valid_text(name, 128):
+            raise ValueError("Gateway background task request is malformed.")
+        record = _gateway_dispatch_record(
+            self._binding, issuer_plugin_id=self._issuer_plugin_id
+        )
+        return record.schedule(factory, name, self._binding)
+
+
+class GatewayTaskService:
+    """Unbound plugin facade; a signed dispatch binding is always required."""
+
+    def __init__(
+        self, issuer_plugin_id: str, authorization_resolver: Callable[[], bool]
+    ) -> None:
+        self._issuer_plugin_id = issuer_plugin_id
+        self._authorization_resolver = authorization_resolver
+
+    def for_gateway_binding(
+        self, binding: GatewayDispatchBinding
+    ) -> GatewayBoundTaskService:
+        if self._authorization_resolver() is not True:
+            raise PermissionError("Gateway task capability is not granted.")
+        _gateway_dispatch_record(binding, issuer_plugin_id=self._issuer_plugin_id)
+        return GatewayBoundTaskService(
+            issuer_plugin_id=self._issuer_plugin_id,
+            binding=binding,
+            authorization_resolver=self._authorization_resolver,
+        )
 
 
 class CoordinatorService:
@@ -188,6 +568,7 @@ class CoordinatorService:
         allowed_routes_resolver: Callable[[], tuple[str, ...]],
         authorization_resolver: Callable[[], bool],
         clock: Callable[[], float] = time.time,
+        gateway_binding: Optional[GatewayDispatchBinding] = None,
     ) -> None:
         if not _valid_text(issuer_plugin_id):
             raise CoordinatorRouteError("issuer_plugin_id is invalid.")
@@ -196,6 +577,25 @@ class CoordinatorService:
         self._allowed_routes_resolver = allowed_routes_resolver
         self._authorization_resolver = authorization_resolver
         self._clock = clock
+        self._gateway_binding = gateway_binding
+
+    def for_gateway_binding(
+        self, binding: GatewayDispatchBinding
+    ) -> "GatewayBoundCoordinatorService":
+        """Bind coordinator authority to one authorized gateway message."""
+        self._require_authorized()
+        record = _gateway_dispatch_record(
+            binding, issuer_plugin_id=self.issuer_plugin_id, clock=self._clock
+        )
+        bound = CoordinatorService(
+            issuer_plugin_id=self.issuer_plugin_id,
+            parent_agent_resolver=lambda: _gateway_dispatch_parent(record),
+            allowed_routes_resolver=self._allowed_routes_resolver,
+            authorization_resolver=self._authorization_resolver,
+            clock=self._clock,
+            gateway_binding=binding,
+        )
+        return GatewayBoundCoordinatorService(bound, binding)
 
     def issue_route_capability(
         self,
@@ -207,8 +607,7 @@ class CoordinatorService:
         ttl_seconds: float = 300.0,
     ) -> RouteCapability:
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        _parent, session_id, turn_id = self._current_binding()
         self._validate_route_request(
             user_message, coordinator_route, consultation_id, account_scope
         )
@@ -251,8 +650,7 @@ class CoordinatorService:
         account_scope: AccountScope,
     ) -> CoordinatorHandle:
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        _parent, session_id, turn_id = self._current_binding()
         self._validate_route_request(
             user_message, coordinator_route, consultation_id, account_scope
         )
@@ -311,8 +709,7 @@ class CoordinatorService:
 
     def launch_role(self, handle: CoordinatorHandle, request: CoordinatorRoleRequest):
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        parent, session_id, turn_id = self._current_binding(require_parent=True)
         record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
         self._require_route_allowed(handle.coordinator_route)
         if (
@@ -333,7 +730,9 @@ class CoordinatorService:
                 SubagentLifecycleService,
             )
 
-            lifecycle = SubagentLifecycleService(lambda: parent)
+            lifecycle = SubagentLifecycleService(
+                lambda: parent, authorization_resolver=self._authorization_resolver
+            )
             try:
                 role_handle = lifecycle.launch(
                     SubagentLaunchRequest(
@@ -363,8 +762,7 @@ class CoordinatorService:
     ) -> TeamMcpBindingToken:
         """Issue a short-lived profile-scoped binding for the team MCP."""
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        _parent, session_id, turn_id = self._current_binding()
         self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
         self._require_route_allowed(handle.coordinator_route)
         if not isinstance(personal_portfolio, bool):
@@ -483,8 +881,7 @@ class CoordinatorService:
 
     def status(self, handle: CoordinatorHandle) -> CoordinatorStatus:
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        _parent, session_id, turn_id = self._current_binding()
         record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
         with _REGISTRY.lock:
             return CoordinatorStatus(
@@ -495,8 +892,7 @@ class CoordinatorService:
 
     def _role_binding(self, handle: CoordinatorHandle, role: CoordinatorRole):
         self._require_authorized()
-        parent = self._require_top_level_parent()
-        session_id, turn_id = _active_binding(parent)
+        parent, session_id, turn_id = self._current_binding(require_parent=True)
         if not isinstance(role, CoordinatorRole):
             raise CoordinatorRouteError("role must be a CoordinatorRole value.")
         record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
@@ -507,7 +903,9 @@ class CoordinatorService:
         from agent.subagent_lifecycle import SubagentLifecycleService
 
         return (
-            SubagentLifecycleService(lambda: parent),
+            SubagentLifecycleService(
+                lambda: parent, authorization_resolver=self._authorization_resolver
+            ),
             child_handle,
             self._public_role_handle(handle, role, child_handle),
         )
@@ -650,6 +1048,111 @@ class CoordinatorService:
             )
         return parent
 
+    def _current_binding(self, *, require_parent: bool = False) -> tuple[Any, str, str]:
+        if self._gateway_binding is None:
+            parent = self._require_top_level_parent()
+            session_id, turn_id = _active_binding(parent)
+            return parent, session_id, turn_id
+        record = _gateway_dispatch_record(
+            self._gateway_binding,
+            issuer_plugin_id=self.issuer_plugin_id,
+            clock=self._clock,
+        )
+        parent = _gateway_dispatch_parent(record) if require_parent else None
+        if parent is not None:
+            _gateway_dispatch_record(
+                self._gateway_binding,
+                issuer_plugin_id=self.issuer_plugin_id,
+                clock=self._clock,
+            )
+            depth = getattr(parent, "_delegate_depth", 0)
+            if (
+                isinstance(depth, bool)
+                or not isinstance(depth, int)
+                or depth != 0
+                or bool(getattr(parent, "_subagent_id", None))
+            ):
+                raise CoordinatorRouteError(
+                    "Gateway coordinator parent is not a top-level Hermes agent."
+                )
+        return (
+            parent,
+            self._gateway_binding.parent_session_id,
+            self._gateway_binding.parent_turn_id,
+        )
+
+
+class GatewayBoundCoordinatorService:
+    """Coordinator facade that cannot be rebound to another gateway message."""
+
+    def __init__(
+        self, service: CoordinatorService, binding: GatewayDispatchBinding
+    ) -> None:
+        self._service = service
+        self._binding = binding
+
+    def reserve_consultation(
+        self,
+        *,
+        user_message: str,
+        coordinator_route: str,
+        consultation_id: str,
+        account_scope: AccountScope,
+    ) -> CoordinatorHandle:
+        if _message_hash(user_message) != self._binding.user_message_sha256:
+            raise CoordinatorRouteError("Gateway user message binding does not match.")
+        record = _gateway_dispatch_record(
+            self._binding, issuer_plugin_id=self._service.issuer_plugin_id
+        )
+        with _GATEWAY_BINDINGS_LOCK:
+            existing = record.consultation_binding
+        requested = (coordinator_route, consultation_id, account_scope)
+        if existing is not None and existing != requested:
+            raise CoordinatorRouteError(
+                "Gateway dispatch binding is already bound to another consultation."
+            )
+        capability = self._service.issue_route_capability(
+            user_message=user_message,
+            coordinator_route=coordinator_route,
+            consultation_id=consultation_id,
+            account_scope=account_scope,
+        )
+        _bind_gateway_consultation(
+            self._binding,
+            issuer_plugin_id=self._service.issuer_plugin_id,
+            coordinator_route=coordinator_route,
+            consultation_id=consultation_id,
+            account_scope=account_scope,
+        )
+        return self._service.reserve_consultation(
+            capability=capability,
+            user_message=user_message,
+            coordinator_route=coordinator_route,
+            consultation_id=consultation_id,
+            account_scope=account_scope,
+        )
+
+    def issue_team_mcp_binding_token(self, *args: Any, **kwargs: Any):
+        return self._service.issue_team_mcp_binding_token(*args, **kwargs)
+
+    def launch_role(self, *args: Any, **kwargs: Any):
+        return self._service.launch_role(*args, **kwargs)
+
+    def role_status(self, *args: Any, **kwargs: Any):
+        return self._service.role_status(*args, **kwargs)
+
+    def wait_role(self, *args: Any, **kwargs: Any):
+        return self._service.wait_role(*args, **kwargs)
+
+    def role_result(self, *args: Any, **kwargs: Any):
+        return self._service.role_result(*args, **kwargs)
+
+    def cancel_role(self, *args: Any, **kwargs: Any):
+        return self._service.cancel_role(*args, **kwargs)
+
+    def status(self, *args: Any, **kwargs: Any):
+        return self._service.status(*args, **kwargs)
+
 
 def reset_coordinator_registry_for_tests() -> None:
     """Clear process-local coordinator records for hermetic contract tests."""
@@ -657,6 +1160,8 @@ def reset_coordinator_registry_for_tests() -> None:
         _REGISTRY.by_key.clear()
         _REGISTRY.by_id.clear()
         _REGISTRY.used_nonces.clear()
+    with _GATEWAY_BINDINGS_LOCK:
+        _GATEWAY_BINDINGS.clear()
 
 
 def _active_binding(parent: Any) -> tuple[str, str]:
@@ -706,6 +1211,14 @@ def _sign_route(capability: RouteCapability) -> str:
 def _sign_handle(handle: CoordinatorHandle) -> str:
     return hmac.new(
         _HANDLE_SECRET, _canonical_payload(handle, "capability"), hashlib.sha256
+    ).hexdigest()
+
+
+def _sign_gateway_binding(binding: GatewayDispatchBinding) -> str:
+    return hmac.new(
+        _GATEWAY_BINDING_SECRET,
+        _canonical_payload(binding, "signature"),
+        hashlib.sha256,
     ).hexdigest()
 
 

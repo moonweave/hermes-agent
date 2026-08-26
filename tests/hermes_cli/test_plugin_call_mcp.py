@@ -8,7 +8,8 @@ live MCP servers).
 """
 
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -129,6 +130,64 @@ def test_allowed_call_routes_through_existing_handler(monkeypatch):
     assert captured["tool"] == "create_issue"
     assert captured["args"] == {"title": "bug"}
     assert result == {"ok": True, "result": "issue #7 created"}
+
+
+def test_eager_hidden_server_remains_available_to_allowlisted_plugin(monkeypatch):
+    """Real eager registration hides tools but keeps direct plugin RPC live."""
+    from mcp.types import CallToolResult, TextContent
+    from tools import mcp_tool as mcp_mod
+    from tools.registry import registry
+
+    server_config = {
+        "command": "fixture-team-mcp",
+        "lazy": False,
+        "tools": {
+            "include": [],
+            "resources": False,
+            "prompts": False,
+        },
+    }
+    server = mcp_mod.MCPServerTask("team")
+    monkeypatch.setattr(
+        mcp_mod.MCPServerTask, "_watch_stdio_children", lambda _self: None
+    )
+    server._tools = [
+        SimpleNamespace(
+            name="prepare_consultation",
+            description="prepare",
+            inputSchema={"type": "object"},
+            annotations=None,
+        )
+    ]
+    server.session = SimpleNamespace(
+        call_tool=AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text="prepared")]
+            )
+        )
+    )
+
+    async def discover(name, config):
+        assert name == "team"
+        assert config["lazy"] is False
+        with mcp_mod._lock:
+            mcp_mod._servers[name] = server
+        return mcp_mod._register_server_tools(name, server, config)
+
+    monkeypatch.setattr(mcp_mod, "_discover_and_register_server", discover)
+    assert mcp_mod.register_mcp_servers({"team": server_config}) == []
+    assert not any(name.startswith("mcp__team__") for name in registry.get_all_tool_names())
+
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["team"]}})
+    result = _make_ctx().call_mcp("team", "prepare_consultation", {"scope": "omitted"})
+
+    assert result == {"ok": True, "result": "prepared"}
+    server.session.call_tool.assert_awaited_once_with(
+        "prepare_consultation", arguments={"scope": "omitted"}
+    )
+
+    with mcp_mod._lock:
+        mcp_mod._servers.pop("team", None)
 
 
 def test_error_result_maps_to_ok_false(monkeypatch):

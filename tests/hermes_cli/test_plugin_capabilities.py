@@ -46,7 +46,12 @@ class TestRegistry:
     def test_every_capability_has_description_and_delegation_is_grant_only(self):
         for spec in CAPABILITY_REGISTRY.values():
             assert spec.description
-            if spec.id in {"delegation.coordinator", "delegation.subagents"}:
+            if spec.id in {
+                "delegation.coordinator",
+                "delegation.subagents",
+                "gateway.control_observer",
+                "gateway.message_dispatch",
+            }:
                 assert spec.legacy_path == ()
             else:
                 assert spec.legacy_path, spec.id

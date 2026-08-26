@@ -2069,8 +2069,9 @@ class PluginContext:
         Returns:
             Envelope dict: ``{"ok": True, "result": <parsed result>}`` on
             success or ``{"ok": False, "error": <message>}`` when the MCP
-            call itself failed. Results larger than ~64KB are truncated
-            with a marker.
+            call itself failed. Results larger than ~64KB preserve a complete,
+            bounded ``structuredContent`` payload when present; otherwise they
+            are truncated with a marker.
 
         Raises:
             PermissionError: server not in this plugin's ``mcp_allowlist``.
@@ -2105,22 +2106,62 @@ class PluginContext:
         return self._mcp_envelope(raw)
 
     _MCP_RESULT_CHAR_CAP = 65536
+    # The canonical MCP handler can emit both a 2M-character text result and
+    # a 2M-character structured result. Account for worst-case JSON escaping
+    # of both components before applying the tighter plugin-context cap, but
+    # never parse without a hard ceiling.
+    _MCP_JSON_PARSE_CHAR_CAP = 25_000_000
 
     @classmethod
     def _mcp_envelope(cls, raw: Any) -> Dict[str, Any]:
         """Normalize an MCP handler result string into a stable envelope."""
         if not isinstance(raw, str):
             raw = "" if raw is None else str(raw)
+        parsed: Any = None
+        if len(raw) <= cls._MCP_JSON_PARSE_CHAR_CAP:
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = None
         if len(raw) > cls._MCP_RESULT_CHAR_CAP:
+            if isinstance(parsed, dict) and "error" in parsed:
+                error = parsed["error"]
+                error_text = (
+                    error
+                    if isinstance(error, str)
+                    else json.dumps(error, ensure_ascii=False, separators=(",", ":"))
+                )
+                if len(error_text) <= cls._MCP_RESULT_CHAR_CAP:
+                    return {"ok": False, "error": error}
+                return {
+                    "ok": False,
+                    "error": error_text[: cls._MCP_RESULT_CHAR_CAP]
+                    + "… [truncated]",
+                    "truncated": True,
+                }
+            if (
+                isinstance(parsed, dict)
+                and "error" not in parsed
+                and "result" in parsed
+            ):
+                structured = parsed.get("structuredContent")
+                bounded = structured if isinstance(structured, dict) else parsed["result"]
+                if isinstance(bounded, dict):
+                    bounded_raw = json.dumps(
+                        bounded,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if len(bounded_raw) <= cls._MCP_RESULT_CHAR_CAP:
+                        envelope = {"ok": True, "result": bounded}
+                        if isinstance(structured, dict):
+                            envelope["structuredContent"] = structured
+                        return envelope
             raw = raw[: cls._MCP_RESULT_CHAR_CAP] + "… [truncated]"
             truncated = True
+            parsed = None
         else:
             truncated = False
-        parsed: Any = None
-        try:
-            parsed = json.loads(raw)
-        except (ValueError, TypeError):
-            parsed = None
         if isinstance(parsed, dict) and "error" in parsed:
             envelope: Dict[str, Any] = {"ok": False, "error": parsed["error"]}
         elif isinstance(parsed, dict) and "result" in parsed:

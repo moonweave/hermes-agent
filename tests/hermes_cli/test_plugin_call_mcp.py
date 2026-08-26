@@ -273,3 +273,105 @@ def test_oversized_result_is_truncated(monkeypatch):
     assert result["truncated"] is True
     assert len(result["result"]) <= PluginContext._MCP_RESULT_CHAR_CAP + 20
     assert result["result"].endswith("… [truncated]")
+
+
+def test_oversized_json_preserves_bounded_structured_content(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["big"]}})
+    structured = {"snapshot": "s" * (PluginContext._MCP_RESULT_CHAR_CAP // 2)}
+    raw = json.dumps({
+        "result": "x" * PluginContext._MCP_RESULT_CHAR_CAP,
+        "structuredContent": structured,
+    })
+    assert len(raw) > PluginContext._MCP_RESULT_CHAR_CAP
+    _patch_handler(monkeypatch, raw)
+
+    ctx = _make_ctx()
+    result = ctx.call_mcp("big", "dump")
+
+    assert result == {
+        "ok": True,
+        "result": structured,
+        "structuredContent": structured,
+    }
+
+
+def test_canonical_large_envelope_preserves_bounded_structured_content(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["big"]}})
+    structured = {"snapshot": "s" * 40_000}
+    raw = json.dumps({
+        "result": "x" * 100_000,
+        "structuredContent": structured,
+    })
+    assert len(raw) > PluginContext._MCP_RESULT_CHAR_CAP
+    _patch_handler(monkeypatch, raw)
+
+    result = _make_ctx().call_mcp("big", "dump")
+
+    assert result == {
+        "ok": True,
+        "result": structured,
+        "structuredContent": structured,
+    }
+
+
+def test_structured_only_result_survives_json_wrapper_overhead(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["big"]}})
+    structured = {"snapshot": "s" * 65_509}
+    structured_raw = json.dumps(
+        structured,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    raw = json.dumps({"result": structured})
+    assert len(structured_raw) <= PluginContext._MCP_RESULT_CHAR_CAP
+    assert len(raw) > PluginContext._MCP_RESULT_CHAR_CAP
+    _patch_handler(monkeypatch, raw)
+
+    result = _make_ctx().call_mcp("big", "dump")
+
+    assert result == {"ok": True, "result": structured}
+
+
+def test_error_status_survives_json_wrapper_overhead(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["big"]}})
+    error = "e" * (PluginContext._MCP_RESULT_CHAR_CAP - 5)
+    raw = json.dumps({"error": error})
+    assert len(error) <= PluginContext._MCP_RESULT_CHAR_CAP
+    assert len(raw) > PluginContext._MCP_RESULT_CHAR_CAP
+    _patch_handler(monkeypatch, raw)
+
+    result = _make_ctx().call_mcp("big", "dump")
+
+    assert result == {"ok": False, "error": error}
+
+
+def test_oversized_error_remains_an_error(monkeypatch):
+    _patch_config(monkeypatch, {"my-plugin": {"mcp_allowlist": ["big"]}})
+    error = "e" * (PluginContext._MCP_RESULT_CHAR_CAP + 100)
+    _patch_handler(monkeypatch, json.dumps({"error": error}))
+
+    result = _make_ctx().call_mcp("big", "dump")
+
+    assert result["ok"] is False
+    assert result["truncated"] is True
+    assert len(result["error"]) <= PluginContext._MCP_RESULT_CHAR_CAP + 20
+    assert result["error"].endswith("… [truncated]")
+
+
+def test_oversized_json_parse_is_bounded(monkeypatch):
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(PluginContext, "_MCP_RESULT_CHAR_CAP", 64)
+    monkeypatch.setattr(PluginContext, "_MCP_JSON_PARSE_CHAR_CAP", 128)
+    raw = json.dumps({"result": "x" * 129})
+
+    def _unexpected_parse(_raw):
+        raise AssertionError("oversized MCP JSON must not be parsed")
+
+    monkeypatch.setattr(plugins_mod.json, "loads", _unexpected_parse)
+
+    result = PluginContext._mcp_envelope(raw)
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert result["result"].endswith("… [truncated]")

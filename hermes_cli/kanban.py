@@ -1641,32 +1641,41 @@ def _cmd_boards_dashboard_snapshot(args: argparse.Namespace) -> int:
                 "operator_inbox": None,
             })
     interactive_activity = None
+    interactive_activity_v4 = None
     try:
-        from hermes_cli.sessions_cmd import _sessions_activity_v3_payload
+        from hermes_cli.sessions_cmd import _sessions_activity_v4_payload
         from hermes_state import SessionDB
 
         session_db = SessionDB()
         try:
-            interactive_activity = _sessions_activity_v3_payload(
+            interactive_activity_v4 = _sessions_activity_v4_payload(
                 session_db,
                 argparse.Namespace(source=None, window=120, json=True),
             )
+            interactive_activity = {
+                key: value
+                for key, value in interactive_activity_v4.items()
+                if key not in {"delegated_aggregates", "delegated_coverage"}
+            }
+            interactive_activity["contract_version"] = "hermes-sessions-activity-v3"
         finally:
             session_db.close()
     except Exception:
         interactive_activity = None
+        interactive_activity_v4 = None
 
     payload = {
         "contract_version": "hermes-kanban-dashboard-snapshot-v1",
         "generated_at": int(time.time()),
         "boards": rows,
         "interactive_activity": interactive_activity,
+        "interactive_activity_v4": interactive_activity_v4,
         "coverage": {
-            "complete": not failed_boards and interactive_activity is not None,
+            "complete": not failed_boards and interactive_activity_v4 is not None,
             "total_boards": len(boards),
             "returned_boards": len(boards) - len(failed_boards),
             "failed_boards": failed_boards,
-            "interactive_complete": interactive_activity is not None,
+            "interactive_complete": interactive_activity_v4 is not None,
         },
     }
     if getattr(args, "json", False):

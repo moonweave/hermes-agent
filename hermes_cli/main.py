@@ -12283,6 +12283,23 @@ def main():
         "--json", action="store_true", help="Emit the aggregate as JSON"
     )
 
+    sessions_activity_v4 = sessions_subparsers.add_parser(
+        "activity-v4",
+        help="Add privacy-safe direct delegation counts to interactive activity",
+    )
+    sessions_activity_v4.add_argument(
+        "--source", help="Filter by the owning interactive session source"
+    )
+    sessions_activity_v4.add_argument(
+        "--window",
+        type=int,
+        default=120,
+        help="Seconds for current evidence (default: 120)",
+    )
+    sessions_activity_v4.add_argument(
+        "--json", action="store_true", help="Emit the aggregate as JSON"
+    )
+
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument(
         "--source", help="Filter by source (cli, telegram, discord, etc.)"

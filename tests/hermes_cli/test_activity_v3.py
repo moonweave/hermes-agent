@@ -13,7 +13,7 @@ import pytest
 from agent.live_activity import sanitize_live_caption
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
-from hermes_cli.sessions_cmd import _sessions_activity_v3
+from hermes_cli.sessions_cmd import _sessions_activity_v3, _sessions_activity_v4
 from hermes_state import SessionDB
 
 
@@ -33,7 +33,15 @@ class _Sessions:
 
     def list_sessions_rich(self, **kwargs):
         excluded = set(kwargs.get("exclude_sources") or [])
-        return [row for row in self.rows if row.get("source") not in excluded]
+        source = kwargs.get("source")
+        return [
+            row for row in self.rows
+            if row.get("source") not in excluded
+            and (source is None or row.get("source") == source)
+        ]
+
+    def get_session(self, session_id):
+        return next((row for row in self.rows if row.get("id") == session_id), None)
 
 
 def _session(
@@ -374,6 +382,110 @@ def test_sessions_activity_v3_uses_latest_open_caption_and_keeps_v2_private(caps
     assert "older" not in json.dumps(payload)
     assert "newer" not in json.dumps(payload)
     assert "worker" not in json.dumps(payload)
+
+
+def test_sessions_activity_v4_reports_direct_delegates_without_exposing_identity(capsys, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    parent = _session(
+        session_id="discord-parent-secret",
+        active=now - 2,
+        source="discord",
+        profile="default",
+        cwd=None,
+    )
+    first = _session(
+        session_id="delegate-child-secret-a",
+        active=now - 2,
+        source="subagent",
+        profile="default",
+        cwd=None,
+    )
+    first["parent_session_id"] = parent["id"]
+    second = _session(
+        session_id="delegate-child-secret-b",
+        active=now - 4,
+        source="subagent",
+        profile="default",
+        cwd=None,
+    )
+    second["parent_session_id"] = parent["id"]
+    ended = _session(
+        session_id="delegate-ended-secret",
+        active=now - 1,
+        source="subagent",
+        profile="default",
+        cwd=None,
+    )
+    ended["parent_session_id"] = parent["id"]
+    ended["ended_at"] = now - 1
+    kanban = _session(
+        session_id="kanban-worker-secret",
+        active=now - 1,
+        source="kanban-worker",
+        profile="builder",
+        cwd="/private/repo",
+    )
+    kanban["parent_session_id"] = parent["id"]
+
+    db = _Sessions([parent, first, second, ended, kanban])
+    assert _sessions_activity_v4(
+        db, argparse.Namespace(source=None, json=True, window=120)
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["contract_version"] == "hermes-sessions-activity-v4"
+    assert payload["delegated_aggregates"] == [{
+        "delegation_ref": payload["delegated_aggregates"][0]["delegation_ref"],
+        "profile": "default",
+        "workspace_digest": None,
+        "context_scope": "hq",
+        "active_worker_count": 2,
+        "evidence_observed_at": now - 2,
+        "evidence_expires_at": now + 118,
+    }]
+    rendered = json.dumps(payload)
+    for private in (
+        "discord-parent-secret",
+        "delegate-child-secret-a",
+        "delegate-child-secret-b",
+        "delegate-ended-secret",
+        "kanban-worker-secret",
+    ):
+        assert private not in rendered
+
+
+def test_sessions_activity_v4_keeps_same_profile_delegates_split_by_workspace(capsys, monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr("hermes_state.workspace_key", lambda row: row.get("cwd"))
+    parent_a = _session(
+        session_id="parent-a", active=now - 3, source="desktop",
+        profile="default", cwd="/private/repo-a",
+    )
+    parent_b = _session(
+        session_id="parent-b", active=now - 2, source="desktop",
+        profile="default", cwd="/private/repo-b",
+    )
+    child_a = _session(
+        session_id="child-a", active=now - 3, source="subagent",
+        profile="default", cwd=None,
+    )
+    child_b = _session(
+        session_id="child-b", active=now - 2, source="subagent",
+        profile="default", cwd=None,
+    )
+    child_a["parent_session_id"] = parent_a["id"]
+    child_b["parent_session_id"] = parent_b["id"]
+
+    assert _sessions_activity_v4(
+        _Sessions([parent_a, parent_b, child_a, child_b]),
+        argparse.Namespace(source=None, json=True, window=120),
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert len(payload["delegated_aggregates"]) == 2
+    assert {item["active_worker_count"] for item in payload["delegated_aggregates"]} == {1}
+    assert len({item["workspace_digest"] for item in payload["delegated_aggregates"]}) == 2
 
 
 def test_sessions_activity_v3_repairs_legacy_overlong_caption(capsys, monkeypatch):

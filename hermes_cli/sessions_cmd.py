@@ -44,6 +44,7 @@ def _relative_time(ts):
 SESSIONS_ACTIVITY_CONTRACT = "hermes-sessions-activity-v1"
 SESSIONS_ACTIVITY_V2_CONTRACT = "hermes-sessions-activity-v2"
 SESSIONS_ACTIVITY_V3_CONTRACT = "hermes-sessions-activity-v3"
+SESSIONS_ACTIVITY_V4_CONTRACT = "hermes-sessions-activity-v4"
 _INTERACTIVE_ACTIVITY_V2_WINDOW_SECONDS = 120
 # Enough sessions to cover every workspace a person could plausibly have open
 # at once, while keeping the read bounded on a 300+ session store.
@@ -500,6 +501,161 @@ def _sessions_activity_v3(db, args) -> int:
     return 0
 
 
+def _sessions_activity_v4_payload(db, args) -> dict:
+    """Add privacy-safe direct-delegation evidence to interactive activity.
+
+    Direct ``source=subagent`` children are not interactive sessions and must
+    not be folded into ``aggregates``.  They are nevertheless real workers a
+    local operator needs to see.  Project them through their owning parent as
+    an identifier-free count, while keeping Kanban workers on the independent
+    Kanban evidence path.
+    """
+    import hashlib
+    import time as _time
+
+    from hermes_state import workspace_key as _ws_key
+
+    payload = _sessions_activity_v3_payload(db, args)
+    window = payload["window_seconds"]
+    now = int(_time.time())
+    floor = now - window
+    rows = db.list_sessions_rich(
+        source="subagent",
+        limit=_ACTIVITY_SCAN_LIMIT,
+        include_children=True,
+        project_compression_tips=False,
+        compact_rows=True,
+        order_by_last_active=True,
+    )
+    requested_source = str(getattr(args, "source", None) or "").strip().lower()
+
+    def owning_parent(row):
+        parent_id = row.get("parent_session_id")
+        visited = set()
+        for _ in range(8):
+            if not parent_id or parent_id in visited:
+                return None
+            visited.add(parent_id)
+            parent = db.get_session(parent_id)
+            if not parent:
+                return None
+            if str(parent.get("source") or "").strip().lower() != "subagent":
+                return parent
+            parent_id = parent.get("parent_session_id")
+        return None
+
+    groups: dict[tuple[str, str, str], dict] = {}
+    unresolved_profile = 0
+    unresolved_workspace = 0
+    total_workers = 0
+    for row in rows:
+        if row.get("ended_at") is not None:
+            continue
+        last_active = row.get("last_active")
+        last_active = int(last_active) if last_active else None
+        if last_active is None or last_active <= floor:
+            continue
+        total_workers += 1
+        parent = owning_parent(row)
+        if not parent:
+            unresolved_profile += 1
+            unresolved_workspace += 1
+            continue
+        parent_source = str(parent.get("source") or "").strip().lower()
+        if requested_source and parent_source != requested_source:
+            total_workers -= 1
+            continue
+        profile_raw = parent.get("profile_name")
+        profile = profile_raw.strip() if isinstance(profile_raw, str) else ""
+        if not profile:
+            unresolved_profile += 1
+            continue
+        workspace = _activity_workspace_key(parent, _ws_key)
+        if workspace:
+            context_scope = "workspace"
+            workspace_digest = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
+            context_identity = workspace_digest
+        elif parent_source in _HQ_INTERACTIVE_SOURCES:
+            context_scope = "hq"
+            workspace_digest = None
+            context_identity = "hermes-hq"
+        else:
+            unresolved_workspace += 1
+            continue
+        key = (profile, context_scope, context_identity)
+        bucket = groups.setdefault(
+            key,
+            {
+                "delegation_ref": "delegated_"
+                + hashlib.sha256(
+                    f"{profile}\x1f{context_scope}\x1f{context_identity}".encode("utf-8")
+                ).hexdigest()[:16],
+                "profile": profile,
+                "workspace_digest": workspace_digest,
+                "context_scope": context_scope,
+                "active_worker_count": 0,
+                "evidence_observed_at": None,
+            },
+        )
+        bucket["active_worker_count"] += 1
+        if bucket["evidence_observed_at"] is None or last_active > bucket["evidence_observed_at"]:
+            bucket["evidence_observed_at"] = last_active
+
+    delegated = []
+    for bucket in groups.values():
+        bucket["evidence_expires_at"] = bucket["evidence_observed_at"] + window
+        delegated.append(bucket)
+    delegated.sort(
+        key=lambda entry: (
+            -(entry["evidence_observed_at"] or 0),
+            entry["profile"],
+            entry["workspace_digest"] or "",
+        )
+    )
+    oldest_scanned = min(
+        (int(row.get("last_active") or 0) for row in rows),
+        default=0,
+    )
+    scan_truncated = len(rows) >= _ACTIVITY_SCAN_LIMIT and oldest_scanned >= floor
+
+    payload["contract_version"] = SESSIONS_ACTIVITY_V4_CONTRACT
+    payload["delegated_aggregates"] = delegated
+    payload["delegated_coverage"] = {
+        "complete": not scan_truncated and unresolved_profile == 0 and unresolved_workspace == 0,
+        "total_workers": total_workers,
+        "returned_workers": sum(item["active_worker_count"] for item in delegated),
+        "scan_truncated": scan_truncated,
+        "unresolved_profiles": unresolved_profile,
+        "unresolved_workspaces": unresolved_workspace,
+    }
+    payload["unresolved_profile"]["recent_session_count"] += unresolved_profile
+    payload["unresolved_workspace"]["recent_session_count"] += unresolved_workspace
+    payload["coverage"]["complete"] = (
+        payload["coverage"]["complete"]
+        and payload["delegated_coverage"]["complete"]
+    )
+    payload["coverage"]["scan_truncated"] = (
+        payload["coverage"]["scan_truncated"] or scan_truncated
+    )
+    return payload
+
+
+def _sessions_activity_v4(db, args) -> int:
+    """Render interactive plus direct-delegation activity v4."""
+    import json as _json
+
+    payload = _sessions_activity_v4_payload(db, args)
+    if getattr(args, "json", False):
+        print(_json.dumps(payload, indent=2))
+        return 0
+    print(
+        "Recent activity groups: "
+        f"{len(payload['aggregates'])} interactive, "
+        f"{len(payload['delegated_aggregates'])} delegated"
+    )
+    return 0
+
+
 def _session_browse_picker(sessions):
     return _m()._session_browse_picker(sessions)
 
@@ -711,6 +867,8 @@ def cmd_sessions(args, sessions_parser=None):
         return _sessions_activity_v2(db, args)
     if action == "activity-v3":
         return _sessions_activity_v3(db, args)
+    if action == "activity-v4":
+        return _sessions_activity_v4(db, args)
 
     if action == "list":
         from hermes_state import workspace_key as _ws_key

@@ -48,7 +48,11 @@ def _reserve(
     content: str = "sanitized final",
     binding: str = "opaque.secret.binding",
     recovery_context_digest: str | None = _DEFAULT_RECOVERY_CONTEXT_DIGEST,
+    reconciliation_id: str | None = None,
 ):
+    kwargs = {}
+    if reconciliation_id is not None:
+        kwargs["reconciliation_id"] = reconciliation_id
     return ledger.reserve_delivery(
         plugin_id="test.plugin",
         binding_handle=binding,
@@ -56,6 +60,7 @@ def _reserve(
         sanitized_content=content,
         recovery_context_digest=recovery_context_digest,
         now=1_000.0,
+        **kwargs,
     )
 
 
@@ -987,6 +992,7 @@ def test_restart_resumes_only_pending_and_claimed_becomes_uncertain():
         "content": "sanitized final",
         "binding_digest": pending.binding_digest,
         "recovery_context_digest": pending.recovery_context_digest,
+        "reconciliation_digest": None,
     }
     restarted = ledger.get_delivery(claimed.delivery_id)
     assert restarted is not None
@@ -1143,13 +1149,215 @@ def test_reservation_rejects_malformed_recovery_context_before_database_write(
     assert not _isolated_db.exists()
 
 
+def test_reconciliation_id_is_digest_only_and_supports_reserve_then_claim(
+    _isolated_db,
+):
+    reconciliation_id = "consultation-018f4f7e-7d8f-7000-8000-123456789abc"
+    record = _reserve(reconciliation_id=reconciliation_id)
+
+    assert (
+        record.reconciliation_digest
+        == hashlib.sha256(reconciliation_id.encode()).hexdigest()
+    )
+    assert reconciliation_id.encode() not in _isolated_db.read_bytes()
+    looked_up = ledger.get_delivery_by_reconciliation_id(
+        plugin_id="test.plugin",
+        reconciliation_id=reconciliation_id,
+    )
+    assert looked_up is not None
+    assert looked_up == record
+    assert looked_up.state is ledger.DeliveryState.PENDING
+    assert not hasattr(looked_up, "claim_token")
+
+    duplicate = _reserve(reconciliation_id=reconciliation_id)
+    assert duplicate == record
+    claim = ledger.claim_for_send(
+        plugin_id="test.plugin",
+        binding_handle="opaque.secret.binding",
+        delivery_key="turn-1",
+        now=1_001.0,
+    )
+    assert claim is not None
+    assert (
+        ledger.claim_for_send(
+            plugin_id="test.plugin",
+            binding_handle="opaque.secret.binding",
+            delivery_key="turn-1",
+            now=1_001.1,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "reconciliation_id",
+    ["", "has space", "has/slash", "한글-id", "x" * 129],
+)
+def test_reconciliation_id_rejects_unsafe_or_unbounded_values(
+    _isolated_db, reconciliation_id
+):
+    with pytest.raises(ValueError, match="reconciliation_id"):
+        _reserve(reconciliation_id=reconciliation_id)
+
+    assert not _isolated_db.exists()
+
+
+def test_reconciliation_lookup_is_plugin_scoped_and_immutable():
+    reconciliation_id = "consultation-immutable-1"
+    record = _reserve(reconciliation_id=reconciliation_id)
+
+    assert (
+        ledger.get_delivery_by_reconciliation_id(
+            plugin_id="other.plugin",
+            reconciliation_id=reconciliation_id,
+        )
+        is None
+    )
+    with pytest.raises(ledger.DeliveryConflictError, match="reconciliation"):
+        ledger.reserve_delivery(
+            plugin_id="test.plugin",
+            binding_handle="other.binding",
+            delivery_key="turn-2",
+            sanitized_content="other final",
+            recovery_context_digest=_DEFAULT_RECOVERY_CONTEXT_DIGEST,
+            reconciliation_id=reconciliation_id,
+            now=1_001.0,
+        )
+    with pytest.raises(ledger.DeliveryConflictError, match="reconciliation"):
+        _reserve(reconciliation_id="consultation-immutable-2")
+
+    unchanged = ledger.get_delivery(record.delivery_id)
+    assert unchanged == record
+
+
+def test_reconciliation_lookup_reports_every_lifecycle_state_after_restart():
+    reconciliation_id = "consultation-lifecycle-1"
+    record = _reserve(reconciliation_id=reconciliation_id)
+
+    def state() -> ledger.DeliveryState:
+        found = ledger.get_delivery_by_reconciliation_id(
+            plugin_id="test.plugin",
+            reconciliation_id=reconciliation_id,
+        )
+        assert found is not None
+        return found.state
+
+    assert state() is ledger.DeliveryState.PENDING
+    claim = ledger.claim_for_send(
+        plugin_id="test.plugin",
+        binding_handle="opaque.secret.binding",
+        delivery_key="turn-1",
+        now=1_001.0,
+    )
+    assert claim is not None
+    assert state() is ledger.DeliveryState.SEND_CLAIMED
+    assert ledger.recover_after_restart(now=1_002.0) == []
+    assert state() is ledger.DeliveryState.DELIVERY_UNCERTAIN
+
+    delivered_id = "consultation-lifecycle-delivered"
+    delivered = ledger.reserve_delivery(
+        plugin_id="test.plugin",
+        binding_handle="delivered.binding",
+        delivery_key="turn-delivered",
+        sanitized_content="delivered final",
+        recovery_context_digest=_DEFAULT_RECOVERY_CONTEXT_DIGEST,
+        reconciliation_id=delivered_id,
+        now=1_003.0,
+    )
+    delivered_claim = ledger.claim_for_send(
+        plugin_id="test.plugin",
+        binding_handle="delivered.binding",
+        delivery_key="turn-delivered",
+        now=1_004.0,
+    )
+    assert delivered_claim is not None
+    assert ledger.mark_delivered(
+        delivered.delivery_id, delivered_claim.claim_token, now=1_005.0
+    )
+    delivered_status = ledger.get_delivery_by_reconciliation_id(
+        plugin_id="test.plugin", reconciliation_id=delivered_id
+    )
+    assert delivered_status is not None
+    assert delivered_status.state is ledger.DeliveryState.DELIVERED
+
+    failed_id = "consultation-lifecycle-failed"
+    failed = ledger.reserve_delivery(
+        plugin_id="test.plugin",
+        binding_handle="failed.binding",
+        delivery_key="turn-failed",
+        sanitized_content="failed final",
+        recovery_context_digest=_DEFAULT_RECOVERY_CONTEXT_DIGEST,
+        reconciliation_id=failed_id,
+        now=1_006.0,
+    )
+    assert ledger.cancel_pending_delivery(
+        delivery_id=failed.delivery_id,
+        plugin_id=failed.plugin_id,
+        binding_digest=failed.binding_digest,
+        recovery_context_digest=_required_record_context(failed),
+        now=1_007.0,
+    )
+    failed_status = ledger.get_delivery_by_reconciliation_id(
+        plugin_id="test.plugin", reconciliation_id=failed_id
+    )
+    assert failed_status is not None
+    assert failed_status.state is ledger.DeliveryState.FAILED
+
+    assert ledger.recover_after_restart(now=1_008.0) == []
+    for terminal_id, expected_state in (
+        (reconciliation_id, ledger.DeliveryState.DELIVERY_UNCERTAIN),
+        (delivered_id, ledger.DeliveryState.DELIVERED),
+        (failed_id, ledger.DeliveryState.FAILED),
+    ):
+        restarted = ledger.get_delivery_by_reconciliation_id(
+            plugin_id="test.plugin", reconciliation_id=terminal_id
+        )
+        assert restarted is not None
+        assert restarted.state is expected_state
+
+
+def test_concurrent_reconciliation_reservation_has_one_mapping():
+    reconciliation_id = "consultation-concurrent-1"
+
+    def reserve(index: int):
+        try:
+            return ledger.reserve_delivery(
+                plugin_id="test.plugin",
+                binding_handle=f"binding-{index}",
+                delivery_key=f"turn-{index}",
+                sanitized_content=f"final {index}",
+                recovery_context_digest=_DEFAULT_RECOVERY_CONTEXT_DIGEST,
+                reconciliation_id=reconciliation_id,
+                now=1_000.0 + index,
+            )
+        except ledger.DeliveryConflictError:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(reserve, range(8)))
+
+    winners = [record for record in outcomes if record is not None]
+    assert len(winners) == 1
+    assert (
+        ledger.get_delivery_by_reconciliation_id(
+            plugin_id="test.plugin", reconciliation_id=reconciliation_id
+        )
+        == winners[0]
+    )
+
+
 def test_cancel_pending_delivery_is_durable_and_securely_erases_content(
     _isolated_db, monkeypatch
 ):
     _force_secure_delete_default_off(monkeypatch)
     needle = b"cancel-pending-sensitive-Q"
-    record = _reserve(content=_page_spanning_content(needle.decode()))
+    reconciliation_id = "consultation-cancel-secure-1"
+    record = _reserve(
+        content=_page_spanning_content(needle.decode()),
+        reconciliation_id=reconciliation_id,
+    )
     assert needle in _isolated_db.read_bytes()
+    assert reconciliation_id.encode() not in _isolated_db.read_bytes()
 
     assert ledger.cancel_pending_delivery(
         delivery_id=record.delivery_id,
@@ -1178,6 +1386,11 @@ def test_cancel_pending_delivery_is_durable_and_securely_erases_content(
     assert unchanged is not None
     assert unchanged.last_error == "resolver_cleanup_cancelled"
     assert ledger.recover_after_restart(now=1_002.0) == []
+    recovered_status = ledger.get_delivery_by_reconciliation_id(
+        plugin_id="test.plugin", reconciliation_id=reconciliation_id
+    )
+    assert recovered_status is not None
+    assert recovered_status.state is ledger.DeliveryState.FAILED
 
 
 def test_cancel_pending_delivery_mismatch_and_nonpending_are_noops():

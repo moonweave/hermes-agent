@@ -28,6 +28,10 @@ class CoordinatorRouteError(ValueError):
     """A coordinator operation cannot be safely accepted."""
 
 
+class CoordinatorRoleTimeoutError(CoordinatorRouteError):
+    """A coordinator role could not be launched before its deadline."""
+
+
 @dataclasses.dataclass(frozen=True)
 class GatewayDispatchBinding:
     """Opaque, process-local proof of one authorized gateway message."""
@@ -74,6 +78,25 @@ class GatewayDeliveryResult:
     error_code: Optional[str] = None
 
 
+class GatewayDeliveryState(str, enum.Enum):
+    NOT_RESERVED = "NOT_RESERVED"
+    RETRYABLE = "RETRYABLE"
+    PENDING = "PENDING"
+    SEND_CLAIMED = "SEND_CLAIMED"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+    DELIVERY_UNCERTAIN = "DELIVERY_UNCERTAIN"
+
+
+@dataclasses.dataclass(frozen=True)
+class GatewayDeliveryStatus:
+    """Secret-free reconciliation state for one plugin-scoped delivery id."""
+
+    state: GatewayDeliveryState
+    transport_attempted: bool = False
+    error_code: Optional[str] = None
+
+
 @dataclasses.dataclass
 class _GatewayDispatchRecord:
     binding: GatewayDispatchBinding
@@ -82,6 +105,15 @@ class _GatewayDispatchRecord:
     validity_resolver: Callable[[], bool]
     delivery: Optional[
         Callable[[str, str, float, str, str], Awaitable[GatewayDeliveryResult]]
+    ] = None
+    delivery_prepare: Optional[
+        Callable[[str, str, float, str, str, str], Awaitable[GatewayDeliveryStatus]]
+    ] = None
+    delivery_send_prepared: Optional[
+        Callable[[str, str, float, str], Awaitable[GatewayDeliveryStatus]]
+    ] = None
+    delivery_cancel_prepared: Optional[
+        Callable[[str, str, str], GatewayDeliveryStatus]
     ] = None
     delivery_binding_handle: str = dataclasses.field(default="", repr=False)
     consultation_binding: Optional[tuple[str, str, AccountScope]] = None
@@ -97,6 +129,7 @@ class _GatewayDispatchRecord:
 class TeamMcpBindingToken:
     """Opaque bearer value requiring explicit transport disclosure."""
 
+    __wire_value: str
     __slots__ = ("__wire_value",)
 
     def __init__(self, wire_value: str) -> None:
@@ -263,6 +296,15 @@ def issue_gateway_dispatch_binding(
     delivery: Optional[
         Callable[[str, str, float, str, str], Awaitable[GatewayDeliveryResult]]
     ] = None,
+    delivery_prepare: Optional[
+        Callable[[str, str, float, str, str, str], Awaitable[GatewayDeliveryStatus]]
+    ] = None,
+    delivery_send_prepared: Optional[
+        Callable[[str, str, float, str], Awaitable[GatewayDeliveryStatus]]
+    ] = None,
+    delivery_cancel_prepared: Optional[
+        Callable[[str, str, str], GatewayDeliveryStatus]
+    ] = None,
     clock: Callable[[], float] = time.time,
     ttl_seconds: float = 300.0,
 ) -> GatewayDispatchBinding:
@@ -278,6 +320,12 @@ def issue_gateway_dispatch_binding(
         or not callable(schedule)
         or not callable(validity_resolver)
         or (delivery is not None and not callable(delivery))
+        or (delivery_prepare is not None and not callable(delivery_prepare))
+        or (delivery_send_prepared is not None and not callable(delivery_send_prepared))
+        or (
+            delivery_cancel_prepared is not None
+            and not callable(delivery_cancel_prepared)
+        )
         or (parent is None and not callable(parent_resolver))
         or (parent is not None and parent_resolver is not None)
     ):
@@ -315,6 +363,9 @@ def issue_gateway_dispatch_binding(
             schedule=schedule,
             validity_resolver=validity_resolver,
             delivery=delivery,
+            delivery_prepare=delivery_prepare,
+            delivery_send_prepared=delivery_send_prepared,
+            delivery_cancel_prepared=delivery_cancel_prepared,
             delivery_binding_handle=_gateway_delivery_binding_handle(binding),
         )
     return binding
@@ -591,21 +642,27 @@ class GatewayBoundDeliveryService:
         self._binding = binding
         self._authorization_resolver = authorization_resolver
 
-    async def deliver_once(
-        self, *, delivery_key: str, content: str
-    ) -> GatewayDeliveryResult:
-        """Attempt one logical delivery without exposing its destination."""
+    def _active_record(self) -> _GatewayDispatchRecord:
         if self._authorization_resolver() is not True:
             raise PermissionError("Gateway delivery capability is not granted.")
-        if not _valid_text(delivery_key, 256) or not _valid_text(content, 100_000):
-            raise ValueError("Gateway delivery request is malformed.")
         record = _gateway_dispatch_record(
             self._binding,
             issuer_plugin_id=self._issuer_plugin_id,
         )
         if record.activated is not True:
             raise CoordinatorRouteError("Gateway delivery binding is not active.")
-        if record.delivery is None or not record.delivery_binding_handle:
+        if not record.delivery_binding_handle:
+            raise CoordinatorRouteError("Gateway delivery is unavailable.")
+        return record
+
+    async def deliver_once(
+        self, *, delivery_key: str, content: str
+    ) -> GatewayDeliveryResult:
+        """Attempt one logical delivery without exposing its destination."""
+        if not _valid_text(delivery_key, 256) or not _valid_text(content, 100_000):
+            raise ValueError("Gateway delivery request is malformed.")
+        record = self._active_record()
+        if record.delivery is None:
             raise CoordinatorRouteError("Gateway delivery is unavailable.")
         return await record.delivery(
             self._issuer_plugin_id,
@@ -615,15 +672,132 @@ class GatewayBoundDeliveryService:
             content,
         )
 
+    async def prepare_once(
+        self, *, reconciliation_id: str, delivery_key: str, content: str
+    ) -> GatewayDeliveryStatus:
+        """Durably reserve one final without claiming or transporting it."""
+        if (
+            not _valid_text(reconciliation_id, 256)
+            or not _valid_text(delivery_key, 256)
+            or not _valid_text(content, 100_000)
+        ):
+            raise ValueError("Gateway delivery preparation is malformed.")
+        record = self._active_record()
+        cancel_prepared = record.delivery_cancel_prepared
+        if record.delivery_prepare is None or cancel_prepared is None:
+            raise CoordinatorRouteError("Gateway delivery preparation is unavailable.")
+
+        def _cancel() -> None:
+            cancel_prepared(
+                self._issuer_plugin_id,
+                record.delivery_binding_handle,
+                reconciliation_id,
+            )
+
+        try:
+            status = _validated_delivery_status(
+                await record.delivery_prepare(
+                    self._issuer_plugin_id,
+                    record.delivery_binding_handle,
+                    self._binding.expires_at,
+                    reconciliation_id,
+                    delivery_key,
+                    content,
+                )
+            )
+        except BaseException:
+            _cancel()
+            raise
+        if status.state is GatewayDeliveryState.PENDING:
+            try:
+                register_gateway_dispatch_revocation_callback(self._binding, _cancel)
+            except Exception:
+                _cancel()
+                raise
+        return status
+
+    async def send_prepared_once(
+        self, *, reconciliation_id: str
+    ) -> GatewayDeliveryStatus:
+        """Claim and attempt transport only for this binding's prepared row."""
+        if not _valid_text(reconciliation_id, 256):
+            raise ValueError("Gateway prepared delivery request is malformed.")
+        record = self._active_record()
+        if record.delivery_send_prepared is None:
+            raise CoordinatorRouteError("Gateway prepared delivery is unavailable.")
+        return _validated_delivery_status(
+            await record.delivery_send_prepared(
+                self._issuer_plugin_id,
+                record.delivery_binding_handle,
+                self._binding.expires_at,
+                reconciliation_id,
+            )
+        )
+
+    def cancel_prepared_once(self, *, reconciliation_id: str) -> GatewayDeliveryStatus:
+        """Durably cancel this binding's prepared row without transport work."""
+        if not _valid_text(reconciliation_id, 256):
+            raise ValueError("Gateway prepared delivery cancellation is malformed.")
+        record = self._active_record()
+        if record.delivery_cancel_prepared is None:
+            raise CoordinatorRouteError("Gateway prepared cancellation is unavailable.")
+        return _validated_delivery_status(
+            record.delivery_cancel_prepared(
+                self._issuer_plugin_id,
+                record.delivery_binding_handle,
+                reconciliation_id,
+            )
+        )
+
 
 class GatewayDeliveryService:
-    """Unbound delivery facade; a live signed gateway binding is mandatory."""
+    """Grant-only two-phase delivery plus plugin-scoped reconciliation."""
 
     def __init__(
-        self, issuer_plugin_id: str, authorization_resolver: Callable[[], bool]
+        self,
+        issuer_plugin_id: str,
+        authorization_resolver: Callable[[], bool],
+        reconciliation: Optional[
+            Callable[[str, str], Awaitable[GatewayDeliveryStatus]]
+        ] = None,
+        reconciliation_now: Optional[
+            Callable[[str, str], GatewayDeliveryStatus]
+        ] = None,
     ) -> None:
         self._issuer_plugin_id = issuer_plugin_id
         self._authorization_resolver = authorization_resolver
+        self._reconciliation = reconciliation
+        self._reconciliation_now = reconciliation_now
+
+    def _validate_reconciliation_request(self, reconciliation_id: str) -> None:
+        if self._authorization_resolver() is not True:
+            raise PermissionError("Gateway delivery capability is not granted.")
+        if not _valid_text(reconciliation_id, 256):
+            raise ValueError("Gateway delivery reconciliation is malformed.")
+
+    def reconcile_now(self, *, reconciliation_id: str) -> GatewayDeliveryStatus:
+        """Synchronously read ledger state for register and status hooks."""
+        self._validate_reconciliation_request(reconciliation_id)
+        if self._reconciliation_now is None:
+            raise CoordinatorRouteError(
+                "Gateway delivery reconciliation is unavailable."
+            )
+        return _validated_delivery_status(
+            self._reconciliation_now(self._issuer_plugin_id, reconciliation_id)
+        )
+
+    async def reconcile(self, *, reconciliation_id: str) -> GatewayDeliveryStatus:
+        """Read bounded host-ledger state without requiring an old binding."""
+        self._validate_reconciliation_request(reconciliation_id)
+        if self._reconciliation is not None:
+            return _validated_delivery_status(
+                await self._reconciliation(self._issuer_plugin_id, reconciliation_id)
+            )
+        if self._reconciliation_now is None:
+            raise CoordinatorRouteError(
+                "Gateway delivery reconciliation is unavailable."
+            )
+        return self.reconcile_now(reconciliation_id=reconciliation_id)
 
     def for_gateway_binding(
         self, binding: GatewayDispatchBinding
@@ -636,6 +810,17 @@ class GatewayDeliveryService:
             binding=binding,
             authorization_resolver=self._authorization_resolver,
         )
+
+
+def _validated_delivery_status(value: Any) -> GatewayDeliveryStatus:
+    if (
+        not isinstance(value, GatewayDeliveryStatus)
+        or not isinstance(value.state, GatewayDeliveryState)
+        or not isinstance(value.transport_attempted, bool)
+        or (value.error_code is not None and not _valid_text(value.error_code, 128))
+    ):
+        raise CoordinatorRouteError("Gateway delivery status is malformed.")
+    return value
 
 
 class CoordinatorService:
@@ -788,7 +973,13 @@ class CoordinatorService:
             _REGISTRY.by_id[handle.coordinator_id] = record
             return handle
 
-    def launch_role(self, handle: CoordinatorHandle, request: CoordinatorRoleRequest):
+    def launch_role(
+        self,
+        handle: CoordinatorHandle,
+        request: CoordinatorRoleRequest,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ):
         self._require_authorized()
         parent, session_id, turn_id = self._current_binding(require_parent=True)
         record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
@@ -808,6 +999,7 @@ class CoordinatorService:
                 return self._public_role_handle(handle, request.role, existing)
             from agent.subagent_lifecycle import (
                 SubagentLaunchRequest,
+                SubagentLaunchTimeoutError,
                 SubagentLifecycleService,
             )
 
@@ -825,8 +1017,14 @@ class CoordinatorService:
                         parent_session_id=session_id,
                         correlation_id=(f"{handle.coordinator_id}:{role_name}"),
                         metadata={"coordinator_id": handle.coordinator_id},
+                        timeout_seconds=timeout_seconds,
                     )
                 )
+            except SubagentLaunchTimeoutError as exc:
+                record.state = CoordinatorJobState.ROLE_FAILED
+                raise CoordinatorRoleTimeoutError(
+                    "Coordinator role launch timed out."
+                ) from exc
             except Exception:
                 record.state = CoordinatorJobState.ROLE_FAILED
                 raise

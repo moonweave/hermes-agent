@@ -1738,9 +1738,27 @@ class PluginContext:
                     and plugin_capability_granted(self.plugin_id, capability_id)
                 )
 
+            async def _reconcile(plugin_id: str, reconciliation_id: str) -> Any:
+                from gateway.plugin_delivery_service import reconcile
+
+                return await reconcile(
+                    plugin_id=plugin_id,
+                    reconciliation_id=reconciliation_id,
+                )
+
+            def _reconcile_now(plugin_id: str, reconciliation_id: str) -> Any:
+                from gateway.plugin_delivery_service import reconcile_now
+
+                return reconcile_now(
+                    plugin_id=plugin_id,
+                    reconciliation_id=reconciliation_id,
+                )
+
             self._gateway_delivery = GatewayDeliveryService(
                 self.plugin_id,
                 authorization_resolver=_authorized,
+                reconciliation=_reconcile,
+                reconciliation_now=_reconcile_now,
             )
         return self._gateway_delivery
 
@@ -5502,6 +5520,9 @@ class PluginManager:
         schedule: Callable,
         binding_validity: Callable[[], bool],
         delivery: Optional[Callable] = None,
+        delivery_prepare: Optional[Callable] = None,
+        delivery_send_prepared: Optional[Callable] = None,
+        delivery_cancel_prepared: Optional[Callable] = None,
     ) -> Any:
         """Run the one authorized dispatch owner; every failure means allow."""
         from agent.route_capability import (
@@ -5539,6 +5560,9 @@ class PluginManager:
                     schedule=schedule,
                     validity_resolver=binding_validity,
                     delivery=delivery,
+                    delivery_prepare=delivery_prepare,
+                    delivery_send_prepared=delivery_send_prepared,
+                    delivery_cancel_prepared=delivery_cancel_prepared,
                 )
                 context = GatewayDispatchContext(
                     binding=binding,

@@ -19645,6 +19645,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop: asyncio.AbstractEventLoop,
         binding_validity: Optional[Callable[[], bool]] = None,
         delivery: Optional[Callable[..., Awaitable[Any]]] = None,
+        delivery_prepare: Optional[Callable[..., Awaitable[Any]]] = None,
+        delivery_send_prepared: Optional[Callable[..., Awaitable[Any]]] = None,
+        delivery_cancel_prepared: Optional[Callable[..., Any]] = None,
     ) -> Any:
         """Invoke dispatch after auth/session binding but before agent construction."""
         from agent.route_capability import GatewayDispatchDecision
@@ -19687,6 +19690,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             binding_validity=validity_check,
             delivery=delivery,
+            delivery_prepare=delivery_prepare,
+            delivery_send_prepared=delivery_send_prepared,
+            delivery_cancel_prepared=delivery_cancel_prepared,
         )
 
     def _gateway_delivery_destination(
@@ -19724,6 +19730,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         return _deliver
+
+    def _gateway_prepared_delivery_destinations(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        session_key: str,
+    ) -> tuple[
+        Callable[..., Awaitable[Any]],
+        Callable[..., Awaitable[Any]],
+        Callable[..., Any],
+    ]:
+        """Bind prepare/send phases to the same authorized Telegram destination."""
+        bound_source = dataclasses.replace(source)
+        transport_adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        if callable(transport_adapter_ref):
+            bound_source._transport_adapter_ref = transport_adapter_ref
+
+        async def _prepare(
+            plugin_id: str,
+            binding_handle: str,
+            binding_expires_at: float,
+            reconciliation_id: str,
+            delivery_key: str,
+            content: str,
+        ) -> Any:
+            from gateway.plugin_delivery_service import prepare_once
+
+            return await prepare_once(
+                self,
+                plugin_id=plugin_id,
+                binding_handle=binding_handle,
+                binding_expires_at=binding_expires_at,
+                session_id=session_id,
+                session_key=session_key,
+                source=bound_source,
+                reconciliation_id=reconciliation_id,
+                delivery_key=delivery_key,
+                content=content,
+            )
+
+        async def _send_prepared(
+            plugin_id: str,
+            binding_handle: str,
+            binding_expires_at: float,
+            reconciliation_id: str,
+        ) -> Any:
+            from gateway.plugin_delivery_service import send_prepared_once
+
+            return await send_prepared_once(
+                self,
+                plugin_id=plugin_id,
+                binding_handle=binding_handle,
+                binding_expires_at=binding_expires_at,
+                session_id=session_id,
+                session_key=session_key,
+                source=bound_source,
+                reconciliation_id=reconciliation_id,
+            )
+
+        def _cancel_prepared(
+            plugin_id: str,
+            binding_handle: str,
+            reconciliation_id: str,
+        ) -> Any:
+            from gateway.plugin_delivery_service import cancel_prepared
+
+            return cancel_prepared(
+                self,
+                plugin_id=plugin_id,
+                binding_handle=binding_handle,
+                session_key=session_key,
+                reconciliation_id=reconciliation_id,
+            )
+
+        return _prepare, _send_prepared, _cancel_prepared
 
     async def _recover_gateway_plugin_deliveries_once(self) -> dict[str, int]:
         """Run plugin PENDING recovery once after adapters and sessions are ready."""
@@ -19767,15 +19849,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
             parent_turn_id=parent_turn_id,
         )
-        delivery = (
-            self._gateway_delivery_destination(
+        delivery = None
+        delivery_prepare = None
+        delivery_send_prepared = None
+        delivery_cancel_prepared = None
+        if source.platform == Platform.TELEGRAM:
+            delivery = self._gateway_delivery_destination(
                 source=source,
                 session_id=dispatch_entry.session_id,
                 session_key=session_key,
             )
-            if source.platform == Platform.TELEGRAM
-            else None
-        )
+            (
+                delivery_prepare,
+                delivery_send_prepared,
+                delivery_cancel_prepared,
+            ) = self._gateway_prepared_delivery_destinations(
+                source=source,
+                session_id=dispatch_entry.session_id,
+                session_key=session_key,
+            )
         decision = self._invoke_gateway_dispatch_before_agent(
             message=message,
             source=source,
@@ -19785,6 +19877,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_resolver=parent_resolver,
             loop=asyncio.get_running_loop(),
             delivery=delivery,
+            delivery_prepare=delivery_prepare,
+            delivery_send_prepared=delivery_send_prepared,
+            delivery_cancel_prepared=delivery_cancel_prepared,
         )
         if not isinstance(decision, GatewayDispatchDecision):
             return GatewayDispatchDecision()

@@ -35,6 +35,10 @@ class SubagentLifecycleError(ValueError):
     """A request cannot be safely accepted by the public lifecycle API."""
 
 
+class SubagentLaunchTimeoutError(SubagentLifecycleError):
+    """Child construction exceeded its accepted launch deadline."""
+
+
 class SubagentState(str, enum.Enum):
     PENDING = "PENDING"
     STARTING = "STARTING"
@@ -221,6 +225,11 @@ class SubagentLifecycleService:
         parent: Any,
         parent_session_id: Optional[str],
     ) -> SubagentHandle:
+        deadline = (
+            time.monotonic() + request.timeout_seconds
+            if request.timeout_seconds is not None
+            else None
+        )
         correlation_key = (parent_session_id, request.correlation_id or "")
         with _REGISTRY.lock:
             self._cleanup_locked()
@@ -251,6 +260,9 @@ class SubagentLifecycleService:
             parent_agent=parent,
             role=request.role,
         )
+        if deadline is not None and time.monotonic() >= deadline:
+            self._discard_constructed_child(child, parent)
+            raise SubagentLaunchTimeoutError("Subagent launch timed out.")
         if request.allowed_toolsets == () and (
             getattr(child, "enabled_toolsets", None) != []
             or bool(getattr(child, "valid_tool_names", None))
@@ -258,13 +270,13 @@ class SubagentLifecycleService:
             or getattr(child, "_delegate_role", None) != "leaf"
             or getattr(child, "_delegate_depth", None) != 1
         ):
-            self._close_child(child)
+            self._discard_constructed_child(child, parent)
             raise SubagentLifecycleError(
                 "Hermes failed to construct a strictly tool-less child."
             )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
-            self._close_child(child)
+            self._discard_constructed_child(child, parent)
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
         created = time.time()
         handle = SubagentHandle(
@@ -295,7 +307,7 @@ class SubagentLifecycleService:
                     and _REGISTRY.correlations.get(correlation_key) == subagent_id
                 ):
                     _REGISTRY.correlations.pop(correlation_key, None)
-            self._close_child(child)
+            self._discard_constructed_child(child, parent)
             raise
         return handle
 
@@ -310,6 +322,25 @@ class SubagentLifecycleService:
                 close()
             except Exception:
                 pass
+
+    @classmethod
+    def _discard_constructed_child(cls, child: Any, parent: Any) -> None:
+        """Close a child that never became lifecycle-visible and unlink it."""
+        cls._close_child(child)
+        active_children = getattr(parent, "_active_children", None)
+        if not isinstance(active_children, list):
+            return
+        lock = getattr(parent, "_active_children_lock", None)
+        try:
+            if lock is None:
+                if child in active_children:
+                    active_children.remove(child)
+            else:
+                with lock:
+                    if child in active_children:
+                        active_children.remove(child)
+        except Exception:
+            pass
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         self._require_authorized()
@@ -576,9 +607,15 @@ class SubagentLifecycleService:
             )
         if request.role not in {"leaf", "orchestrator"}:
             raise SubagentLifecycleError("role must be 'leaf' or 'orchestrator'.")
-        if request.timeout_seconds is not None:
+        if request.timeout_seconds is not None and (
+            isinstance(request.timeout_seconds, bool)
+            or not isinstance(request.timeout_seconds, (int, float))
+            or not math.isfinite(float(request.timeout_seconds))
+            or request.timeout_seconds <= 0
+            or request.timeout_seconds > 300
+        ):
             raise SubagentLifecycleError(
-                "Per-launch timeout is not supported; configure delegation timeout explicitly."
+                "timeout_seconds must be greater than 0 and at most 300."
             )
         if request.working_directory is not None:
             raise SubagentLifecycleError(

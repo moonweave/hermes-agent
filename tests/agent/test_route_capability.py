@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import dataclasses
 import base64
+import asyncio
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, cast
@@ -19,6 +21,7 @@ from agent.secret_scope import (
     set_multiplex_active,
     set_secret_scope,
 )
+from agent.subagent_lifecycle import SubagentLifecycleError
 from agent.route_capability import (
     AccountScope,
     CoordinatorJobState,
@@ -28,6 +31,7 @@ from agent.route_capability import (
     CoordinatorRoleRequest,
     CoordinatorRoleStatus,
     CoordinatorRoleTerminalState,
+    CoordinatorRoleTimeoutError,
     CoordinatorRouteError,
     CoordinatorService,
     TeamMcpBindingToken,
@@ -693,6 +697,68 @@ def test_concurrent_duplicate_role_launch_constructs_one_child(service_setup):
     assert len(built) == 1
 
 
+@pytest.mark.asyncio
+async def test_role_launch_deadline_closes_late_child_after_caller_timeout(
+    service_setup, monkeypatch
+):
+    parent, _now, service, built = service_setup
+    parent._active_children = []
+    parent._active_children_lock = threading.RLock()
+    handle = _reserve(service, _capability(service))
+    constructor_started = threading.Event()
+    release_constructor = threading.Event()
+
+    original_build = __import__(
+        "tools.delegate_tool", fromlist=["_build_child_preserving_parent_tools"]
+    )._build_child_preserving_parent_tools
+
+    def slow_build(**kwargs):
+        constructor_started.set()
+        assert release_constructor.wait(timeout=2)
+        child = original_build(**kwargs)
+        with parent._active_children_lock:
+            parent._active_children.append(child)
+        return child
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", slow_build
+    )
+    request = CoordinatorRoleRequest(
+        role=CoordinatorRole.FUNDAMENTAL, goal="Analyze fundamentals"
+    )
+    launch = asyncio.create_task(
+        asyncio.to_thread(
+            service.launch_role,
+            handle,
+            request,
+            timeout_seconds=0.02,
+        )
+    )
+    assert await asyncio.to_thread(constructor_started.wait, 1)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(launch), timeout=0.01)
+
+    await asyncio.sleep(0.02)
+    release_constructor.set()
+    with pytest.raises(CoordinatorRoleTimeoutError, match="timed out") as exc_info:
+        await launch
+    assert isinstance(exc_info.value, CoordinatorRouteError)
+    assert isinstance(exc_info.value.__cause__, SubagentLifecycleError)
+
+    assert len(built) == 1
+    assert built[0][1].closed is True
+    assert parent._active_children == []
+    assert service.status(handle).state is CoordinatorJobState.ROLE_FAILED
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", original_build
+    )
+    retry = service.launch_role(handle, request, timeout_seconds=1)
+    assert retry.role is CoordinatorRole.FUNDAMENTAL
+    assert len(built) == 2
+
+
 def test_unsafe_partially_built_role_is_closed_and_retry_is_duplicate_free(
     service_setup, monkeypatch
 ):
@@ -724,8 +790,9 @@ def test_unsafe_partially_built_role_is_closed_and_retry_is_duplicate_free(
     request = CoordinatorRoleRequest(
         role=CoordinatorRole.RISK_PORTFOLIO, goal="Review risk"
     )
-    with pytest.raises(Exception, match="strictly tool-less"):
+    with pytest.raises(SubagentLifecycleError, match="strictly tool-less") as exc_info:
         service.launch_role(handle, request)
+    assert not isinstance(exc_info.value, CoordinatorRoleTimeoutError)
 
     assert built[0][1].closed is True
     assert service.status(handle).state is CoordinatorJobState.ROLE_FAILED

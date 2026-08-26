@@ -11,12 +11,15 @@ import threading
 import time
 import weakref
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import pytest
 
 from agent.route_capability import (
+    CoordinatorRouteError,
     GatewayDeliveryService,
+    GatewayDeliveryState,
+    GatewayDeliveryStatus,
     activate_gateway_dispatch_binding,
     issue_gateway_dispatch_binding,
     reset_coordinator_registry_for_tests,
@@ -29,8 +32,13 @@ from gateway.plugin_delivery_service import (
     _persist_resolver,
     _recovery_context_digest,
     _transport_owner_digest,
+    cancel_prepared,
     deliver_once,
+    prepare_once,
+    reconcile,
+    reconcile_now,
     recover_pending,
+    send_prepared_once,
 )
 from gateway.session import Platform, SessionSource
 
@@ -76,6 +84,25 @@ class Store:
         return None
 
 
+class _DeliveryCall(TypedDict):
+    runner: Any
+    plugin_id: str
+    binding_handle: str
+    binding_expires_at: float
+    session_id: str
+    session_key: str
+    source: SessionSource
+
+
+class _DeliveryContext(TypedDict):
+    runner: Any
+    plugin_id: str
+    binding_expires_at: float
+    session_id: str
+    session_key: str
+    source: SessionSource
+
+
 class Adapter:
     def __init__(self, outcome=SendOnceOutcome.DELIVERED):
         self.outcome = outcome
@@ -104,6 +131,7 @@ def _target_metadata(
 def _recovery_runner(store, adapter, *, adapters=None, profile_adapters=None):
     return SimpleNamespace(
         session_store=store,
+        _adapter_for_source=lambda _source: adapter,
         adapters=({Platform.TELEGRAM: adapter} if adapters is None else adapters),
         _profile_adapters=profile_adapters or {},
         _thread_metadata_for_target=_target_metadata,
@@ -255,6 +283,48 @@ def _delivery_fixture(
             content=content,
         )
 
+    async def prepare(
+        plugin_id,
+        binding_handle,
+        expires_at,
+        reconciliation_id,
+        delivery_key,
+        content,
+    ):
+        return await prepare_once(
+            runner,
+            plugin_id=plugin_id,
+            binding_handle=binding_handle,
+            binding_expires_at=expires_at,
+            session_id=entry.session_id,
+            session_key=entry.session_key,
+            source=source,
+            reconciliation_id=reconciliation_id,
+            delivery_key=delivery_key,
+            content=content,
+        )
+
+    async def send_prepared(plugin_id, binding_handle, expires_at, reconciliation_id):
+        return await send_prepared_once(
+            runner,
+            plugin_id=plugin_id,
+            binding_handle=binding_handle,
+            binding_expires_at=expires_at,
+            session_id=entry.session_id,
+            session_key=entry.session_key,
+            source=source,
+            reconciliation_id=reconciliation_id,
+        )
+
+    def cancel(plugin_id, binding_handle, reconciliation_id):
+        return cancel_prepared(
+            runner,
+            plugin_id=plugin_id,
+            binding_handle=binding_handle,
+            session_key=entry.session_key,
+            reconciliation_id=reconciliation_id,
+        )
+
     binding = issue_gateway_dispatch_binding(
         issuer_plugin_id="fixture.delivery",
         parent=SimpleNamespace(session_id=entry.session_id),
@@ -266,12 +336,372 @@ def _delivery_fixture(
         schedule=lambda *_args: "unused",
         validity_resolver=lambda: True,
         delivery=delivery,
+        delivery_prepare=prepare,
+        delivery_send_prepared=send_prepared,
+        delivery_cancel_prepared=cancel,
     )
     bound = GatewayDeliveryService(
         "fixture.delivery", authorization_resolver=lambda: True
     ).for_gateway_binding(binding)
     activate_gateway_dispatch_binding(binding)
     return bound, binding, store, adapter
+
+
+@pytest.mark.asyncio
+async def test_two_phase_prepare_reconcile_and_send_without_plugin_content_replay():
+    _bound, _binding, store, adapter = _delivery_fixture()
+    runner = _recovery_runner(store, adapter)
+    source = store.entry.origin
+    common: _DeliveryCall = {
+        "runner": runner,
+        "plugin_id": "fixture.delivery",
+        "binding_handle": "private-binding-handle",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": source,
+    }
+
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-1"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.NOT_RESERVED)
+    assert reconcile_now(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-1",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.NOT_RESERVED)
+    prepared = await prepare_once(
+        **common,
+        reconciliation_id="consultation-1",
+        delivery_key="final",
+        content="safe answer",
+    )
+    assert prepared == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+    assert adapter.calls == []
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-1"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+    assert reconcile_now(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-1",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    sent = await send_prepared_once(
+        **common,
+        reconciliation_id="consultation-1",
+    )
+    assert sent == GatewayDeliveryStatus(
+        GatewayDeliveryState.DELIVERED,
+        transport_attempted=True,
+    )
+    assert len(adapter.calls) == 1
+    assert await send_prepared_once(
+        **common,
+        reconciliation_id="consultation-1",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+    assert len(adapter.calls) == 1
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-1"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_read_failure_is_retryable_not_terminal(monkeypatch):
+    def fail_read(**_kwargs):
+        raise OSError("ledger unavailable")
+
+    monkeypatch.setattr(
+        "gateway.plugin_delivery_ledger.get_delivery_by_reconciliation_id",
+        fail_read,
+    )
+    expected = GatewayDeliveryStatus(
+        GatewayDeliveryState.RETRYABLE,
+        error_code="reconciliation_unavailable",
+    )
+
+    assert (
+        reconcile_now(
+            plugin_id="fixture.delivery",
+            reconciliation_id="consultation-retry",
+        )
+        == expected
+    )
+    assert (
+        await reconcile(
+            plugin_id="fixture.delivery",
+            reconciliation_id="consultation-retry",
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_binding_revocation_cancels_prepared_pending_before_restart_recovery():
+    bound, binding, store, adapter = _delivery_fixture()
+    assert await bound.prepare_once(
+        reconciliation_id="consultation-stop",
+        delivery_key="final",
+        content="safe answer",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    revoke_gateway_dispatch_binding(binding)
+
+    with pytest.raises(CoordinatorRouteError, match="Unknown"):
+        await bound.send_prepared_once(reconciliation_id="consultation-stop")
+    assert await reconcile(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-stop",
+    ) == GatewayDeliveryStatus(
+        GatewayDeliveryState.FAILED,
+        error_code="cancelled",
+    )
+    counts = await recover_pending(_recovery_runner(store, adapter))
+    assert counts == {"pending": 0, "delivered": 0, "failed": 0, "uncertain": 0}
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_bound_cancel_prepared_once_is_terminal_idempotent_and_transport_free():
+    bound, _binding, _store, adapter = _delivery_fixture()
+    assert await bound.prepare_once(
+        reconciliation_id="consultation-state-write-failed",
+        delivery_key="final",
+        content="safe answer",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    cancelled = bound.cancel_prepared_once(
+        reconciliation_id="consultation-state-write-failed"
+    )
+    assert cancelled == GatewayDeliveryStatus(
+        GatewayDeliveryState.FAILED,
+        error_code="cancelled",
+    )
+    assert bound.cancel_prepared_once(
+        reconciliation_id="consultation-state-write-failed"
+    ) == GatewayDeliveryStatus(
+        GatewayDeliveryState.FAILED,
+        error_code="cancelled",
+    )
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_phase_prepared_pending_is_the_only_restart_resumable_state():
+    _bound, _binding, store, adapter = _delivery_fixture()
+    common: _DeliveryCall = {
+        "runner": _recovery_runner(store, adapter),
+        "plugin_id": "fixture.delivery",
+        "binding_handle": "private-binding-handle",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": store.entry.origin,
+    }
+    await prepare_once(
+        **common,
+        reconciliation_id="consultation-pending",
+        delivery_key="final",
+        content="safe answer",
+    )
+
+    counts = await recover_pending(_recovery_runner(store, adapter))
+
+    assert counts == {"pending": 1, "delivered": 1, "failed": 0, "uncertain": 0}
+    assert len(adapter.calls) == 1
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-pending"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+    second = await recover_pending(_recovery_runner(store, adapter))
+    assert second == {"pending": 0, "delivered": 0, "failed": 0, "uncertain": 0}
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_maps_claimed_uncertain_and_failed_reasons_without_secrets():
+    _bound, _binding, store, adapter = _delivery_fixture()
+    common: _DeliveryCall = {
+        "runner": _recovery_runner(store, adapter),
+        "plugin_id": "fixture.delivery",
+        "binding_handle": "private-binding-handle",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": store.entry.origin,
+    }
+    await prepare_once(
+        **common,
+        reconciliation_id="consultation-claimed",
+        delivery_key="claimed-final",
+        content="secret claimed answer",
+    )
+    claim = ledger.claim_for_send(
+        plugin_id="fixture.delivery",
+        binding_handle="private-binding-handle",
+        delivery_key="claimed-final",
+    )
+    assert claim is not None
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-claimed"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+    ledger.recover_after_restart()
+    uncertain = await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-claimed"
+    )
+    assert uncertain == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERY_UNCERTAIN)
+
+    await prepare_once(
+        **common,
+        reconciliation_id="consultation-cancelled",
+        delivery_key="cancelled-final",
+        content="secret cancelled answer",
+    )
+    cancelled_record = ledger.get_delivery_by_reconciliation_id(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-cancelled",
+    )
+    assert cancelled_record is not None
+    assert isinstance(cancelled_record.recovery_context_digest, str)
+    assert ledger.cancel_pending_delivery(
+        delivery_id=cancelled_record.delivery_id,
+        plugin_id=cancelled_record.plugin_id,
+        binding_digest=cancelled_record.binding_digest,
+        recovery_context_digest=cancelled_record.recovery_context_digest,
+        reason="delivery_cancelled",
+    )
+    cancelled = await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-cancelled"
+    )
+    assert cancelled == GatewayDeliveryStatus(
+        GatewayDeliveryState.FAILED,
+        error_code="cancelled",
+    )
+    serialized = repr((uncertain, cancelled))
+    assert "secret" not in serialized
+    assert "private-binding-handle" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_prepared_binding_mismatch_never_claims_or_sends():
+    _bound, _binding, store, adapter = _delivery_fixture()
+    common: _DeliveryContext = {
+        "runner": _recovery_runner(store, adapter),
+        "plugin_id": "fixture.delivery",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": store.entry.origin,
+    }
+    await prepare_once(
+        **common,
+        binding_handle="original-private-binding",
+        reconciliation_id="consultation-binding",
+        delivery_key="final",
+        content="safe answer",
+    )
+
+    result = await send_prepared_once(
+        **common,
+        binding_handle="different-private-binding",
+        reconciliation_id="consultation-binding",
+    )
+
+    assert result == GatewayDeliveryStatus(
+        GatewayDeliveryState.FAILED,
+        error_code="binding_mismatch",
+    )
+    assert adapter.calls == []
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-binding"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_prepared_send_has_one_transport_attempt():
+    _bound, _binding, store, adapter = _delivery_fixture()
+    common: _DeliveryCall = {
+        "runner": _recovery_runner(store, adapter),
+        "plugin_id": "fixture.delivery",
+        "binding_handle": "private-binding-handle",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": store.entry.origin,
+    }
+    await prepare_once(
+        **common,
+        reconciliation_id="consultation-concurrent",
+        delivery_key="final",
+        content="safe answer",
+    )
+
+    results = await asyncio.gather(
+        send_prepared_once(**common, reconciliation_id="consultation-concurrent"),
+        send_prepared_once(**common, reconciliation_id="consultation-concurrent"),
+    )
+
+    assert len(adapter.calls) == 1
+    assert {result.state for result in results} <= {
+        GatewayDeliveryState.SEND_CLAIMED,
+        GatewayDeliveryState.DELIVERED,
+    }
+    assert await reconcile(
+        plugin_id="fixture.delivery", reconciliation_id="consultation-concurrent"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prepared_send_is_never_resumed_or_sent_later():
+    started = asyncio.Event()
+
+    class BlockingAdapter(Adapter):
+        async def send_once(
+            self, chat_id, content, reply_to=None, metadata=None
+        ) -> SendOnceResult:
+            self.calls.append((chat_id, content, reply_to, metadata))
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    adapter = BlockingAdapter()
+    _bound, _binding, store, _adapter = _delivery_fixture(adapter)
+    common: _DeliveryCall = {
+        "runner": _recovery_runner(store, adapter),
+        "plugin_id": "fixture.delivery",
+        "binding_handle": "private-binding-handle",
+        "binding_expires_at": time.time() + 60,
+        "session_id": store.entry.session_id,
+        "session_key": store.entry.session_key,
+        "source": store.entry.origin,
+    }
+    await prepare_once(
+        **common,
+        reconciliation_id="consultation-cancel-active",
+        delivery_key="final",
+        content="safe answer",
+    )
+    task = asyncio.create_task(
+        send_prepared_once(
+            **common,
+            reconciliation_id="consultation-cancel-active",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(adapter.calls) == 1
+    assert await reconcile(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-cancel-active",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+
+    counts = await recover_pending(_recovery_runner(store, adapter))
+    assert counts == {"pending": 0, "delivered": 0, "failed": 0, "uncertain": 0}
+    assert len(adapter.calls) == 1
+    assert await reconcile(
+        plugin_id="fixture.delivery",
+        reconciliation_id="consultation-cancel-active",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERY_UNCERTAIN)
 
 
 @pytest.mark.asyncio

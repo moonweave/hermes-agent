@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from types import SimpleNamespace
 
@@ -11,6 +12,8 @@ from agent.route_capability import (
     CoordinatorRole,
     CoordinatorRoleRequest,
     CoordinatorService,
+    GatewayDeliveryState,
+    GatewayDeliveryStatus,
     GatewayDeliveryResult,
     GatewayDeliveryService,
     GatewayTaskService,
@@ -29,7 +32,15 @@ def _reset_registry():
 
 
 def _binding(
-    *, parent=None, parent_resolver=None, schedule=None, delivery=None, validity=None
+    *,
+    parent=None,
+    parent_resolver=None,
+    schedule=None,
+    delivery=None,
+    delivery_prepare=None,
+    delivery_send_prepared=None,
+    delivery_cancel_prepared=None,
+    validity=None,
 ):
     if parent is None and parent_resolver is None:
         parent = SimpleNamespace(
@@ -47,6 +58,9 @@ def _binding(
         schedule=schedule or (lambda _factory, _name, _binding: "task-1"),
         validity_resolver=validity or (lambda: True),
         delivery=delivery,
+        delivery_prepare=delivery_prepare,
+        delivery_send_prepared=delivery_send_prepared,
+        delivery_cancel_prepared=delivery_cancel_prepared,
     )
 
 
@@ -210,6 +224,139 @@ async def test_bound_delivery_rechecks_session_liveness_before_callback():
     with pytest.raises(CoordinatorRouteError, match="no longer live"):
         await bound.deliver_once(delivery_key="final", content="answer")
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_phase_delivery_is_bound_and_revocation_suppresses_send():
+    calls = []
+    cancellations = []
+
+    async def prepare(plugin_id, handle, expires_at, reconciliation_id, key, content):
+        calls.append((
+            "prepare",
+            plugin_id,
+            handle,
+            expires_at,
+            reconciliation_id,
+            key,
+            content,
+        ))
+        return GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    async def send(plugin_id, handle, expires_at, reconciliation_id):
+        calls.append(("send", plugin_id, handle, expires_at, reconciliation_id))
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.DELIVERED,
+            transport_attempted=True,
+        )
+
+    binding = _binding(
+        delivery_prepare=prepare,
+        delivery_send_prepared=send,
+        delivery_cancel_prepared=lambda plugin, handle, reconciliation_id: (
+            cancellations.append((plugin, handle, reconciliation_id))
+        ),
+    )
+    bound = GatewayDeliveryService(
+        "fixture", authorization_resolver=lambda: True
+    ).for_gateway_binding(binding)
+    activate_gateway_dispatch_binding(binding)
+
+    assert await bound.prepare_once(
+        reconciliation_id="consultation-1",
+        delivery_key="final",
+        content="safe answer",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+    assert calls[0][0] == "prepare"
+
+    revoke_gateway_dispatch_binding(binding)
+    with pytest.raises(CoordinatorRouteError, match="Unknown"):
+        await bound.send_prepared_once(reconciliation_id="consultation-1")
+    assert [call[0] for call in calls] == ["prepare"]
+    assert len(cancellations) == 1
+    assert cancellations[0][0] == "fixture"
+    assert cancellations[0][2] == "consultation-1"
+
+
+@pytest.mark.asyncio
+async def test_unbound_reconcile_is_plugin_scoped_and_rechecks_live_grant():
+    authorized = [True]
+    calls = []
+
+    async def reconcile(plugin_id, reconciliation_id):
+        calls.append((plugin_id, reconciliation_id))
+        return GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+
+    service = GatewayDeliveryService(
+        "fixture",
+        authorization_resolver=lambda: authorized[0],
+        reconciliation=reconcile,
+    )
+    assert await service.reconcile(
+        reconciliation_id="consultation-1"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+    assert calls == [("fixture", "consultation-1")]
+
+    authorized[0] = False
+    with pytest.raises(PermissionError, match="not granted"):
+        await service.reconcile(reconciliation_id="consultation-1")
+    assert len(calls) == 1
+
+
+def test_unbound_reconcile_now_is_sync_plugin_scoped_and_rechecks_live_grant():
+    authorized = [True]
+    calls = []
+
+    def reconcile_now(plugin_id, reconciliation_id):
+        calls.append((plugin_id, reconciliation_id))
+        return GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    service = GatewayDeliveryService(
+        "fixture",
+        authorization_resolver=lambda: authorized[0],
+        reconciliation_now=reconcile_now,
+    )
+    assert service.reconcile_now(
+        reconciliation_id="consultation-sync"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+    assert calls == [("fixture", "consultation-sync")]
+
+    authorized[0] = False
+    with pytest.raises(PermissionError, match="not granted"):
+        service.reconcile_now(reconciliation_id="consultation-sync")
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prepare_invokes_host_pending_cancellation():
+    cancellations = []
+
+    async def prepare(*_args):
+        raise asyncio.CancelledError
+
+    async def send(*_args):
+        return GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+
+    binding = _binding(
+        delivery_prepare=prepare,
+        delivery_send_prepared=send,
+        delivery_cancel_prepared=lambda plugin, handle, reconciliation_id: (
+            cancellations.append((plugin, handle, reconciliation_id))
+        ),
+    )
+    bound = GatewayDeliveryService(
+        "fixture", authorization_resolver=lambda: True
+    ).for_gateway_binding(binding)
+    activate_gateway_dispatch_binding(binding)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bound.prepare_once(
+            reconciliation_id="consultation-cancelled-prepare",
+            delivery_key="final",
+            content="safe answer",
+        )
+    assert len(cancellations) == 1
+    assert cancellations[0][2] == "consultation-cancelled-prepare"
 
 
 def test_gateway_bound_coordinator_launches_strict_toolless_leaf(monkeypatch):

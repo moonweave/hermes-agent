@@ -17,7 +17,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from agent.route_capability import GatewayDeliveryResult
+from agent.route_capability import (
+    GatewayDeliveryResult,
+    GatewayDeliveryState,
+    GatewayDeliveryStatus,
+)
 from gateway.platforms.base import SendOnceOutcome, SendOnceResult
 from gateway.session import Platform
 
@@ -496,6 +500,439 @@ def _existing_result(record: Any) -> GatewayDeliveryResult:
         transport_attempted=False,
         delivery_id=str(getattr(record, "delivery_id", "") or "") or None,
         error_code="duplicate_delivery",
+    )
+
+
+def _record_status(record: Any) -> GatewayDeliveryStatus:
+    if record is None:
+        return GatewayDeliveryStatus(GatewayDeliveryState.NOT_RESERVED)
+    try:
+        state = GatewayDeliveryState(
+            str(getattr(getattr(record, "state", None), "value", "FAILED"))
+        )
+    except ValueError:
+        state = GatewayDeliveryState.FAILED
+    error_code = None
+    if state is GatewayDeliveryState.FAILED:
+        error_code = (
+            "cancelled"
+            if getattr(record, "last_error", None)
+            in {"cancelled", "delivery_cancelled", "binding_revoked"}
+            else "blocked"
+        )
+    return GatewayDeliveryStatus(state, error_code=error_code)
+
+
+def reconcile_now(*, plugin_id: str, reconciliation_id: str) -> GatewayDeliveryStatus:
+    """Synchronously read plugin-scoped ledger state without transport work."""
+    from gateway import plugin_delivery_ledger as ledger
+
+    try:
+        record = ledger.get_delivery_by_reconciliation_id(
+            plugin_id=plugin_id,
+            reconciliation_id=reconciliation_id,
+        )
+    except Exception:
+        logger.warning("Gateway delivery reconciliation failed")
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.RETRYABLE,
+            error_code="reconciliation_unavailable",
+        )
+    return _record_status(record)
+
+
+async def reconcile(*, plugin_id: str, reconciliation_id: str) -> GatewayDeliveryStatus:
+    """Async wrapper over the same secret-free plugin-scoped ledger read."""
+    return await asyncio.to_thread(
+        reconcile_now,
+        plugin_id=plugin_id,
+        reconciliation_id=reconciliation_id,
+    )
+
+
+def _live_delivery_context(
+    runner: Any,
+    *,
+    binding_handle: str,
+    binding_expires_at: float,
+    session_id: str,
+    session_key: str,
+    source: Any,
+) -> tuple[Any, Any, str, str]:
+    if binding_expires_at <= time.time():
+        raise ValueError("binding_expired")
+    if getattr(source, "platform", None) != Platform.TELEGRAM:
+        raise ValueError("unsupported_platform")
+    entry = runner.session_store.lookup_by_session_key(session_key)
+    if (
+        entry is None
+        or str(getattr(entry, "session_id", "") or "") != session_id
+        or getattr(entry, "origin", None) is None
+        or not _same_origin(entry.origin, source)
+    ):
+        raise ValueError("session_not_live")
+    adapter = _adapter_for_delivery_source(runner, source)
+    if adapter is None:
+        raise ValueError("adapter_unavailable")
+    binding_digest = _binding_digest(binding_handle)
+    transport_owner_digest = _transport_owner_digest(
+        binding_digest,
+        platform=source.platform,
+        adapter=adapter,
+    )
+    recovery_context_digest = _recovery_context_digest(
+        binding_digest,
+        session_id=session_id,
+        session_key=session_key,
+        origin=entry.origin,
+        transport_owner_digest=transport_owner_digest,
+    )
+    return entry, adapter, binding_digest, recovery_context_digest
+
+
+async def prepare_once(
+    runner: Any,
+    *,
+    plugin_id: str,
+    binding_handle: str,
+    binding_expires_at: float,
+    session_id: str,
+    session_key: str,
+    source: Any,
+    reconciliation_id: str,
+    delivery_key: str,
+    content: str,
+) -> GatewayDeliveryStatus:
+    """Durably reserve a sanitized final without claiming adapter transport."""
+    from gateway import plugin_delivery_ledger as ledger
+
+    digest: str | None = None
+    try:
+        _entry, _adapter, digest, recovery_context_digest = _live_delivery_context(
+            runner,
+            binding_handle=binding_handle,
+            binding_expires_at=binding_expires_at,
+            session_id=session_id,
+            session_key=session_key,
+            source=source,
+        )
+        sanitized = ledger.sanitize_delivery_content(content).text
+        if not _persist_resolver(
+            runner.session_store,
+            session_key=session_key,
+            binding_digest=digest,
+            recovery_context_digest=recovery_context_digest,
+            transport_owner_digest=_transport_owner_digest(
+                digest,
+                platform=source.platform,
+                adapter=_adapter,
+            ),
+            expires_at=binding_expires_at,
+        ):
+            return GatewayDeliveryStatus(
+                GatewayDeliveryState.FAILED,
+                error_code="resolver_persist_failed",
+            )
+        reserve_task = asyncio.create_task(
+            asyncio.to_thread(
+                ledger.reserve_delivery,
+                plugin_id=plugin_id,
+                binding_handle=binding_handle,
+                delivery_key=delivery_key,
+                sanitized_content=sanitized,
+                recovery_context_digest=recovery_context_digest,
+                reconciliation_id=reconciliation_id,
+            )
+        )
+        try:
+            record = await asyncio.shield(reserve_task)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(reserve_task)
+            except Exception:
+                if digest is not None:
+                    _cleanup_resolver(
+                        runner.session_store,
+                        session_key=session_key,
+                        binding_digest=digest,
+                    )
+            raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        if digest is not None:
+            _cleanup_resolver(
+                runner.session_store,
+                session_key=session_key,
+                binding_digest=digest,
+            )
+        logger.warning("Gateway delivery preparation failed")
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.FAILED,
+            error_code="prepare_failed",
+        )
+    status = _record_status(record)
+    if status.state not in {
+        GatewayDeliveryState.PENDING,
+        GatewayDeliveryState.SEND_CLAIMED,
+    }:
+        _cleanup_resolver(
+            runner.session_store,
+            session_key=session_key,
+            binding_digest=digest,
+        )
+    return status
+
+
+async def _send_prepared_claim(
+    runner: Any, *, ledger: Any, adapter: Any, source: Any, claim: Any
+) -> GatewayDeliveryStatus:
+    try:
+        current_adapter = _adapter_for_delivery_source(runner, source)
+        if current_adapter is not adapter:
+            transport: Any = None
+        else:
+            metadata = runner._thread_metadata_for_target(
+                source.platform,
+                source.chat_id,
+                source.thread_id,
+                chat_type=source.chat_type,
+                reply_to_message_id=None,
+                adapter=adapter,
+            )
+            transport = await adapter.send_once(
+                str(source.chat_id),
+                claim.sanitized_content,
+                reply_to=None,
+                metadata=metadata,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        transport = _TRANSPORT_RAISED
+
+    state = GatewayDeliveryState.FAILED
+    error_code = "blocked"
+    try:
+        if transport is _TRANSPORT_RAISED:
+            state = GatewayDeliveryState.DELIVERY_UNCERTAIN
+            error_code = "transport_exception"
+            marked = await asyncio.to_thread(
+                ledger.mark_uncertain,
+                claim.delivery_id,
+                claim.claim_token,
+                error=error_code,
+            )
+        elif transport is None:
+            marked = await asyncio.to_thread(
+                ledger.mark_failed,
+                claim.delivery_id,
+                claim.claim_token,
+                error="adapter_unavailable",
+            )
+        elif (
+            isinstance(transport, SendOnceResult)
+            and transport.outcome is SendOnceOutcome.DELIVERED
+        ):
+            state = GatewayDeliveryState.DELIVERED
+            error_code = None
+            marked = await asyncio.to_thread(
+                ledger.mark_delivered,
+                claim.delivery_id,
+                claim.claim_token,
+                receipt_id=transport.message_id,
+            )
+        elif (
+            isinstance(transport, SendOnceResult)
+            and transport.outcome is SendOnceOutcome.DELIVERY_UNCERTAIN
+        ):
+            state = GatewayDeliveryState.DELIVERY_UNCERTAIN
+            error_code = "transport_uncertain"
+            marked = await asyncio.to_thread(
+                ledger.mark_uncertain,
+                claim.delivery_id,
+                claim.claim_token,
+                error=error_code,
+            )
+        else:
+            marked = await asyncio.to_thread(
+                ledger.mark_failed,
+                claim.delivery_id,
+                claim.claim_token,
+                error="transport_failed",
+            )
+        if marked is not True:
+            state = GatewayDeliveryState.DELIVERY_UNCERTAIN
+            error_code = "terminal_update_failed"
+    except Exception:
+        state = GatewayDeliveryState.DELIVERY_UNCERTAIN
+        error_code = "terminal_update_failed"
+    return GatewayDeliveryStatus(
+        state,
+        transport_attempted=transport is not None,
+        error_code=error_code,
+    )
+
+
+async def send_prepared_once(
+    runner: Any,
+    *,
+    plugin_id: str,
+    binding_handle: str,
+    binding_expires_at: float,
+    session_id: str,
+    session_key: str,
+    source: Any,
+    reconciliation_id: str,
+) -> GatewayDeliveryStatus:
+    """Claim and send only the exact PENDING row prepared for this binding."""
+    from gateway import plugin_delivery_ledger as ledger
+
+    digest: str | None = None
+    claim: Any = None
+    cleanup_resolver = False
+    try:
+        _entry, adapter, digest, recovery_context_digest = _live_delivery_context(
+            runner,
+            binding_handle=binding_handle,
+            binding_expires_at=binding_expires_at,
+            session_id=session_id,
+            session_key=session_key,
+            source=source,
+        )
+        record = await asyncio.to_thread(
+            ledger.get_delivery_by_reconciliation_id,
+            plugin_id=plugin_id,
+            reconciliation_id=reconciliation_id,
+        )
+        if record is None:
+            return GatewayDeliveryStatus(GatewayDeliveryState.NOT_RESERVED)
+        if (
+            record.binding_digest != digest
+            or record.recovery_context_digest != recovery_context_digest
+        ):
+            return GatewayDeliveryStatus(
+                GatewayDeliveryState.FAILED,
+                error_code="binding_mismatch",
+            )
+        if str(record.state.value) != "PENDING":
+            status = _record_status(record)
+            cleanup_resolver = status.state in {
+                GatewayDeliveryState.DELIVERED,
+                GatewayDeliveryState.FAILED,
+                GatewayDeliveryState.DELIVERY_UNCERTAIN,
+            }
+            return status
+        claim_task = asyncio.create_task(
+            asyncio.to_thread(
+                ledger.claim_pending_delivery,
+                delivery_id=record.delivery_id,
+                plugin_id=plugin_id,
+                binding_digest=digest,
+                recovery_context_digest=recovery_context_digest,
+            )
+        )
+        try:
+            claim = await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            claim = await asyncio.shield(claim_task)
+            if claim is not None:
+                await _fail_claimed_record(ledger, claim, reason="delivery_cancelled")
+                cleanup_resolver = True
+            raise
+        if claim is None:
+            current = await asyncio.to_thread(ledger.get_delivery, record.delivery_id)
+            status = _record_status(current or record)
+            cleanup_resolver = status.state in {
+                GatewayDeliveryState.DELIVERED,
+                GatewayDeliveryState.FAILED,
+                GatewayDeliveryState.DELIVERY_UNCERTAIN,
+            }
+            return status
+        cleanup_resolver = True
+        status = await _send_prepared_claim(
+            runner,
+            ledger=ledger,
+            adapter=adapter,
+            source=source,
+            claim=claim,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Gateway prepared delivery failed")
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.FAILED,
+            error_code="send_failed",
+        )
+    finally:
+        if cleanup_resolver and digest is not None:
+            _cleanup_resolver(
+                runner.session_store,
+                session_key=session_key,
+                binding_digest=digest,
+            )
+    return status
+
+
+def cancel_prepared(
+    runner: Any,
+    *,
+    plugin_id: str,
+    binding_handle: str,
+    session_key: str,
+    reconciliation_id: str,
+) -> GatewayDeliveryStatus:
+    """Synchronously terminalize an exact PENDING row without transport."""
+    from gateway import plugin_delivery_ledger as ledger
+
+    binding_digest = _binding_digest(binding_handle)
+    try:
+        record = ledger.get_delivery_by_reconciliation_id(
+            plugin_id=plugin_id,
+            reconciliation_id=reconciliation_id,
+        )
+        if record is None:
+            return GatewayDeliveryStatus(GatewayDeliveryState.NOT_RESERVED)
+        if record.binding_digest != binding_digest or not isinstance(
+            record.recovery_context_digest, str
+        ):
+            return GatewayDeliveryStatus(
+                GatewayDeliveryState.RETRYABLE,
+                error_code="cancellation_unavailable",
+            )
+        existing = _record_status(record)
+        if existing.state is not GatewayDeliveryState.PENDING:
+            return existing
+        cancelled = ledger.cancel_pending_delivery(
+            delivery_id=record.delivery_id,
+            plugin_id=plugin_id,
+            binding_digest=binding_digest,
+            recovery_context_digest=record.recovery_context_digest,
+            reason="binding_revoked",
+        )
+    except Exception:
+        logger.warning("Gateway prepared delivery cancellation failed")
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.RETRYABLE,
+            error_code="cancellation_unavailable",
+        )
+    finally:
+        # A missing resolver also makes any surviving PENDING row fail closed
+        # during startup recovery if the ledger CAS itself could not complete.
+        _cleanup_resolver(
+            runner.session_store,
+            session_key=session_key,
+            binding_digest=binding_digest,
+        )
+    if cancelled:
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.FAILED,
+            error_code="cancelled",
+        )
+    return GatewayDeliveryStatus(
+        GatewayDeliveryState.RETRYABLE,
+        error_code="cancellation_unavailable",
     )
 
 

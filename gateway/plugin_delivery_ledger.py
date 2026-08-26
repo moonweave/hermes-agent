@@ -36,6 +36,7 @@ _MAX_DATABASE_BYTES = 64 * 1024 * 1024
 _MAX_CANONICAL_INPUT_BYTES = 200_000
 _MAX_CANONICALIZATION_PASSES = 8
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_RECONCILIATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _DELIVERY_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACCOUNT_VALUE_PART = r"[A-Za-z0-9*._-]*\d[A-Za-z0-9*._-]*"
@@ -187,6 +188,7 @@ class DeliveryRecord:
     binding_digest: str
     delivery_key_digest: str
     recovery_context_digest: str | None
+    reconciliation_digest: str | None
     state: DeliveryState
     sanitized_content: str | None
     created_at: float
@@ -208,6 +210,7 @@ class PendingDelivery:
     content: str
     binding_digest: str
     recovery_context_digest: str
+    reconciliation_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -584,6 +587,7 @@ def _memory_connection(image: bytes | None) -> sqlite3.Connection:
                 binding_digest TEXT NOT NULL,
                 delivery_key_digest TEXT NOT NULL,
                 recovery_context_digest TEXT,
+                reconciliation_digest TEXT,
                 content_digest TEXT NOT NULL,
                 sanitized_content TEXT,
                 state TEXT NOT NULL,
@@ -603,6 +607,16 @@ def _memory_connection(image: bytes | None) -> sqlite3.Connection:
             conn.execute(
                 "ALTER TABLE plugin_deliveries ADD COLUMN recovery_context_digest TEXT"
             )
+        if "reconciliation_digest" not in columns:
+            conn.execute(
+                "ALTER TABLE plugin_deliveries ADD COLUMN reconciliation_digest TEXT"
+            )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS
+                   plugin_deliveries_reconciliation_uq
+               ON plugin_deliveries(plugin_id, reconciliation_digest)
+               WHERE reconciliation_digest IS NOT NULL"""
+        )
         return conn
     except LedgerTrustError:
         if conn is not None:
@@ -807,6 +821,7 @@ def _row_to_record(row: sqlite3.Row) -> DeliveryRecord:
         binding_digest=row["binding_digest"],
         delivery_key_digest=row["delivery_key_digest"],
         recovery_context_digest=row["recovery_context_digest"],
+        reconciliation_digest=row["reconciliation_digest"],
         state=DeliveryState(row["state"]),
         sanitized_content=row["sanitized_content"],
         created_at=float(row["created_at"]),
@@ -823,6 +838,7 @@ def reserve_delivery(
     delivery_key: str,
     sanitized_content: str,
     recovery_context_digest: str | None = None,
+    reconciliation_id: str | None = None,
     now: float | None = None,
 ) -> DeliveryRecord:
     """Persist one logical final result without retaining capability material."""
@@ -835,38 +851,53 @@ def reserve_delivery(
         or not _SHA256_DIGEST_RE.fullmatch(recovery_context_digest)
     ):
         raise ValueError("invalid recovery_context_digest")
+    if reconciliation_id is not None and (
+        not isinstance(reconciliation_id, str)
+        or not _RECONCILIATION_ID_RE.fullmatch(reconciliation_id)
+    ):
+        raise ValueError("invalid reconciliation_id")
     content = _sanitize_text(sanitized_content, limit=100_000)
     if not content.strip():
         raise ValueError("sanitized_content must not be empty")
     timestamp = time.time() if now is None else float(now)
     binding_digest = _digest(binding_handle)
     key_digest = _digest(delivery_key)
+    reconciliation_digest = (
+        None if reconciliation_id is None else _digest(reconciliation_id)
+    )
     content_digest = _digest(content)
     delivery_id = _digest(f"{plugin_id}\0{binding_digest}\0{key_digest}")[:32]
 
     with _LOCK, _transaction(immediate=True) as conn:
-        conn.execute(
-            """INSERT INTO plugin_deliveries (
-                   delivery_id, plugin_id, binding_digest, delivery_key_digest,
-                   recovery_context_digest, content_digest, sanitized_content,
-                   state, created_at, updated_at, content_expires_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(plugin_id, binding_digest, delivery_key_digest)
-               DO NOTHING""",
-            (
-                delivery_id,
-                plugin_id,
-                binding_digest,
-                key_digest,
-                recovery_context_digest,
-                content_digest,
-                content,
-                DeliveryState.PENDING.value,
-                timestamp,
-                timestamp,
-                timestamp + CONTENT_RETENTION_SECONDS,
-            ),
-        )
+        try:
+            conn.execute(
+                """INSERT INTO plugin_deliveries (
+                       delivery_id, plugin_id, binding_digest, delivery_key_digest,
+                       recovery_context_digest, reconciliation_digest,
+                       content_digest, sanitized_content, state, created_at,
+                       updated_at, content_expires_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(plugin_id, binding_digest, delivery_key_digest)
+                   DO NOTHING""",
+                (
+                    delivery_id,
+                    plugin_id,
+                    binding_digest,
+                    key_digest,
+                    recovery_context_digest,
+                    reconciliation_digest,
+                    content_digest,
+                    content,
+                    DeliveryState.PENDING.value,
+                    timestamp,
+                    timestamp,
+                    timestamp + CONTENT_RETENTION_SECONDS,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DeliveryConflictError(
+                "reconciliation_id is already reserved for another delivery"
+            ) from exc
         row = conn.execute(
             """SELECT * FROM plugin_deliveries
                WHERE plugin_id=? AND binding_digest=? AND delivery_key_digest=?""",
@@ -881,6 +912,10 @@ def reserve_delivery(
         if row["recovery_context_digest"] != recovery_context_digest:
             raise DeliveryConflictError(
                 "logical delivery already reserved with different recovery context"
+            )
+        if row["reconciliation_digest"] != reconciliation_digest:
+            raise DeliveryConflictError(
+                "logical delivery already reserved with different reconciliation_id"
             )
         return _row_to_record(row)
 
@@ -1200,7 +1235,7 @@ def recover_after_restart(*, now: float | None = None) -> list[PendingDelivery]:
         )
         rows = conn.execute(
             """SELECT delivery_id, sanitized_content, binding_digest,
-                      recovery_context_digest
+                      recovery_context_digest, reconciliation_digest
                FROM plugin_deliveries
                WHERE state=? AND sanitized_content IS NOT NULL
                  AND recovery_context_digest IS NOT NULL
@@ -1213,6 +1248,7 @@ def recover_after_restart(*, now: float | None = None) -> list[PendingDelivery]:
                 content=row["sanitized_content"],
                 binding_digest=row["binding_digest"],
                 recovery_context_digest=row["recovery_context_digest"],
+                reconciliation_digest=row["reconciliation_digest"],
             )
             for row in rows
         ]
@@ -1222,6 +1258,26 @@ def get_delivery(delivery_id: str) -> DeliveryRecord | None:
     with _LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT * FROM plugin_deliveries WHERE delivery_id=?", (delivery_id,)
+        ).fetchone()
+        return None if row is None else _row_to_record(row)
+
+
+def get_delivery_by_reconciliation_id(
+    *, plugin_id: str, reconciliation_id: str
+) -> DeliveryRecord | None:
+    """Look up durable delivery state without persisting the reconciliation ID."""
+    if not isinstance(plugin_id, str) or not _PLUGIN_ID_RE.fullmatch(plugin_id):
+        raise ValueError("invalid plugin_id")
+    if not isinstance(reconciliation_id, str) or not _RECONCILIATION_ID_RE.fullmatch(
+        reconciliation_id
+    ):
+        raise ValueError("invalid reconciliation_id")
+    reconciliation_digest = _digest(reconciliation_id)
+    with _LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT * FROM plugin_deliveries
+               WHERE plugin_id=? AND reconciliation_digest=?""",
+            (plugin_id, reconciliation_digest),
         ).fetchone()
         return None if row is None else _row_to_record(row)
 

@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.route_capability import GatewayDeliveryResult, GatewayDispatchDecision
+from agent.route_capability import (
+    GatewayDeliveryResult,
+    GatewayDeliveryState,
+    GatewayDeliveryStatus,
+    GatewayDispatchDecision,
+)
 from hermes_cli import plugins as plugins_mod
 from hermes_cli.plugins import (
     LoadedPlugin,
@@ -126,6 +131,32 @@ async def test_gateway_delivery_facade_binds_only_host_callback(monkeypatch):
         captured["callback"] = (plugin, handle, expires_at, delivery_key, content)
         return GatewayDeliveryResult("DELIVERED", True, "delivery-1")
 
+    async def prepare(plugin, handle, expires_at, reconciliation_id, key, content):
+        captured["prepare"] = (
+            plugin,
+            handle,
+            expires_at,
+            reconciliation_id,
+            key,
+            content,
+        )
+        return GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+
+    async def send_prepared(plugin, handle, expires_at, reconciliation_id):
+        captured["send_prepared"] = (
+            plugin,
+            handle,
+            expires_at,
+            reconciliation_id,
+        )
+        return GatewayDeliveryStatus(
+            GatewayDeliveryState.DELIVERED,
+            transport_attempted=True,
+        )
+
+    def cancel_prepared(plugin, handle, reconciliation_id):
+        captured["cancel_prepared"] = (plugin, handle, reconciliation_id)
+
     plugin_context.register_hook("gateway_pre_agent_dispatch", dispatch)
     decision = manager.invoke_gateway_pre_agent_dispatch(
         message="sensitive portfolio question",
@@ -137,6 +168,9 @@ async def test_gateway_delivery_facade_binds_only_host_callback(monkeypatch):
         schedule=lambda *_: "task-1",
         binding_validity=lambda: True,
         delivery=delivery,
+        delivery_prepare=prepare,
+        delivery_send_prepared=send_prepared,
+        delivery_cancel_prepared=cancel_prepared,
     )
 
     result = await captured["delivery"].deliver_once(
@@ -150,7 +184,97 @@ async def test_gateway_delivery_facade_binds_only_host_callback(monkeypatch):
     assert callback[3:] == ("final", "safe answer")
     assert isinstance(callback[1], str) and len(callback[1]) == 64
     assert isinstance(callback[2], float)
+    assert await captured["delivery"].prepare_once(
+        reconciliation_id="consultation-1",
+        delivery_key="final-v2",
+        content="safe answer v2",
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.PENDING)
+    assert await captured["delivery"].send_prepared_once(
+        reconciliation_id="consultation-1"
+    ) == GatewayDeliveryStatus(
+        GatewayDeliveryState.DELIVERED,
+        transport_attempted=True,
+    )
+    assert captured["prepare"][0] == plugin_id
+    assert captured["prepare"][3:] == (
+        "consultation-1",
+        "final-v2",
+        "safe answer v2",
+    )
+    assert captured["send_prepared"][0] == plugin_id
+    assert captured["send_prepared"][3] == "consultation-1"
     assert not any("adapter" in name for name in vars(captured["delivery"]))
+
+
+@pytest.mark.asyncio
+async def test_gateway_delivery_reconcile_survives_without_old_binding_and_rechecks_grant(
+    monkeypatch,
+):
+    manifest = PluginManifest(
+        name="fixture-delivery",
+        key="fixture-delivery",
+        capabilities=["gateway.message_delivery"],
+    )
+    manager = PluginManager()
+    context = PluginContext(manifest, manager)
+    granted = [True]
+    calls = []
+    monkeypatch.setattr(
+        plugins_mod,
+        "plugin_capability_granted",
+        lambda *_: granted[0],
+    )
+
+    async def reconcile(*, plugin_id, reconciliation_id):
+        calls.append((plugin_id, reconciliation_id))
+        return GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+
+    monkeypatch.setattr("gateway.plugin_delivery_service.reconcile", reconcile)
+    service = context.gateway_delivery
+    assert await service.reconcile(
+        reconciliation_id="consultation-after-restart"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.DELIVERED)
+    assert calls == [("fixture-delivery", "consultation-after-restart")]
+
+    granted[0] = False
+    with pytest.raises(PermissionError, match="not granted"):
+        await service.reconcile(reconciliation_id="consultation-after-restart")
+    assert len(calls) == 1
+
+
+def test_gateway_delivery_reconcile_now_is_safe_in_synchronous_hook(monkeypatch):
+    manifest = PluginManifest(
+        name="fixture-delivery",
+        key="fixture-delivery",
+        capabilities=["gateway.message_delivery"],
+    )
+    context = PluginContext(manifest, PluginManager())
+    granted = [True]
+    calls = []
+    monkeypatch.setattr(
+        plugins_mod,
+        "plugin_capability_granted",
+        lambda *_: granted[0],
+    )
+
+    def reconcile_now(*, plugin_id, reconciliation_id):
+        calls.append((plugin_id, reconciliation_id))
+        return GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+
+    monkeypatch.setattr(
+        "gateway.plugin_delivery_service.reconcile_now",
+        reconcile_now,
+    )
+    service = context.gateway_delivery
+    assert service.reconcile_now(
+        reconciliation_id="consultation-register-hook"
+    ) == GatewayDeliveryStatus(GatewayDeliveryState.SEND_CLAIMED)
+    assert calls == [("fixture-delivery", "consultation-register-hook")]
+
+    granted[0] = False
+    with pytest.raises(PermissionError, match="not granted"):
+        service.reconcile_now(reconciliation_id="consultation-register-hook")
+    assert len(calls) == 1
 
 
 def test_dispatch_error_and_malformed_result_allow(monkeypatch, caplog):

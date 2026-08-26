@@ -11824,6 +11824,10 @@ _INTERNAL_ORCHESTRATOR_DEPENDENCY_RE = re.compile(
     r"(?:url|handoff|artifact|evidence|result|output)\b",
     re.IGNORECASE,
 )
+_INTERNAL_ORCHESTRATOR_HOLD_RE = re.compile(
+    r"\b(?:held|blocked)\s+by\s+cto\d+\b",
+    re.IGNORECASE,
+)
 _HUMAN_INPUT_REASON_RE = re.compile(
     r"\b(?:human|owner|user)\b|사용자|사람|승인",
     re.IGNORECASE,
@@ -12748,7 +12752,10 @@ def _operator_inbox_kind(block_kind: Optional[str], reason: str) -> str:
         or lowered.startswith(_NEEDS_WORK_REASON_PREFIX)
         or _REVIEW_HOLD_REASON_RE.match(lowered) is not None
         or (
-            _INTERNAL_ORCHESTRATOR_DEPENDENCY_RE.search(lowered) is not None
+            (
+                _INTERNAL_ORCHESTRATOR_DEPENDENCY_RE.search(lowered) is not None
+                or _INTERNAL_ORCHESTRATOR_HOLD_RE.search(lowered) is not None
+            )
             and _HUMAN_INPUT_REASON_RE.search(lowered) is None
         )
     ):

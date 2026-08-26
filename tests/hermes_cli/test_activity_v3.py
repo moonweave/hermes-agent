@@ -215,6 +215,18 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
                 "candidate runtime URL."
             ),
         )
+        held_by_orchestrator_task = kb.create_task(
+            conn, title="Seal reviewed candidate", assignee="vcm"
+        )
+        assert kb.block_task(
+            conn,
+            held_by_orchestrator_task,
+            kind="needs_input",
+            reason=(
+                "Held by cto1 until the candidate receives approved Security, "
+                "Performance, Web QA and Reviewer verdicts."
+            ),
+        )
         obsolete_task = kb.create_task(
             conn, title="Obsolete browser audit", assignee="webdesignqa"
         )
@@ -250,6 +262,7 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
         item["title"] for item in payload["items"] if item["kind"] == "agent_action"
     } == {
         "Repair failed browser assertions",
+        "Seal reviewed candidate",
         "Validate local candidate runtime",
     }
     owner = next(item for item in payload["items"] if item["kind"] == "needs_user")
@@ -261,6 +274,7 @@ def test_operator_inbox_separates_owner_actions_agent_repairs_and_recent_results
         owner_task,
         repair_task,
         orchestrator_task,
+        held_by_orchestrator_task,
         obsolete_task,
         completed_task,
         "/Users/person/private.env",
@@ -310,6 +324,13 @@ def test_operator_inbox_keeps_human_approval_visible_when_cto_is_mentioned():
         kb._operator_inbox_kind(
             "needs_input",
             "Awaiting user approval before cto1 publishes the release artifact.",
+        )
+        == "needs_user"
+    )
+    assert (
+        kb._operator_inbox_kind(
+            "needs_input",
+            "Held by cto1 until user approves the release artifact.",
         )
         == "needs_user"
     )

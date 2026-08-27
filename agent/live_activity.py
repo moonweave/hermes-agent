@@ -23,6 +23,15 @@ _ABSOLUTE_PATH_RE = re.compile(
     r"(?:[^\s`'\"<>]+/)*[^\s`'\"<>]+"
 )
 _BARE_URL_RE = re.compile(r"https?://[^\s<>)\]]+", re.IGNORECASE)
+_KANBAN_TASK_REF_RE = re.compile(r"\bt_[0-9a-f]{8,}\b", re.IGNORECASE)
+_RUN_REF_RE = re.compile(r"\b(run)\s+(?:id\s*)?#?\d+\b", re.IGNORECASE)
+_PID_REF_RE = re.compile(r"\b(PID)\s+(?:`\d{2,}`|\d{2,})(?!\w)", re.IGNORECASE)
+_SESSION_UUID_RE = re.compile(
+    r"\b(session)\s+(?:`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}`|[0-9a-f]{8}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?!\w)",
+    re.IGNORECASE,
+)
 _SPACE_RE = re.compile(r"\s+")
 
 
@@ -55,6 +64,10 @@ def sanitize_live_caption(text: object, *, max_chars: int = 160) -> str:
     value = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), value)
     value = _ABSOLUTE_PATH_RE.sub("[로컬 경로]", value)
     value = _BARE_URL_RE.sub("[웹 주소]", value)
+    value = _KANBAN_TASK_REF_RE.sub("[작업 참조]", value)
+    value = _RUN_REF_RE.sub(lambda match: f"{match.group(1)} [실행 참조]", value)
+    value = _PID_REF_RE.sub(lambda match: f"{match.group(1)} [프로세스 참조]", value)
+    value = _SESSION_UUID_RE.sub(lambda match: f"{match.group(1)} [세션 참조]", value)
     value = _SPACE_RE.sub(" ", value).strip()
     if _utf16_units(value) <= max_chars:
         return value

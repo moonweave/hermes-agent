@@ -93,6 +93,22 @@ def test_live_caption_sanitizer_honors_browser_length_after_ellipsis():
     assert len(emoji_rendered.encode("utf-16-le")) // 2 <= 160
 
 
+def test_live_caption_sanitizer_removes_internal_runtime_identifiers():
+    rendered = sanitize_live_caption(
+        "Task `t_81e629b1`, run #1174, PID `90054`, "
+        "session 123e4567-e89b-12d3-a456-426614174000 상태를 확인하고 있어요."
+    )
+
+    assert rendered == (
+        "Task `[작업 참조]`, run [실행 참조], PID [프로세스 참조], "
+        "session [세션 참조] 상태를 확인하고 있어요."
+    )
+    assert "t_81e629b1" not in rendered
+    assert "1174" not in rendered
+    assert "90054" not in rendered
+    assert "123e4567-e89b-12d3-a456-426614174000" not in rendered
+
+
 def test_session_caption_is_owner_scoped_and_export_omits_ephemeral_fields(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("open", source="desktop")

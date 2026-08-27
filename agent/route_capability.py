@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import base64
 import binascii
+import contextvars
 import enum
 import hashlib
 import hmac
@@ -18,10 +19,20 @@ import math
 import secrets
 import threading
 import time
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    TimeoutError as FutureTimeoutError,
+)
 from typing import Any, Awaitable, Callable, Mapping, Optional
+
+from tools.daemon_pool import DaemonThreadPoolExecutor
 
 
 _TEAM_MCP_HMAC_ENV = "KOSPI_TEAM_COORDINATOR_HMAC_KEY_B64"
+_SYNTHESIS_LAUNCH_EXECUTOR = DaemonThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="coordinator-synthesis-launch"
+)
 
 
 class CoordinatorRouteError(ValueError):
@@ -30,6 +41,10 @@ class CoordinatorRouteError(ValueError):
 
 class CoordinatorRoleTimeoutError(CoordinatorRouteError):
     """A coordinator role could not be launched before its deadline."""
+
+
+class CoordinatorSynthesisTimeoutError(CoordinatorRouteError):
+    """The coordinator synthesis child exceeded its launch deadline."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,6 +265,52 @@ class CoordinatorRoleCancelResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class CoordinatorSynthesisRequest:
+    goal: str
+    input_digest: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CoordinatorSynthesisHandle:
+    coordinator_id: str
+    synthesis_run_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class CoordinatorSynthesisTerminalState:
+    synthesis_handle: CoordinatorSynthesisHandle
+    state: str
+    completed: bool
+    timed_out: bool = False
+    diagnostic: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class CoordinatorSynthesisResult:
+    synthesis_handle: CoordinatorSynthesisHandle
+    state: str
+    ready: bool
+    summary: Optional[str] = None
+    structured_payload: Optional[Mapping[str, Any]] = None
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    error_classification: Optional[str] = None
+    error_message: Optional[str] = None
+    usage_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    tool_execution_summary: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    result_hash: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class CoordinatorSynthesisCancelResult:
+    synthesis_handle: CoordinatorSynthesisHandle
+    accepted: bool
+    already_terminal: bool = False
+    unsupported: bool = False
+    state: str = "UNKNOWN"
+
+
+@dataclasses.dataclass(frozen=True)
 class CoordinatorStatus:
     handle: CoordinatorHandle
     state: CoordinatorJobState
@@ -261,6 +322,13 @@ class _CoordinatorRecord:
     handle: CoordinatorHandle
     state: CoordinatorJobState = CoordinatorJobState.RESERVED
     role_handles: dict[str, Any] = dataclasses.field(default_factory=dict)
+    synthesis_digest: Optional[str] = None
+    synthesis_child_handle: Any = None
+    synthesis_launch_digest: Optional[str] = None
+    synthesis_launch_future: Optional[Future[Any]] = None
+    synthesis_launch_abandoned: Optional[threading.Event] = None
+    synthesis_launch_lifecycle: Any = None
+    synthesis_cancel_requested: bool = False
 
 
 class _CoordinatorRegistry:
@@ -277,6 +345,29 @@ _HANDLE_SECRET = secrets.token_bytes(32)
 _GATEWAY_BINDING_SECRET = secrets.token_bytes(32)
 _GATEWAY_BINDINGS_LOCK = threading.RLock()
 _GATEWAY_BINDINGS: dict[str, _GatewayDispatchRecord] = {}
+
+
+def _discard_abandoned_synthesis_launch(
+    future: Future[Any], lifecycle: Any, abandoned: threading.Event
+) -> None:
+    """Close an over-deadline prepared child before it can execute."""
+    if not abandoned.is_set() or future.cancelled():
+        return
+    try:
+        child_handle = future.result()
+    except Exception:
+        return
+    lifecycle._discard_prepared(child_handle)
+
+
+def _abandon_synthesis_launch(
+    future: Future[Any], lifecycle: Any, abandoned: threading.Event
+) -> None:
+    """Mark a launch abandoned without waiting and close raced completion."""
+    abandoned.set()
+    if future.cancel() or not future.done():
+        return
+    _discard_abandoned_synthesis_launch(future, lifecycle, abandoned)
 
 
 def issue_gateway_dispatch_binding(
@@ -1032,6 +1123,191 @@ class CoordinatorService:
             record.state = CoordinatorJobState.ROLES_RUNNING
             return self._public_role_handle(handle, request.role, role_handle)
 
+    def launch_synthesis(
+        self,
+        handle: CoordinatorHandle,
+        request: CoordinatorSynthesisRequest,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> CoordinatorSynthesisHandle:
+        """Launch the single tool-less synthesis child bound to a consultation."""
+        self._require_authorized()
+        parent, session_id, turn_id = self._current_binding(require_parent=True)
+        record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
+        self._require_route_allowed(handle.coordinator_route)
+        if (
+            not isinstance(request, CoordinatorSynthesisRequest)
+            or not isinstance(request.goal, str)
+            or not request.goal.strip()
+            or not _valid_sha256_digest(request.input_digest)
+        ):
+            raise CoordinatorRouteError("Malformed coordinator synthesis request.")
+        _validate_synthesis_timeout(timeout_seconds)
+        deadline = (
+            time.monotonic() + float(timeout_seconds)
+            if timeout_seconds is not None
+            else None
+        )
+
+        from agent.subagent_lifecycle import (
+            SubagentLaunchRequest,
+            SubagentLaunchTimeoutError,
+            SubagentLifecycleService,
+        )
+
+        launch_request = SubagentLaunchRequest(
+            goal=request.goal,
+            role="leaf",
+            model=None,
+            allowed_toolsets=(),
+            parent_session_id=session_id,
+            correlation_id=f"{handle.coordinator_id}:synthesis",
+            metadata={"coordinator_id": handle.coordinator_id},
+            timeout_seconds=timeout_seconds,
+            max_iterations=1,
+        )
+        while True:
+            with _REGISTRY.lock:
+                if record.synthesis_child_handle is not None:
+                    if not hmac.compare_digest(
+                        record.synthesis_digest or "", request.input_digest
+                    ):
+                        raise CoordinatorRouteError(
+                            "Coordinator synthesis input digest does not match."
+                        )
+                    return self._public_synthesis_handle(
+                        handle, record.synthesis_child_handle
+                    )
+
+                future = record.synthesis_launch_future
+                if future is not None and not hmac.compare_digest(
+                    record.synthesis_launch_digest or "", request.input_digest
+                ):
+                    raise CoordinatorRouteError(
+                        "Coordinator synthesis input digest does not match."
+                    )
+                if future is not None and future.done():
+                    try:
+                        future.result()
+                    except Exception:
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                        future = None
+                if future is None:
+                    lifecycle = SubagentLifecycleService(
+                        lambda: parent,
+                        authorization_resolver=self._authorization_resolver,
+                    )
+                    context = contextvars.copy_context()
+                    abandoned = threading.Event()
+                    future = _SYNTHESIS_LAUNCH_EXECUTOR.submit(
+                        context.run,
+                        lifecycle._prepare_strictly_toolless_launch,
+                        launch_request,
+                    )
+                    future.add_done_callback(
+                        lambda completed, lifecycle=lifecycle, abandoned=abandoned: (
+                            _discard_abandoned_synthesis_launch(
+                                completed, lifecycle, abandoned
+                            )
+                        )
+                    )
+                    record.synthesis_launch_digest = request.input_digest
+                    record.synthesis_launch_future = future
+                    record.synthesis_launch_abandoned = abandoned
+                    record.synthesis_launch_lifecycle = lifecycle
+
+            try:
+                remaining = (
+                    max(0.0, deadline - time.monotonic())
+                    if deadline is not None
+                    else None
+                )
+                child_handle = future.result(timeout=remaining)
+            except FutureTimeoutError as exc:
+                abandoned = None
+                lifecycle = None
+                with _REGISTRY.lock:
+                    if record.synthesis_launch_future is future:
+                        abandoned = record.synthesis_launch_abandoned
+                        lifecycle = record.synthesis_launch_lifecycle
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                if abandoned is not None and lifecycle is not None:
+                    _abandon_synthesis_launch(future, lifecycle, abandoned)
+                raise CoordinatorSynthesisTimeoutError(
+                    "Coordinator synthesis launch timed out."
+                ) from exc
+            except (CancelledError, SubagentLaunchTimeoutError) as exc:
+                with _REGISTRY.lock:
+                    if record.synthesis_launch_future is future:
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                raise CoordinatorSynthesisTimeoutError(
+                    "Coordinator synthesis launch timed out."
+                ) from exc
+            except Exception:
+                with _REGISTRY.lock:
+                    if record.synthesis_launch_future is future:
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                raise
+
+            deadline_abandoned = None
+            deadline_lifecycle = None
+            with _REGISTRY.lock:
+                abandoned = record.synthesis_launch_abandoned
+                if (
+                    record.synthesis_launch_future is future
+                    and abandoned is not None
+                    and not abandoned.is_set()
+                ):
+                    lifecycle = record.synthesis_launch_lifecycle
+                    if lifecycle is None:
+                        raise CoordinatorRouteError(
+                            "Coordinator synthesis launch state is unavailable."
+                        )
+                    if deadline is not None and time.monotonic() >= deadline:
+                        deadline_abandoned = abandoned
+                        deadline_lifecycle = lifecycle
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                    else:
+                        try:
+                            lifecycle._start_prepared(child_handle, request.goal)
+                        except Exception:
+                            lifecycle._discard_prepared(child_handle)
+                            record.synthesis_launch_future = None
+                            record.synthesis_launch_digest = None
+                            record.synthesis_launch_abandoned = None
+                            record.synthesis_launch_lifecycle = None
+                            raise
+                        record.synthesis_digest = request.input_digest
+                        record.synthesis_child_handle = child_handle
+                        record.synthesis_launch_future = None
+                        record.synthesis_launch_digest = None
+                        record.synthesis_launch_abandoned = None
+                        record.synthesis_launch_lifecycle = None
+                if record.synthesis_child_handle is child_handle:
+                    return self._public_synthesis_handle(handle, child_handle)
+            if deadline_abandoned is not None and deadline_lifecycle is not None:
+                _abandon_synthesis_launch(
+                    future, deadline_lifecycle, deadline_abandoned
+                )
+                raise CoordinatorSynthesisTimeoutError(
+                    "Coordinator synthesis launch timed out."
+                )
+
     def issue_team_mcp_binding_token(
         self,
         handle: CoordinatorHandle,
@@ -1158,6 +1434,88 @@ class CoordinatorService:
             state=result.state.value,
         )
 
+    def wait_synthesis(
+        self,
+        handle: CoordinatorHandle,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> CoordinatorSynthesisTerminalState:
+        lifecycle, child_handle, synthesis_handle, _record = self._synthesis_binding(
+            handle
+        )
+        terminal = lifecycle.wait(child_handle, timeout_seconds=timeout_seconds)
+        return CoordinatorSynthesisTerminalState(
+            synthesis_handle=synthesis_handle,
+            state=terminal.state.value,
+            completed=terminal.completed,
+            timed_out=terminal.timed_out,
+            diagnostic=terminal.diagnostic,
+        )
+
+    def synthesis_result(self, handle: CoordinatorHandle) -> CoordinatorSynthesisResult:
+        lifecycle, child_handle, synthesis_handle, _record = self._synthesis_binding(
+            handle
+        )
+        result = lifecycle.result(child_handle)
+        return CoordinatorSynthesisResult(
+            synthesis_handle=synthesis_handle,
+            state=result.terminal_state.value,
+            ready=result.ready,
+            summary=result.summary,
+            structured_payload=result.structured_payload,
+            started_at=getattr(result, "started_at", None),
+            completed_at=getattr(result, "completed_at", None),
+            error_classification=result.error_classification,
+            error_message=result.error_message,
+            usage_metadata=getattr(result, "usage_metadata", {}),
+            tool_execution_summary=getattr(result, "tool_execution_summary", {}),
+            result_hash=result.result_hash,
+        )
+
+    def cancel_synthesis(
+        self,
+        handle: CoordinatorHandle,
+        *,
+        reason: str,
+    ) -> CoordinatorSynthesisCancelResult:
+        lifecycle, child_handle, synthesis_handle, record = self._synthesis_binding(
+            handle
+        )
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise CoordinatorRouteError(
+                "cancel reason must be a non-empty string of at most 500 characters."
+            )
+        with _REGISTRY.lock:
+            if record.synthesis_cancel_requested:
+                status = lifecycle.status(child_handle)
+                terminal = status.state.value in {
+                    "SUCCEEDED",
+                    "FAILED",
+                    "INTERRUPTED",
+                    "CANCELLED",
+                    "UNKNOWN",
+                }
+                return CoordinatorSynthesisCancelResult(
+                    synthesis_handle=synthesis_handle,
+                    accepted=False,
+                    already_terminal=terminal,
+                    state=status.state.value,
+                )
+            record.synthesis_cancel_requested = True
+        try:
+            result = lifecycle.cancel(child_handle, reason=reason)
+        except Exception:
+            with _REGISTRY.lock:
+                record.synthesis_cancel_requested = False
+            raise
+        return CoordinatorSynthesisCancelResult(
+            synthesis_handle=synthesis_handle,
+            accepted=result.accepted,
+            already_terminal=result.already_terminal,
+            unsupported=result.unsupported,
+            state=result.state.value,
+        )
+
     def status(self, handle: CoordinatorHandle) -> CoordinatorStatus:
         self._require_authorized()
         _parent, session_id, turn_id = self._current_binding()
@@ -1189,6 +1547,26 @@ class CoordinatorService:
             self._public_role_handle(handle, role, child_handle),
         )
 
+    def _synthesis_binding(self, handle: CoordinatorHandle):
+        self._require_authorized()
+        parent, session_id, turn_id = self._current_binding(require_parent=True)
+        record = self._record_for_handle(handle, session_id=session_id, turn_id=turn_id)
+        self._require_route_allowed(handle.coordinator_route)
+        with _REGISTRY.lock:
+            child_handle = record.synthesis_child_handle
+        if child_handle is None:
+            raise CoordinatorRouteError("Coordinator synthesis has not been launched.")
+        from agent.subagent_lifecycle import SubagentLifecycleService
+
+        return (
+            SubagentLifecycleService(
+                lambda: parent, authorization_resolver=self._authorization_resolver
+            ),
+            child_handle,
+            self._public_synthesis_handle(handle, child_handle),
+            record,
+        )
+
     @staticmethod
     def _public_role_handle(
         handle: CoordinatorHandle, role: CoordinatorRole, child_handle: Any
@@ -1197,6 +1575,15 @@ class CoordinatorService:
             coordinator_id=handle.coordinator_id,
             role=role,
             role_run_id=str(child_handle.subagent_id),
+        )
+
+    @staticmethod
+    def _public_synthesis_handle(
+        handle: CoordinatorHandle, child_handle: Any
+    ) -> CoordinatorSynthesisHandle:
+        return CoordinatorSynthesisHandle(
+            coordinator_id=handle.coordinator_id,
+            synthesis_run_id=str(child_handle.subagent_id),
         )
 
     def _record_for_handle(
@@ -1417,6 +1804,9 @@ class GatewayBoundCoordinatorService:
     def launch_role(self, *args: Any, **kwargs: Any):
         return self._service.launch_role(*args, **kwargs)
 
+    def launch_synthesis(self, *args: Any, **kwargs: Any):
+        return self._service.launch_synthesis(*args, **kwargs)
+
     def role_status(self, *args: Any, **kwargs: Any):
         return self._service.role_status(*args, **kwargs)
 
@@ -1428,6 +1818,15 @@ class GatewayBoundCoordinatorService:
 
     def cancel_role(self, *args: Any, **kwargs: Any):
         return self._service.cancel_role(*args, **kwargs)
+
+    def wait_synthesis(self, *args: Any, **kwargs: Any):
+        return self._service.wait_synthesis(*args, **kwargs)
+
+    def synthesis_result(self, *args: Any, **kwargs: Any):
+        return self._service.synthesis_result(*args, **kwargs)
+
+    def cancel_synthesis(self, *args: Any, **kwargs: Any):
+        return self._service.cancel_synthesis(*args, **kwargs)
 
     def status(self, *args: Any, **kwargs: Any):
         return self._service.status(*args, **kwargs)
@@ -1449,6 +1848,26 @@ def _active_binding(parent: Any) -> tuple[str, str]:
     if not session_id or not turn_id:
         raise CoordinatorRouteError("An active parent session and turn are required.")
     return session_id, turn_id
+
+
+def _valid_sha256_digest(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        return False
+    digest = value.removeprefix("sha256:")
+    return len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+
+
+def _validate_synthesis_timeout(timeout_seconds: Optional[float]) -> None:
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+        or timeout_seconds > 300
+    ):
+        raise CoordinatorRouteError(
+            "timeout_seconds must be greater than 0 and at most 300."
+        )
 
 
 def _message_hash(message: str) -> str:

@@ -64,6 +64,7 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    max_iterations: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +150,7 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    structured_output_eligible: bool = False
 
 
 class _Registry:
@@ -171,6 +173,58 @@ _SECRET = secrets.token_bytes(32)
 _ACTIVE_PARENT_AGENT: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "hermes_subagent_lifecycle_parent", default=None
 )
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _parse_structured_payload(summary: Optional[str]) -> Optional[Mapping[str, Any]]:
+    """Decode bounded, exact JSON objects from the fixed tool-less output lane."""
+    if summary is None:
+        return None
+    try:
+        payload = json.loads(summary, parse_constant=_reject_nonfinite_json_constant)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return payload if len(encoded) <= _MAX_RESULT_CHARS else None
+
+
+def _usage_metadata(raw: Any) -> Mapping[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    api_calls = raw.get("api_calls", 0)
+    if isinstance(api_calls, bool) or not isinstance(api_calls, int) or api_calls < 0:
+        api_calls = 0
+    return {"api_calls": api_calls}
+
+
+def _tool_execution_summary(raw: Any, *, strictly_toolless: bool) -> Mapping[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    duration = raw.get("duration_seconds", 0)
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or duration < 0
+    ):
+        duration = 0
+    summary: dict[str, Any] = {"duration_seconds": duration}
+    if strictly_toolless:
+        tool_trace = raw.get("tool_trace")
+        if tool_trace == []:
+            summary.update({"tool_calls": 0, "tool_turns": 0})
+        elif isinstance(tool_trace, list):
+            summary["tool_calls"] = sum(
+                1 for item in tool_trace if isinstance(item, dict)
+            )
+    return summary
 
 
 @contextmanager
@@ -205,6 +259,21 @@ class SubagentLifecycleService:
         self._authorization_resolver = authorization_resolver
 
     def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
+        return self._prepare_launch(request, deferred=False)
+
+    def _prepare_strictly_toolless_launch(
+        self, request: SubagentLaunchRequest
+    ) -> SubagentHandle:
+        """Construct a fixed one-iteration tool-less child without starting it."""
+        if request.allowed_toolsets != () or request.max_iterations != 1:
+            raise SubagentLifecycleError(
+                "Deferred launch is restricted to one-iteration tool-less children."
+            )
+        return self._prepare_launch(request, deferred=True)
+
+    def _prepare_launch(
+        self, request: SubagentLaunchRequest, *, deferred: bool
+    ) -> SubagentHandle:
         self._require_authorized()
         parent = self._parent_agent_resolver()
         if parent is None:
@@ -217,13 +286,17 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "parent_session_id does not match the active session."
             )
-        return self._launch_validated(request, parent, parent_session_id)
+        return self._launch_validated(
+            request, parent, parent_session_id, deferred=deferred
+        )
 
     def _launch_validated(
         self,
         request: SubagentLaunchRequest,
         parent: Any,
         parent_session_id: Optional[str],
+        *,
+        deferred: bool,
     ) -> SubagentHandle:
         deadline = (
             time.monotonic() + request.timeout_seconds
@@ -255,7 +328,11 @@ class SubagentLifecycleService:
                 else None
             ),
             model=request.model,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_iterations=(
+                request.max_iterations
+                if request.max_iterations is not None
+                else DEFAULT_MAX_ITERATIONS
+            ),
             task_count=1,
             parent_agent=parent,
             role=request.role,
@@ -272,7 +349,8 @@ class SubagentLifecycleService:
         ):
             self._discard_constructed_child(child, parent)
             raise SubagentLifecycleError(
-                "Hermes failed to construct a strictly tool-less child."
+                "Hermes failed to construct a strictly tool-less child: "
+                "unsafe tool or depth configuration."
             )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
@@ -291,25 +369,94 @@ class SubagentLifecycleService:
             int(getattr(child, "_delegate_depth", 1) or 1),
             self._capability(subagent_id, parent_session_id, created),
         )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        record = _Record(
+            handle,
+            SubagentState.PENDING,
+            created,
+            agent=child,
+            structured_output_eligible=(
+                request.allowed_toolsets == () and request.max_iterations == 1
+            ),
+        )
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
+        if deferred:
+            return handle
+        self._start_record(record, request.goal, parent)
+        return handle
+
+    def _start_prepared(self, handle: SubagentHandle, goal: str) -> None:
+        """Start a host-prepared child after its caller accepts construction."""
+        self._require_authorized()
+        if not isinstance(goal, str) or not goal.strip() or len(goal) > _MAX_GOAL_CHARS:
+            raise SubagentLifecycleError(
+                "goal must be a non-empty string of at most 16000 characters."
+            )
+        record = self._record(handle)
+        parent = self._parent_agent_resolver()
+        if (
+            record is None
+            or parent is None
+            or not record.structured_output_eligible
+            or record.agent is None
+        ):
+            raise SubagentLifecycleError("Prepared tool-less child is unavailable.")
+        with _REGISTRY.lock:
+            if record.future is not None or record.state is not SubagentState.PENDING:
+                raise SubagentLifecycleError(
+                    "Prepared tool-less child has already been started."
+                )
+        self._start_record(record, goal, parent)
+
+    def _discard_prepared(self, handle: SubagentHandle) -> bool:
+        """Remove and close a prepared child that must never execute."""
+        record = self._record(handle)
+        parent = self._parent_agent_resolver()
+        if record is None or parent is None:
+            return False
+        with _REGISTRY.lock:
+            if (
+                record.future is not None
+                or record.state is not SubagentState.PENDING
+                or record.agent is None
+            ):
+                return False
+            if _REGISTRY.records.get(handle.subagent_id) is not record:
+                return False
+            _REGISTRY.records.pop(handle.subagent_id, None)
+            if handle.correlation_id:
+                _REGISTRY.correlations.pop(
+                    (handle.parent_session_id, handle.correlation_id), None
+                )
+            child = record.agent
+            record.agent = None
+        self._discard_constructed_child(child, parent)
+        return True
+
+    def _start_record(self, record: _Record, goal: str, parent: Any) -> None:
+        handle = record.handle
+        correlation_key = (
+            handle.parent_session_id,
+            handle.correlation_id or "",
+        )
         try:
-            record.future = self._submit(record, request.goal, parent)
+            record.future = self._submit(record, goal, parent)
         except Exception:
             with _REGISTRY.lock:
-                if _REGISTRY.records.get(subagent_id) is record:
-                    _REGISTRY.records.pop(subagent_id, None)
+                if _REGISTRY.records.get(handle.subagent_id) is record:
+                    _REGISTRY.records.pop(handle.subagent_id, None)
                 if (
-                    request.correlation_id
-                    and _REGISTRY.correlations.get(correlation_key) == subagent_id
+                    handle.correlation_id
+                    and _REGISTRY.correlations.get(correlation_key)
+                    == handle.subagent_id
                 ):
                     _REGISTRY.correlations.pop(correlation_key, None)
+            child = record.agent
+            record.agent = None
             self._discard_constructed_child(child, parent)
             raise
-        return handle
 
     def _submit(self, record: _Record, goal: str, parent: Any) -> Optional[Future]:
         return _EXECUTOR.submit(self._run, record, goal, parent)
@@ -535,25 +682,29 @@ class SubagentLifecycleService:
             summary = raw.get("summary") if isinstance(raw, dict) else None
             summary = str(summary)[:_MAX_RESULT_CHARS] if summary is not None else None
             error = raw.get("error") if isinstance(raw, dict) else None
+            structured_payload = (
+                _parse_structured_payload(summary)
+                if record.structured_output_eligible
+                else None
+            )
+            usage_metadata = _usage_metadata(raw)
+            tool_execution_summary = _tool_execution_summary(
+                raw, strictly_toolless=record.structured_output_eligible
+            )
             result = SubagentResult(
                 record.handle,
                 state,
                 True,
                 summary=summary,
+                structured_payload=structured_payload,
                 completed_at=time.time(),
                 started_at=record.started_at,
                 error_classification=None
                 if state == SubagentState.SUCCEEDED
                 else status.upper(),
                 error_message=str(error)[:_MAX_RESULT_CHARS] if error else None,
-                usage_metadata={"api_calls": raw.get("api_calls", 0)}
-                if isinstance(raw, dict)
-                else {},
-                tool_execution_summary={
-                    "duration_seconds": raw.get("duration_seconds", 0)
-                }
-                if isinstance(raw, dict)
-                else {},
+                usage_metadata=usage_metadata,
+                tool_execution_summary=tool_execution_summary,
             )
         except Exception as exc:
             result = SubagentResult(
@@ -617,6 +768,19 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "timeout_seconds must be greater than 0 and at most 300."
             )
+        if request.max_iterations is not None:
+            from tools.delegate_tool import DEFAULT_MAX_ITERATIONS
+
+            if (
+                isinstance(request.max_iterations, bool)
+                or not isinstance(request.max_iterations, int)
+                or request.max_iterations <= 0
+                or request.max_iterations > DEFAULT_MAX_ITERATIONS
+            ):
+                raise SubagentLifecycleError(
+                    "max_iterations must be an integer greater than 0 and at most "
+                    f"{DEFAULT_MAX_ITERATIONS}."
+                )
         if request.working_directory is not None:
             raise SubagentLifecycleError(
                 "working_directory is not supported because Hermes delegates use isolated task environments."

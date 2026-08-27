@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -56,7 +57,9 @@ def coordinator(monkeypatch: pytest.MonkeyPatch):
         def close(self) -> None:
             self.closed = True
 
-        def hard_interrupt(self, _reason: str, *, tool_reason: str | None = None) -> None:
+        def hard_interrupt(
+            self, _reason: str, *, tool_reason: str | None = None
+        ) -> None:
             self.interrupt_reason = tool_reason
             self.interrupt_reasons.append(tool_reason)
 
@@ -113,6 +116,56 @@ def test_synthesis_request_has_no_model_tool_or_profile_override_surface() -> No
                 goal="종합",
                 input_digest="sha256:" + "a" * 64,
                 **{override: "forbidden"},
+            )
+
+
+def test_lifecycle_max_iterations_override_is_bounded_and_default_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.subagent_lifecycle import (
+        SubagentLaunchRequest,
+        SubagentLifecycleService,
+    )
+
+    parent = SimpleNamespace(session_id="parent-iterations", enabled_toolsets=[])
+    captured: list[int] = []
+
+    class Child:
+        _delegate_role = "leaf"
+        _delegate_depth = 1
+        provider = "test"
+        model = "test-model"
+        enabled_toolsets: list[str] = []
+        valid_tool_names: set[str] = set()
+        tools: list[Any] = []
+
+        def __init__(self, child_id: str) -> None:
+            self._subagent_id = child_id
+
+    def build(**kwargs: Any) -> Child:
+        captured.append(kwargs["max_iterations"])
+        return Child(f"sa-iterations-{len(captured)}")
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", build
+    )
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService._submit",
+        lambda *_args, **_kwargs: None,
+    )
+    service = SubagentLifecycleService(lambda: parent)
+
+    service.launch(SubagentLaunchRequest(goal="default iterations"))
+    service.launch(SubagentLaunchRequest(goal="one iteration", max_iterations=1))
+
+    assert captured == [250, 1]
+    for invalid in (True, 0, -1, 251, 1.5, "1"):
+        with pytest.raises(SubagentLifecycleError, match="max_iterations"):
+            service.launch(
+                SubagentLaunchRequest(
+                    goal="invalid iterations",
+                    max_iterations=cast(Any, invalid),
+                )
             )
 
 
@@ -247,7 +300,9 @@ def test_unsafe_synthesis_child_is_rejected_closed_and_unlinked(
             parent._active_children.append(child)
         return child
 
-    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", build
+    )
 
     expected_message = "tool|unsafe" if unsafe_kind == "tools" else "depth|unsafe"
     with pytest.raises(
@@ -304,6 +359,114 @@ def test_synthesis_result_proves_one_model_call_and_zero_tool_execution(
     assert len(built) == 1
 
 
+def test_real_lifecycle_result_retains_bounded_toolless_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.subagent_lifecycle import (
+        SubagentLaunchRequest,
+        SubagentLifecycleService,
+    )
+
+    parent = SimpleNamespace(
+        session_id="session-real-result",
+        _current_turn_id="turn-real-result",
+        _delegate_depth=0,
+        _subagent_id=None,
+        enabled_toolsets=[],
+    )
+    built = 0
+
+    class Child:
+        _delegate_role = "leaf"
+        _delegate_depth = 1
+        provider = "test"
+        model = "test-model"
+        enabled_toolsets: list[str] = []
+        valid_tool_names: set[str] = set()
+        tools: list[Any] = []
+
+        def __init__(self, child_id: str) -> None:
+            self._subagent_id = child_id
+
+    def build(**_kwargs: Any) -> Child:
+        nonlocal built
+        built += 1
+        return Child(f"sa-real-result-{built}")
+
+    raw_summary = (
+        '{"status":"completed","answer":"관찰이 우선입니다.",'
+        '"key_points":[],"dissent":null,"data_note":null}'
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", build
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_child_lifecycle",
+        lambda *_args, **_kwargs: {
+            "status": "completed",
+            "summary": raw_summary,
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+            "tool_trace": [],
+        },
+    )
+    service = route_capability.CoordinatorService(
+        issuer_plugin_id="kospi-team",
+        parent_agent_resolver=lambda: parent,
+        allowed_routes_resolver=lambda: ("investment.team",),
+        authorization_resolver=lambda: True,
+    )
+    capability = service.issue_route_capability(
+        user_message="팀 결과를 종합해줘",
+        coordinator_route="investment.team",
+        consultation_id="T-REAL-RESULT",
+        account_scope=route_capability.AccountScope.OMITTED,
+    )
+    handle = service.reserve_consultation(
+        capability=capability,
+        user_message="팀 결과를 종합해줘",
+        coordinator_route="investment.team",
+        consultation_id="T-REAL-RESULT",
+        account_scope=route_capability.AccountScope.OMITTED,
+    )
+
+    synthesis = service.launch_synthesis(handle, _request(digest="9" * 64))
+    terminal = service.wait_synthesis(handle, timeout_seconds=1)
+    result = service.synthesis_result(handle)
+
+    assert terminal.synthesis_handle == synthesis
+    assert terminal.state == "SUCCEEDED"
+    assert terminal.completed is True
+    assert result.synthesis_handle == synthesis
+    assert result.state == "SUCCEEDED"
+    assert result.ready is True
+    assert result.summary == raw_summary
+    assert result.structured_payload == {
+        "status": "completed",
+        "answer": "관찰이 우선입니다.",
+        "key_points": [],
+        "dissent": None,
+        "data_note": None,
+    }
+    assert result.usage_metadata == {"api_calls": 1}
+    assert result.tool_execution_summary == {
+        "duration_seconds": 0.01,
+        "tool_calls": 0,
+        "tool_turns": 0,
+    }
+    assert isinstance(result.result_hash, str) and len(result.result_hash) == 64
+
+    ordinary = SubagentLifecycleService(lambda: parent)
+    ordinary_handle = ordinary.launch(SubagentLaunchRequest(goal="ordinary child"))
+    assert (
+        ordinary.wait(ordinary_handle, timeout_seconds=1).state
+        is SubagentState.SUCCEEDED
+    )
+    ordinary_result = ordinary.result(ordinary_handle)
+    assert ordinary_result.structured_payload is None
+    assert ordinary_result.tool_execution_summary == {"duration_seconds": 0.01}
+
+
 def test_synthesis_lifecycle_cancel_does_not_change_existing_role_api(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,7 +505,7 @@ def test_synthesis_lifecycle_cancel_does_not_change_existing_role_api(
     assert len(built) == 2
 
 
-def test_synthesis_cancel_interrupts_child_and_is_terminally_idempotent(
+def test_synthesis_cancel_is_idempotent_without_claiming_false_terminal_state(
     coordinator,
 ) -> None:
     _parent, service, handle, built = coordinator
@@ -357,13 +520,71 @@ def test_synthesis_cancel_interrupts_child_and_is_terminally_idempotent(
     assert first.accepted is True
     assert child.interrupt_reason == "subagent cancellation requested"
     assert terminal.synthesis_handle == synthesis
-    assert terminal.state == "CANCELLED"
-    assert terminal.completed is True
+    assert terminal.state == "CANCEL_REQUESTED"
+    assert terminal.completed is False
     assert second.synthesis_handle == synthesis
     assert second.accepted is False
-    assert second.already_terminal is True
-    assert second.state == "CANCELLED"
+    assert second.already_terminal is False
+    assert second.state == "CANCEL_REQUESTED"
     assert child.interrupt_reasons == ["subagent cancellation requested"]
+
+
+def test_synthesis_cancel_does_not_hide_a_later_lifecycle_terminal_state(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _parent, service, handle, _built = coordinator
+    synthesis = service.launch_synthesis(handle, _request())
+    assert service.cancel_synthesis(handle, reason="deadline").accepted is True
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService.status",
+        lambda _self, child_handle: SimpleNamespace(
+            handle=child_handle,
+            state=SubagentState.SUCCEEDED,
+            updated_at=1.0,
+            diagnostic=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService.wait",
+        lambda _self, child_handle, *, timeout_seconds=None: SimpleNamespace(
+            handle=child_handle,
+            state=SubagentState.SUCCEEDED,
+            completed=True,
+            timed_out=False,
+            diagnostic=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService.result",
+        lambda _self, child_handle: SimpleNamespace(
+            handle=child_handle,
+            terminal_state=SubagentState.SUCCEEDED,
+            ready=True,
+            summary="late success",
+            structured_payload={"status": "completed"},
+            started_at=1.0,
+            completed_at=2.0,
+            error_classification=None,
+            error_message=None,
+            usage_metadata={"api_calls": 1},
+            tool_execution_summary={"tool_calls": 0, "tool_turns": 0},
+            result_hash="sha256:" + "7" * 64,
+        ),
+    )
+
+    terminal = service.wait_synthesis(handle, timeout_seconds=0)
+    result = service.synthesis_result(handle)
+    repeated_cancel = service.cancel_synthesis(handle, reason="duplicate")
+
+    assert terminal.synthesis_handle == synthesis
+    assert terminal.state == "SUCCEEDED"
+    assert terminal.completed is True
+    assert result.state == "SUCCEEDED"
+    assert result.summary == "late success"
+    assert repeated_cancel.accepted is False
+    assert repeated_cancel.already_terminal is True
+    assert repeated_cancel.state == "SUCCEEDED"
 
 
 def test_gateway_bound_service_forwards_synthesis_and_rechecks_binding(
@@ -436,9 +657,14 @@ def test_gateway_bound_service_forwards_synthesis_and_rechecks_binding(
         ),
     )
 
-    assert bound_api.wait_synthesis(handle, timeout_seconds=0).synthesis_handle == synthesis
+    assert (
+        bound_api.wait_synthesis(handle, timeout_seconds=0).synthesis_handle
+        == synthesis
+    )
     assert bound_api.synthesis_result(handle).synthesis_handle == synthesis
-    assert bound_api.cancel_synthesis(handle, reason="valid").synthesis_handle == synthesis
+    assert (
+        bound_api.cancel_synthesis(handle, reason="valid").synthesis_handle == synthesis
+    )
     route_capability.revoke_gateway_dispatch_binding(binding)
     for method, kwargs in (
         (bound_api.wait_synthesis, {"timeout_seconds": 0}),
@@ -449,39 +675,53 @@ def test_gateway_bound_service_forwards_synthesis_and_rechecks_binding(
             method(handle, **kwargs)
 
 
-def test_synthesis_launch_timeout_closes_late_child(
+def test_synthesis_timeout_returns_before_release_and_discards_late_success(
     coordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    parent, service, handle, built = coordinator
-    _synthesis_api()
+    parent, service, handle, _built = coordinator
     parent._active_children = []
     parent._active_children_lock = threading.RLock()
     started = threading.Event()
     release = threading.Event()
-    monotonic_calls = 0
+    closed = threading.Event()
+    late_finished = threading.Event()
+    submit_calls: list[str] = []
+    build_count = 0
 
-    def monotonic() -> float:
-        nonlocal monotonic_calls
-        monotonic_calls += 1
-        return 100.0 if monotonic_calls == 1 else 101.0
+    class Child:
+        _delegate_role = "leaf"
+        _delegate_depth = 1
+        provider = "test"
+        model = "test-model"
+        enabled_toolsets: list[str] = []
+        valid_tool_names: set[str] = set()
+        tools: list[Any] = []
 
-    monkeypatch.setattr(
-        "agent.subagent_lifecycle.time.monotonic", monotonic
-    )
-    original_build = __import__(
-        "tools.delegate_tool", fromlist=["_build_child_preserving_parent_tools"]
-    )._build_child_preserving_parent_tools
+        def __init__(self, child_id: str) -> None:
+            self._subagent_id = child_id
 
-    def slow_build(**kwargs: Any):
-        started.set()
-        assert release.wait(timeout=2)
-        child = original_build(**kwargs)
+        def close(self) -> None:
+            closed.set()
+
+    def build(**_kwargs: Any) -> Child:
+        nonlocal build_count
+        build_count += 1
+        child = Child(f"sa-preemptive-{build_count}")
         with parent._active_children_lock:
             parent._active_children.append(child)
+        if build_count == 1:
+            started.set()
+            assert release.wait(timeout=2)
+            late_finished.set()
         return child
 
     monkeypatch.setattr(
-        "tools.delegate_tool._build_child_preserving_parent_tools", slow_build
+        "tools.delegate_tool._build_child_preserving_parent_tools", build
+    )
+    monkeypatch.setattr("agent.subagent_lifecycle.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService._submit",
+        lambda _self, _record, goal, _parent: submit_calls.append(goal),
     )
     captured: list[BaseException] = []
 
@@ -494,12 +734,184 @@ def test_synthesis_launch_timeout_closes_late_child(
     thread = threading.Thread(target=launch)
     thread.start()
     assert started.wait(timeout=1)
-    release.set()
-    thread.join(timeout=2)
+    thread.join(timeout=0.5)
 
+    assert thread.is_alive() is False
     assert len(captured) == 1
-    assert isinstance(captured[0], route_capability.CoordinatorRouteError)
-    assert "timed out" in str(captured[0]).casefold()
+    assert isinstance(captured[0], route_capability.CoordinatorSynthesisTimeoutError)
+    assert submit_calls == []
+    assert closed.is_set() is False
+
+    release.set()
+    assert late_finished.wait(timeout=1)
+    assert closed.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    while parent._active_children and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert parent._active_children == []
+    assert submit_calls == []
+    with pytest.raises(
+        route_capability.CoordinatorRouteError, match="not been launched"
+    ):
+        service.synthesis_result(handle)
+
+    retry = service.launch_synthesis(handle, _request(), timeout_seconds=0.5)
+
+    assert retry.coordinator_id == handle.coordinator_id
+    assert build_count == 2
+    assert submit_calls == ["검증된 역할 결과만 종합하세요"]
+
+
+def test_synthesis_deadline_is_rechecked_after_coordinator_lock_contention(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent, service, handle, _built = coordinator
+    parent._active_children = []
+    parent._active_children_lock = threading.RLock()
+    build_started = threading.Event()
+    release_build = threading.Event()
+    prepared = threading.Event()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    deadline_elapsed = threading.Event()
+    closed = threading.Event()
+    submit_calls: list[str] = []
+
+    class Child:
+        _subagent_id = "sa-lock-contention"
+        _delegate_role = "leaf"
+        _delegate_depth = 1
+        provider = "test"
+        model = "test-model"
+        enabled_toolsets: list[str] = []
+        valid_tool_names: set[str] = set()
+        tools: list[Any] = []
+
+        def close(self) -> None:
+            closed.set()
+
+    child = Child()
+
+    def build(**_kwargs: Any) -> Child:
+        with parent._active_children_lock:
+            parent._active_children.append(child)
+        build_started.set()
+        assert release_build.wait(timeout=2)
+        return child
+
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_preserving_parent_tools", build
+    )
+    from agent.subagent_lifecycle import SubagentLifecycleService
+
+    original_prepare = SubagentLifecycleService._prepare_strictly_toolless_launch
+
+    def prepare(self: Any, request: Any) -> Any:
+        child_handle = original_prepare(self, request)
+        prepared.set()
+        return child_handle
+
+    monkeypatch.setattr(
+        SubagentLifecycleService, "_prepare_strictly_toolless_launch", prepare
+    )
+    monkeypatch.setattr(
+        route_capability.time,
+        "monotonic",
+        lambda: 101.0 if deadline_elapsed.is_set() else 100.0,
+    )
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService._submit",
+        lambda _self, _record, goal, _parent: submit_calls.append(goal),
+    )
+    captured: list[BaseException] = []
+
+    def launch() -> None:
+        try:
+            service.launch_synthesis(handle, _request(), timeout_seconds=0.5)
+        except BaseException as exc:
+            captured.append(exc)
+
+    def hold_registry_lock() -> None:
+        with route_capability._REGISTRY.lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    assert build_started.wait(timeout=1)
+    lock_thread = threading.Thread(target=hold_registry_lock)
+    lock_thread.start()
+    assert lock_held.wait(timeout=1)
+    release_build.set()
+    assert prepared.wait(timeout=1)
+    deadline_elapsed.set()
+    release_lock.set()
+    lock_thread.join(timeout=1)
+    launch_thread.join(timeout=1)
+
+    assert lock_thread.is_alive() is False
+    assert launch_thread.is_alive() is False
+    assert len(captured) == 1
+    assert isinstance(captured[0], route_capability.CoordinatorSynthesisTimeoutError)
+    assert submit_calls == []
+    assert closed.wait(timeout=1)
+    assert parent._active_children == []
+    with pytest.raises(
+        route_capability.CoordinatorRouteError, match="not been launched"
+    ):
+        service.synthesis_result(handle)
+
+
+def test_synthesis_abandon_cleans_completion_that_won_callback_race() -> None:
+    child_handle = object()
+    abandoned = threading.Event()
+    discarded: list[Any] = []
+    lifecycle = SimpleNamespace(
+        _discard_prepared=lambda handle: discarded.append(handle)
+    )
+    future: Future[Any] = Future()
+    future.add_done_callback(
+        lambda completed: route_capability._discard_abandoned_synthesis_launch(
+            completed, lifecycle, abandoned
+        )
+    )
+    future.set_result(child_handle)
+
+    assert discarded == []
+
+    route_capability._abandon_synthesis_launch(future, lifecycle, abandoned)
+
+    assert discarded == [child_handle]
+
+
+def test_synthesis_start_failure_discards_attempt_and_allows_fresh_retry(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _parent, service, handle, built = coordinator
+    submit_calls = 0
+
+    def submit(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal submit_calls
+        submit_calls += 1
+        if submit_calls == 1:
+            raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.SubagentLifecycleService._submit", submit
+    )
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        service.launch_synthesis(handle, _request())
+
     assert len(built) == 1
     assert built[0][1].closed is True
-    assert parent._active_children == []
+    with pytest.raises(
+        route_capability.CoordinatorRouteError, match="not been launched"
+    ):
+        service.synthesis_result(handle)
+
+    retry = service.launch_synthesis(handle, _request())
+
+    assert retry.coordinator_id == handle.coordinator_id
+    assert len(built) == 2
+    assert submit_calls == 2

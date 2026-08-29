@@ -47,11 +47,13 @@ def cron_env(tmp_path, monkeypatch):
     # uses. Without this, the tool resolves against the real
     # `~/.hermes/skills/` and our planted skills are invisible.
     import tools.skills_tool as _skills_tool
+
     monkeypatch.setattr(_skills_tool, "SKILLS_DIR", skills_dir)
     monkeypatch.setattr(_skills_tool, "HERMES_HOME", hermes_home)
 
     # Reset bundle cache and make bundle discovery hit this test home.
     import agent.skill_bundles as _skill_bundles
+
     _skill_bundles._bundles_cache = {}
     _skill_bundles._bundles_cache_mtime = None
 
@@ -59,6 +61,7 @@ def cron_env(tmp_path, monkeypatch):
     # CURRENT module object (post any reload that happened in fixtures of
     # previously-executed tests in the same worker).
     import cron.scheduler as _scheduler
+
     return hermes_home, _scheduler
 
 
@@ -72,7 +75,9 @@ def _plant_skill(hermes_home: Path, name: str, body: str) -> None:
     )
 
 
-def _plant_bundle(hermes_home: Path, name: str, skills: list[str], instruction: str = "") -> None:
+def _plant_bundle(
+    hermes_home: Path, name: str, skills: list[str], instruction: str = ""
+) -> None:
     """Drop a bundle YAML into ~/.hermes/skill-bundles/ and refresh cache."""
     bundles_dir = hermes_home / "skill-bundles"
     bundles_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +88,7 @@ def _plant_bundle(hermes_home: Path, name: str, skills: list[str], instruction: 
         lines.extend(f"  {line}" for line in instruction.splitlines())
     (bundles_dir / f"{name}.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     import agent.skill_bundles as _skill_bundles
+
     _skill_bundles.scan_bundles()
 
 
@@ -133,7 +139,6 @@ class TestScanAssembledCronPrompt:
 
 
 class TestBuildJobPromptScansSkillContent:
-
     def test_builtin_style_github_api_example_is_allowed(self, cron_env):
         hermes_home, scheduler = cron_env
         _plant_skill(
@@ -212,6 +217,36 @@ class TestBuildJobPromptScansSkillContent:
         assert prompt is not None
         assert "cat ~/.hermes/.env" in prompt
 
+    def test_skill_with_benign_do_not_tell_user_phrasing_is_allowed(self, cron_env):
+        """A skill instructing the agent to act instead of delegating to the
+        human ("do NOT tell the user to run X, it's your job") must NOT be
+        blocked as `deception_hide`. This is ordinary UX-writing prose, the
+        opposite of a deception directive — the bundled `hermes-agent`
+        skill's own theming doc phrases it exactly this way, and it
+        repeatedly hard-blocked a live cron job (Research Grove
+        relation-loop closeout, four times within 20 minutes on
+        2026-08-18) before the assembled-tier pattern was dropped.
+        """
+        hermes_home, scheduler = cron_env
+        _plant_skill(
+            hermes_home,
+            "ux-guidance",
+            "You apply the setting yourself; do NOT tell the user to run "
+            "the command manually (they still can, but it's your job).",
+        )
+
+        job = {
+            "id": "job-ux",
+            "name": "ux-style",
+            "prompt": "run daily report",
+            "skills": ["ux-guidance"],
+        }
+
+        # Must NOT raise — telling the agent to act instead of delegating
+        # to the human is not deception.
+        prompt = scheduler._build_job_prompt(job)
+        assert prompt is not None
+        assert "do NOT tell the user to run the command manually" in prompt
 
     def test_no_skills_still_scans_user_prompt(self, cron_env):
         """Defense-in-depth: even without skills, assembled-prompt scanning
@@ -241,10 +276,11 @@ class TestBuildJobPromptScansSkillContent:
         assert prompt is not None
         assert "could not be found" in prompt
 
-
     def test_bundle_name_shadows_skill_name_for_cron_jobs(self, cron_env):
         hermes_home, scheduler = cron_env
-        _plant_skill(hermes_home, "article-pipeline", "Standalone skill should not win.")
+        _plant_skill(
+            hermes_home, "article-pipeline", "Standalone skill should not win."
+        )
         _plant_skill(hermes_home, "bundle-member", "Bundle member should win.")
         _plant_bundle(hermes_home, "article-pipeline", ["bundle-member"])
 
@@ -312,7 +348,6 @@ class TestScriptOutputNotStrictScanned:
         assert self.RM_ROOT in prompt
         assert "Triage the items" in prompt
 
-
     def test_injection_directive_in_script_output_still_blocked(self, cron_env):
         """The looser tier keeps the unambiguous injection directives — a
         compromised feed smuggling 'ignore all previous instructions'
@@ -346,5 +381,3 @@ class TestScriptOutputNotStrictScanned:
         assert prompt is not None
         assert "\u200b" not in prompt
         assert "item oneitem two" in prompt
-
-

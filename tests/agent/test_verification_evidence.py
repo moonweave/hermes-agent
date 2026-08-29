@@ -26,12 +26,6 @@ def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
 
 
-
-
-
-
-
-
 def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
@@ -57,8 +51,6 @@ def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch
     assert test.scope == "targeted"
 
 
-
-
 def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
@@ -82,9 +74,9 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
-
-
-def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
+def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
@@ -107,17 +99,9 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
     assert evidence.status == "passed"
 
 
-
-
-
-
-
-
-
-
-
-
-def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, monkeypatch):
+def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
     target = tmp_path / "src" / "app.ts"
@@ -143,12 +127,13 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
     )
 
     assert result["files_modified"] == [str(target.resolve())]
-    assert verification_status(session_id="conversation", cwd=tmp_path)["status"] == "stale"
-    assert verification_status(session_id="turn", cwd=tmp_path)["status"] == "unverified"
-
-
-
-
+    assert (
+        verification_status(session_id="conversation", cwd=tmp_path)["status"]
+        == "stale"
+    )
+    assert (
+        verification_status(session_id="turn", cwd=tmp_path)["status"] == "unverified"
+    )
 
 
 def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
@@ -177,6 +162,32 @@ def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     status = verification_status(session_id="old-session", cwd=tmp_path)
     assert status["status"] == "unverified"
     assert status["changed_paths"] == []
+
+
+def test_subdir_manifest_is_classified_when_root_has_no_markers(tmp_path, monkeypatch):
+    """Monorepo layout: the git root carries no manifest of its own (packages
+    live one level down, e.g. ``server/pyproject.toml``). A verify command run
+    inside that subpackage must still be classified — see
+    ``_subdir_verify_commands``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".git").mkdir()
+    server = tmp_path / "server"
+    server.mkdir()
+    (server / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+
+    evidence = classify_verification_command(
+        "uv run pytest -q",
+        cwd=server,
+        session_id="s1",
+        exit_code=0,
+        output="3 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "pytest"
+    assert evidence.kind == "test"
+    assert evidence.root == str(tmp_path.resolve())
 
 
 def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):

@@ -53,7 +53,9 @@ def _utc_now() -> str:
 
 
 def _retention_cutoff() -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=_MAX_EVIDENCE_AGE_DAYS)).isoformat()
+    return (
+        datetime.now(timezone.utc) - timedelta(days=_MAX_EVIDENCE_AGE_DAYS)
+    ).isoformat()
 
 
 def _db_path() -> Path:
@@ -183,7 +185,7 @@ def _find_subsequence(tokens: list[str], needle: list[str]) -> Optional[int]:
         return None
     cleaned = [_clean_token(t) for t in tokens]
     for idx in range(0, len(cleaned) - len(needle) + 1):
-        if cleaned[idx:idx + len(needle)] == needle:
+        if cleaned[idx : idx + len(needle)] == needle:
             return idx
     return None
 
@@ -211,19 +213,19 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
     if len(needle) == 1 and "/" in needle[0]:
         candidates.extend([["bash", needle[0]], ["sh", needle[0]]])
     if needle == ["pytest"]:
-        candidates.extend(
-            [
-                ["python", "-m", "pytest"],
-                ["python3", "-m", "pytest"],
-                ["uv", "run", "pytest"],
-                ["poetry", "run", "pytest"],
-                ["pipenv", "run", "pytest"],
-            ]
-        )
+        candidates.extend([
+            ["python", "-m", "pytest"],
+            ["python3", "-m", "pytest"],
+            ["uv", "run", "pytest"],
+            ["poetry", "run", "pytest"],
+            ["pipenv", "run", "pytest"],
+        ])
     return candidates
 
 
-def _find_canonical_match(command: str, canonical_commands: list[str]) -> Optional[tuple[str, list[str]]]:
+def _find_canonical_match(
+    command: str, canonical_commands: list[str]
+) -> Optional[tuple[str, list[str]]]:
     """Return ``(canonical, trailing_args)`` for the first detected command."""
 
     segments = _split_segment_tokens(command)
@@ -234,8 +236,8 @@ def _find_canonical_match(command: str, canonical_commands: list[str]) -> Option
         for tokens in segments:
             candidate_tokens = _strip_command_prefix(tokens)
             for candidate in _equivalent_needles(needle):
-                if candidate_tokens[:len(candidate)] == candidate:
-                    return canonical, candidate_tokens[len(candidate):]
+                if candidate_tokens[: len(candidate)] == candidate:
+                    return canonical, candidate_tokens[len(candidate) :]
     return None
 
 
@@ -307,7 +309,9 @@ def _is_temp_script_path(token: str, root: str | Path | None) -> bool:
     )
 
 
-def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> Optional[list[str]]:
+def _ad_hoc_script_args(
+    tokens: list[str], root: str | Path | None
+) -> Optional[list[str]]:
     candidate_tokens = _strip_command_prefix(tokens)
     if not candidate_tokens:
         return None
@@ -319,7 +323,7 @@ def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> Optional[
             if token == "--":
                 continue
             if _is_temp_script_path(token, root):
-                return candidate_tokens[idx + 1:]
+                return candidate_tokens[idx + 1 :]
             if not token.startswith("-"):
                 return None
     return None
@@ -411,6 +415,35 @@ def _prune_old_events(conn: sqlite3.Connection, *, session_id: str, root: str) -
     )
 
 
+def _subdir_verify_commands(cwd: str | Path | None, root: str | None) -> list[str]:
+    """Monorepo fallback: retry marker detection at the command's own cwd.
+
+    ``project_facts_for`` derives ``verifyCommands`` from markers (package.json,
+    pytest.ini/pyproject.toml, Makefile) at the git/marker root only. A
+    monorepo whose root carries no manifest of its own — packages live one
+    level down (``server/pyproject.toml``, ``viewer/package.json``) — never
+    matches there, so a command actually run inside that subpackage is never
+    classified even though its manifest is right there in ``cwd``. Re-run the
+    same detection at ``cwd`` when it differs from ``root`` and the root-level
+    scan came up empty.
+    """
+    if not cwd or not root:
+        return []
+    try:
+        from agent.coding_context import detect_project_facts
+
+        cwd_path = Path(cwd).expanduser().resolve()
+        root_path = Path(root).expanduser().resolve()
+    except Exception:
+        return []
+    if cwd_path == root_path:
+        return []
+    try:
+        return detect_project_facts(cwd_path).verify_commands
+    except Exception:
+        return []
+
+
 def classify_verification_command(
     command: str,
     *,
@@ -433,6 +466,8 @@ def classify_verification_command(
         return None
 
     verify_commands = list(facts.get("verifyCommands") or [])
+    if not verify_commands:
+        verify_commands = _subdir_verify_commands(cwd, facts.get("root"))
     match = _find_canonical_match(command, verify_commands)
     is_ad_hoc = False
     if match is None and not verify_commands:
@@ -623,7 +658,12 @@ def mark_workspace_edited(
             )
             conn.commit()
 
-    return {"session_id": sid, "root": root, "last_edit_at": edited_at, "changed_paths": changed_paths}
+    return {
+        "session_id": sid,
+        "root": root,
+        "last_edit_at": edited_at,
+        "changed_paths": changed_paths,
+    }
 
 
 def verification_status(

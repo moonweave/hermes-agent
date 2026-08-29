@@ -444,6 +444,28 @@ def _subdir_verify_commands(cwd: str | Path | None, root: str | None) -> list[st
         return []
 
 
+# Last-resort fallback when neither a declared verifyCommands entry (root or
+# subdir) nor an ad-hoc script matches: the command shape itself is an
+# unambiguous test-runner invocation. No manifest anywhere in the tree has to
+# spell out "pytest" for `uv run pytest -q tests/x.py` to mean "a test suite
+# just ran" — a monorepo package can carry pytest only as a dev dependency
+# (no [tool.pytest] section, no pytest.ini) and still be a real pytest
+# project; research-grove's server/ package is exactly this shape. Reuses
+# `_find_canonical_match`'s wrapper-stripping (`uv run pytest`, `python -m
+# pytest`, `npm test` for `npm run test`, ...) against a fixed, narrow
+# allowlist — not the open-ended surface a declared verify command searches.
+_RECOGNIZED_TEST_RUNNERS = [
+    "pytest",
+    "npm run test",
+    "pnpm run test",
+    "yarn run test",
+    "vitest",
+    "jest",
+    "cargo test",
+    "go test",
+]
+
+
 def classify_verification_command(
     command: str,
     *,
@@ -475,15 +497,31 @@ def classify_verification_command(
         if ad_hoc_args is not None:
             match = ("ad-hoc verification script", ad_hoc_args)
             is_ad_hoc = True
+    is_recognized_runner = False
+    if match is None:
+        match = _find_canonical_match(command, _RECOGNIZED_TEST_RUNNERS)
+        if match is not None:
+            is_recognized_runner = True
     if match is None:
         return None
 
     canonical, trailing_args = match
+    kind = "ad_hoc" if is_ad_hoc else _kind_for_command(canonical)
+    scope = "targeted" if is_ad_hoc else _scope_for_args(trailing_args)
+    # Distinguish "matched a declared/ad-hoc verify command" from "matched a
+    # recognized runner shape with nothing declaring it" in the recorded
+    # canonical_command itself (no schema/kind-taxonomy change), mirroring
+    # how "ad-hoc verification script" already flags its own tier.
+    canonical_label = (
+        f"{canonical} (recognized runner, no declared verify command)"
+        if is_recognized_runner
+        else canonical
+    )
     return VerificationEvidence(
         command=command,
-        canonical_command=canonical,
-        kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
-        scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
+        canonical_command=canonical_label,
+        kind=kind,
+        scope=scope,
         status="passed" if int(exit_code) == 0 else "failed",
         exit_code=int(exit_code),
         cwd=str(Path(cwd or ".").resolve()),

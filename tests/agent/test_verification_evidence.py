@@ -190,6 +190,73 @@ def test_subdir_manifest_is_classified_when_root_has_no_markers(tmp_path, monkey
     assert evidence.root == str(tmp_path.resolve())
 
 
+def test_recognized_runner_fallback_when_no_manifest_declares_pytest(
+    tmp_path, monkeypatch
+):
+    """Real research-grove shape: the subpackage's pyproject.toml lists
+    pytest only as a dev dependency — no ``[tool.pytest...]`` section, no
+    ``pytest.ini`` anywhere in the tree. ``detect_project_facts`` finds no
+    verify markers at either the root or the subdir, so
+    ``_subdir_verify_commands`` also comes up empty — yet the command IS an
+    unambiguous pytest invocation and must still be classified.
+
+    Reproduces a false negative found live: the fix for the subdir-manifest
+    case above assumed ``server/pyproject.toml`` declared ``[tool.pytest]``;
+    the actual research-grove ``server/`` package does not, so that fix
+    alone left every real research-grove pytest run unclassified. Verified
+    against the live tree with
+    ``~/.hermes/hermes-agent/venv/bin/python -c "from
+    agent.verification_evidence import classify_verification_command as c;
+    print(c('uv run pytest -q tests/test_x.py',
+    cwd='<worktree>/server'))"``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".git").mkdir()
+    server = tmp_path / "server"
+    server.mkdir()
+    (server / "pyproject.toml").write_text(
+        '[project]\nname = "server"\ndependencies = []\n'
+        '\n[dependency-groups]\ndev = ["pytest>=9.1.1"]\n'
+    )
+
+    evidence = classify_verification_command(
+        "uv run pytest -q tests/test_x.py",
+        cwd=server,
+        session_id="s1",
+        exit_code=0,
+        output="3 passed",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == (
+        "pytest (recognized runner, no declared verify command)"
+    )
+    assert evidence.kind == "test"
+    assert evidence.scope == "targeted"
+    assert evidence.status == "passed"
+
+
+def test_recognized_runner_fallback_does_not_fire_on_unrelated_commands(
+    tmp_path, monkeypatch
+):
+    """Negative control for the fallback above: a command with no
+    recognized-runner shape must still return ``None``, manifest or not.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".git").mkdir()
+    server = tmp_path / "server"
+    server.mkdir()
+    (server / "pyproject.toml").write_text('[project]\nname = "server"\n')
+
+    evidence = classify_verification_command(
+        "echo hello",
+        cwd=server,
+        session_id="s1",
+        exit_code=0,
+    )
+    assert evidence is None
+
+
 def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):
     """Ad-hoc verification scripts with Windows backslash paths must be
     matched by ``_find_ad_hoc_match`` trying ``posix=False`` in addition to

@@ -95,8 +95,361 @@ def kanban_home(tmp_path, monkeypatch):
 # Stats + age
 # ---------------------------------------------------------------------------
 
+def test_board_activity_projects_lifecycle_without_task_content(
+    kanban_home, monkeypatch,
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="private activity title",
+            body="private activity body",
+            assignee="builder",
+        )
+        assert kb.assign_task(conn, task_id, "reviewer")
+        assert kb.claim_task(conn, task_id, claimer="private-host:private-lock")
+        assert kb.complete_task(conn, task_id, result="private activity result")
+        activity = kb.board_activity(conn, limit=80)
+
+    assert activity["contract_version"] == "hermes-kanban-activity-v1"
+    assert activity["retention_limit"] == 80
+    assert activity["now"] == now
+    assert [event["kind"] for event in activity["events"]] == [
+        "created", "assigned", "claimed", "completed",
+    ]
+    assert activity["events"][0]["profile"] == "builder"
+    assert activity["events"][1]["previous_profile"] == "builder"
+    assert activity["events"][1]["profile"] == "reviewer"
+    assert activity["events"][2]["profile"] == "reviewer"
+    assert activity["events"][3]["profile"] == "reviewer"
+    assert len({event["event_ref"] for event in activity["events"]}) == 4
+    assert len({event["work_ref"] for event in activity["events"]}) == 1
+
+    payload = json.dumps(activity)
+    for private_value in (
+        task_id,
+        "private activity title",
+        "private activity body",
+        "private activity result",
+        "private-host:private-lock",
+    ):
+        assert private_value not in payload
+
+    observed_keys = set()
+    pending = [activity]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            observed_keys.update(value)
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    assert observed_keys.isdisjoint({
+        "id", "task_id", "run_id", "title", "body", "result", "comment",
+        "payload", "claim_lock", "worker_pid", "hostname", "path", "email",
+    })
 
 
+# ---------------------------------------------------------------------------
+# Activity-ref salt (privacy pseudonymization)
+# ---------------------------------------------------------------------------
+
+def _spawn_board_activity_worker(db_path_str: str, result_path_str: str, barrier) -> None:
+    """Module-level (spawn-picklable) worker for the salt-convergence test.
+
+    Every worker is a fresh process with an empty _INITIALIZED_PATHS cache,
+    so each one takes connect()'s first-touch init path against a board that
+    starts with no kanban_meta row -- the same concurrent-first-open
+    scenario real dispatchers hit on a brand new board.
+    """
+    barrier.wait(timeout=10)
+    conn = kb.connect(db_path=Path(db_path_str))
+    try:
+        activity = kb.board_activity(conn)
+    finally:
+        conn.close()
+    refs = [[event["event_ref"], event["work_ref"]] for event in activity["events"]]
+    Path(result_path_str).write_text(json.dumps(refs))
+
+
+def test_activity_refs_stable_across_reconnects(kanban_home, monkeypatch):
+    """event_ref/work_ref must be byte-identical across separate connections
+    to the same board -- the dashboard dedupes on event_ref and keeps a
+    bounded retention window, so any churn here would make every poll look
+    like all-new activity (constraint 1)."""
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        assert kb.claim_task(conn, task_id, claimer="host:lock")
+        assert kb.complete_task(conn, task_id, result="done")
+        first = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    with kb.connect() as conn:
+        second = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    assert first["events"]
+    assert [e["event_ref"] for e in first["events"]] == [
+        e["event_ref"] for e in second["events"]
+    ]
+    assert [e["work_ref"] for e in first["events"]] == [
+        e["work_ref"] for e in second["events"]
+    ]
+
+
+def test_activity_refs_stable_across_forced_reinit(kanban_home, monkeypatch):
+    """kb.init_db() discards _INITIALIZED_PATHS and re-runs SCHEMA_SQL +
+    _migrate_add_optional_columns; the salt seed must stay write-once so
+    refs survive it (constraint 1) and kanban_meta must stay a single row."""
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        before = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        after = kb.board_activity(conn, limit=80)
+        [meta_count] = conn.execute(
+            "SELECT COUNT(*) FROM kanban_meta WHERE key = ?",
+            (kb._ACTIVITY_SALT_META_KEY,),
+        ).fetchone()
+    conn.close()
+
+    assert before["events"]
+    assert [e["event_ref"] for e in after["events"]] == [
+        e["event_ref"] for e in before["events"]
+    ]
+    assert [e["work_ref"] for e in after["events"]] == [
+        e["work_ref"] for e in before["events"]
+    ]
+    assert meta_count == 1
+
+
+def test_activity_refs_survive_moving_the_db_file(tmp_path):
+    """Refs must not depend on the filesystem path the DB is opened at. The
+    old path-derived namespace made two processes reaching the same file
+    through different paths (env var vs default vs symlink) emit different
+    refs -- move the file (with WAL/SHM siblings) and confirm the refs are
+    unchanged."""
+    import shutil
+
+    original_dir = tmp_path / "original"
+    original_dir.mkdir()
+    db_path = original_dir / "kanban.db"
+
+    with kb.connect(db_path=db_path) as conn:
+        task_id = kb.create_task(conn, title="t", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        before = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    moved_dir = tmp_path / "moved"
+    moved_dir.mkdir()
+    moved_path = moved_dir / "kanban.db"
+    for suffix in ("", "-wal", "-shm"):
+        src = original_dir / f"kanban.db{suffix}"
+        if src.exists():
+            shutil.move(str(src), str(moved_dir / f"kanban.db{suffix}"))
+
+    with kb.connect(db_path=moved_path) as conn:
+        after = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    assert before["events"]
+    assert [e["event_ref"] for e in after["events"]] == [
+        e["event_ref"] for e in before["events"]
+    ]
+    assert [e["work_ref"] for e in after["events"]] == [
+        e["work_ref"] for e in before["events"]
+    ]
+
+
+def test_activity_refs_disjoint_across_boards(tmp_path):
+    """Two boards seeded with identical task titles and identical event
+    sequences must produce disjoint ref sets -- the salt is per-database,
+    not derived from content, so it cannot leak a shared identity across
+    boards."""
+    def _seed(db_path):
+        with kb.connect(db_path=db_path) as conn:
+            task_id = kb.create_task(conn, title="same title", assignee="builder")
+            assert kb.assign_task(conn, task_id, "reviewer")
+            activity = kb.board_activity(conn, limit=80)
+        conn.close()
+        return activity
+
+    board_a = _seed(tmp_path / "board-a" / "kanban.db")
+    board_b = _seed(tmp_path / "board-b" / "kanban.db")
+
+    assert board_a["events"] and board_b["events"]
+    event_refs_a = {e["event_ref"] for e in board_a["events"]}
+    event_refs_b = {e["event_ref"] for e in board_b["events"]}
+    work_refs_a = {e["work_ref"] for e in board_a["events"]}
+    work_refs_b = {e["work_ref"] for e in board_b["events"]}
+
+    assert event_refs_a.isdisjoint(event_refs_b)
+    assert work_refs_a.isdisjoint(work_refs_b)
+
+
+def test_activity_ref_salt_rejects_a_degenerate_value(tmp_path):
+    """An empty salt would key HMAC with no key at all, putting the 32-bit task
+    id space back within brute-force reach. bytes.fromhex("") does not raise, so
+    the length has to be checked explicitly."""
+    db_path = tmp_path / "degenerate.db"
+    with kb.connect(db_path=db_path) as conn:
+        kb.create_task(conn, title="degenerate salt probe", assignee="builder")
+        for bad in ("", "00" * 16):
+            conn.execute(
+                "UPDATE kanban_meta SET value = ? WHERE key = ?",
+                (bad, kb._ACTIVITY_SALT_META_KEY),
+            )
+            with pytest.raises(ValueError, match="malformed"):
+                kb.board_activity(conn, limit=10)
+    conn.close()
+
+
+def test_activity_ref_salt_seed_converges_across_concurrent_processes(tmp_path):
+    """N racing processes opening a brand-new board must converge on one
+    salt and therefore one set of refs (constraint 5). Correctness must not
+    rest on _cross_process_init_lock -- it is bounded by
+    _INIT_LOCK_TIMEOUT_SECONDS and proceeds without the lock on timeout --
+    so this exercises the real guarantee: INSERT OR IGNORE on the writable
+    initialization path, followed by read-only activity projection."""
+    import multiprocessing as mp
+    import sqlite3
+
+    db_path = tmp_path / "concurrent.db"
+    with kb.connect(db_path=db_path) as conn:
+        task_id = kb.create_task(conn, title="race task", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        # connect() already seeded the salt. Leaving it in place would make the
+        # assertions below trivially true: the workers would only prove that N
+        # processes can read one existing row. Delete it so they actually race
+        # to create it, which is the property this test exists for.
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key = ?", (kb._ACTIVITY_SALT_META_KEY,)
+        )
+        assert conn.execute("SELECT COUNT(*) FROM kanban_meta").fetchone()[0] == 0
+    conn.close()
+
+    ctx = mp.get_context("spawn")
+    num_workers = 8
+    barrier = ctx.Barrier(num_workers)
+    result_paths = [tmp_path / f"worker_{i}.json" for i in range(num_workers)]
+    procs = [
+        ctx.Process(
+            target=_spawn_board_activity_worker,
+            args=(str(db_path), str(result_paths[i]), barrier),
+        )
+        for i in range(num_workers)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=30)
+        assert not p.is_alive()
+        assert p.exitcode == 0
+
+    ref_sets = [json.loads(path.read_text()) for path in result_paths]
+    assert ref_sets[0], "worker produced no events"
+    assert all(refs == ref_sets[0] for refs in ref_sets)
+
+    with sqlite3.connect(db_path) as raw:
+        [meta_count] = raw.execute(
+            "SELECT COUNT(*) FROM kanban_meta WHERE key = ?",
+            (kb._ACTIVITY_SALT_META_KEY,),
+        ).fetchone()
+    assert meta_count == 1
+
+
+def test_activity_ref_wire_shape(kanban_home):
+    """Every event_ref/work_ref must match the consumer's validators
+    (server/hermes-adapter.mjs) or the dashboard fails the whole envelope
+    closed."""
+    import re
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        assert kb.claim_task(conn, task_id, claimer="host:lock")
+        assert kb.complete_task(conn, task_id, result="done")
+        activity = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    assert activity["events"]
+    for event in activity["events"]:
+        assert re.fullmatch(r"event_[a-f0-9]{16}", event["event_ref"])
+        assert re.fullmatch(r"work_[a-f0-9]{16}", event["work_ref"])
+
+
+def test_activity_salt_never_leaves_board_activity(kanban_home):
+    """The 64-char salt hex must never appear in the serialized
+    board_activity payload -- complements the existing title/body/result/
+    claim-lock leak assertions."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="builder")
+        assert kb.assign_task(conn, task_id, "reviewer")
+        salt = kb._activity_ref_salt(conn)
+        activity = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    assert activity["events"]
+    assert salt.hex() not in json.dumps(activity)
+
+
+def test_activity_salt_reprovisions_after_row_loss(kanban_home):
+    """A DB file that lost (or predates) its kanban_meta row must not crash
+    board_activity -- init_db() reprovisions a fresh salt row."""
+    with kb.connect() as conn:
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key = ?", (kb._ACTIVITY_SALT_META_KEY,)
+        )
+        [count_before] = conn.execute(
+            "SELECT COUNT(*) FROM kanban_meta WHERE key = ?",
+            (kb._ACTIVITY_SALT_META_KEY,),
+        ).fetchone()
+    conn.close()
+    assert count_before == 0
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        [count_after] = conn.execute(
+            "SELECT COUNT(*) FROM kanban_meta WHERE key = ?",
+            (kb._ACTIVITY_SALT_META_KEY,),
+        ).fetchone()
+        activity = kb.board_activity(conn, limit=80)
+    conn.close()
+
+    assert count_after == 1
+    assert activity["events"] == []
+
+def test_board_activity_does_not_repair_missing_salt_on_read_only_path(
+    kanban_home,
+):
+    import sqlite3
+
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        kb.create_task(conn, title="read-only activity", assignee="builder")
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key = ?", (kb._ACTIVITY_SALT_META_KEY,)
+        )
+
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        with pytest.raises(RuntimeError, match="activity ref salt is missing"):
+            kb.board_activity(conn, limit=10)
 
 
 # ---------------------------------------------------------------------------
@@ -1406,5 +1759,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

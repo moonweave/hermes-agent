@@ -132,7 +132,7 @@ def _strip_yaml_frontmatter(content: str) -> str:
         end = content.find("\n---", 3)
         if end != -1:
             # Skip past the closing --- and any trailing newline
-            body = content[end + 4:].lstrip("\n")
+            body = content[end + 4 :].lstrip("\n")
             return body if body else content
     return content
 
@@ -217,6 +217,13 @@ KANBAN_GUIDANCE = (
     "\n"
     "## Lifecycle\n"
     "\n"
+    "**Every run ends with a terminal kanban call.** `kanban_complete` or "
+    "`kanban_block` is the only way this task leaves `running` — a plain-text "
+    "final reply, however complete, is not a terminal state, and it gets "
+    "recorded as a protocol violation no matter how much work you did. Never "
+    "end a turn narrating what you're about to do next (\"Now I'll write the "
+    'report"); do the thing, then call the tool in the same turn.\n'
+    "\n"
     "1. **Orient.** Call `kanban_show()` first (no args — it defaults to your "
     "task). The response includes title, body, parent-task handoffs (summary + "
     "metadata), any prior attempts on this task if you're a retry, the full "
@@ -235,7 +242,7 @@ KANBAN_GUIDANCE = (
     "tick), but you lose your current run's progress.\n"
     "4. **Block on genuine ambiguity.** If you need a human decision you cannot "
     "infer (missing credentials, UX choice, paywalled source, peer output you "
-    "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
+    'need first), call `kanban_block(reason="...")` and stop. Don\'t guess. '
     "The user will unblock with context and the dispatcher will respawn you.\n"
     "5. **Finish with the review model encoded by the task graph.** Always "
     "include the structured handoff (`summary`, `metadata`) on the lifecycle "
@@ -339,7 +346,16 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
+TOOL_USE_ENFORCEMENT_MODELS = (
+    "gpt",
+    "codex",
+    "gemini",
+    "gemma",
+    "grok",
+    "glm",
+    "qwen",
+    "deepseek",
+)
 
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
@@ -519,6 +535,7 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
     """
     if platform_name is None:
         import sys as _sys
+
         platform_name = _sys.platform
 
     is_macos = platform_name == "darwin"
@@ -568,9 +585,7 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         f"# Computer Use ({os_name} background control)\n"
         f"You have a `computer_use` tool that drives the {os_name} desktop in "
         "the BACKGROUND — your actions do not steal the user's cursor, "
-        "keyboard "
-        + share_line +
-        "## Preferred workflow\n"
+        "keyboard " + share_line + "## Preferred workflow\n"
         "1. Call `computer_use` with `action='capture'` and `mode='som'` "
         "(default). You get a screenshot with numbered overlays on every "
         "interactable element plus an AX-tree index listing role, label, and "
@@ -631,8 +646,8 @@ def computer_use_guidance(platform_name: Optional[str] = None) -> str:
         f"- When capturing, prefer `app='{example_app}'` (or whichever app the "
         "task is about) instead of the whole screen — it's less noisy and "
         "won't leak other windows the user has open.\n"
-        + offscreen_line +
-        "## The agent cursor you'll see on screen\n"
+        + offscreen_line
+        + "## The agent cursor you'll see on screen\n"
         "Each computer-use run declares a session with cua-driver; that "
         "session owns a tinted overlay cursor that glides to where you "
         "act. It's a visual cue for the user — the REAL OS cursor never "
@@ -1080,8 +1095,13 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
+    "docker",
+    "singularity",
+    "modal",
+    "daytona",
+    "ssh",
+    "vercel_sandbox",
+    "managed_modal",
 })
 
 
@@ -1211,13 +1231,17 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_persistent": config.get("container_persistent", True),
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
-                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                "docker_mount_cwd_to_workspace": config.get(
+                    "docker_mount_cwd_to_workspace", False
+                ),
                 "docker_forward_env": config.get("docker_forward_env", []),
                 "docker_env": config.get("docker_env", {}),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_extra_args": config.get("docker_extra_args", []),
                 "docker_shm_size": config.get("docker_shm_size", "1g"),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                "docker_persist_across_processes": config.get(
+                    "docker_persist_across_processes", True
+                ),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
             }
 
@@ -1235,9 +1259,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
         # `2>/dev/null` so a missing binary doesn't pollute the output.
         probe_cmd = (
             "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
-            "\"$(uname -s 2>/dev/null || echo unknown)\" "
-            "\"$(uname -r 2>/dev/null || echo unknown)\" "
-            "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
+            '"$(uname -s 2>/dev/null || echo unknown)" '
+            '"$(uname -r 2>/dev/null || echo unknown)" '
+            '"$HOME" "$(pwd)" "$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)"'
         )
         result = env.execute(probe_cmd, timeout=4)
         if result.get("returncode") != 0:
@@ -1261,7 +1285,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
             parsed[k.strip()] = v.strip()
 
     pieces = []
-    os_bits = " ".join(x for x in (parsed.get("os"), parsed.get("kernel")) if x and x != "unknown")
+    os_bits = " ".join(
+        x for x in (parsed.get("os"), parsed.get("kernel")) if x and x != "unknown"
+    )
     if os_bits:
         pieces.append(f"OS: {os_bits}")
     if parsed.get("user") and parsed["user"] != "unknown":
@@ -1384,7 +1410,9 @@ def build_environment_hints() -> str:
             from hermes_cli.config import load_config_readonly
 
             extra = str(
-                (load_config_readonly().get("agent", {}) or {}).get("environment_hint", "")
+                (load_config_readonly().get("agent", {}) or {}).get(
+                    "environment_hint", ""
+                )
             ).strip()
         except Exception as e:
             logger.debug("Could not read agent.environment_hint from config: %s", e)
@@ -1443,6 +1471,7 @@ def _get_context_file_max_chars(context_length: Optional[int] = None) -> int:
     except Exception as e:
         logger.debug("Could not read context_file_max_chars from config: %s", e)
     return _dynamic_context_file_max_chars(context_length)
+
 
 # Collect truncation warnings so the caller (run_agent) can surface them.
 # A ContextVar (not a module-global list) isolates accumulation per thread /
@@ -1517,13 +1546,18 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     try:
         st = os.stat(marker_path)
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
-            int(st.st_mtime), int(st.st_size),
+            int(st.st_mtime),
+            int(st.st_size),
         ]
     except OSError:
         pass
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
         has_skill_md = "SKILL.md" in files
-        if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
+        if (
+            root == skills_dir_str
+            and ORG_MIRROR_DIR_NAME in dirs
+            and active_org is None
+        ):
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
@@ -1626,9 +1660,7 @@ def _build_snapshot_entry(
         try:
             import json as _json
 
-            prov_path = (
-                skills_dir / ORG_MIRROR_DIR_NAME / org_id / ORG_PROVENANCE_FILE
-            )
+            prov_path = skills_dir / ORG_MIRROR_DIR_NAME / org_id / ORG_PROVENANCE_FILE
             prov = _json.loads(prov_path.read_text(encoding="utf-8"))
             device = str(prov.get("author_device") or "")
             entry["org_author"] = device or str(prov.get("author_user_id") or "")
@@ -1640,6 +1672,7 @@ def _build_snapshot_entry(
 # =========================================================================
 # Skills index
 # =========================================================================
+
 
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
@@ -1700,12 +1733,16 @@ def _skill_should_show(
 
 def _current_session_platform_hint() -> str:
     """Return the active platform without importing the gateway package on CLI startup."""
-    platform = os.environ.get("HERMES_PLATFORM") or os.environ.get("HERMES_SESSION_PLATFORM")
+    platform = os.environ.get("HERMES_PLATFORM") or os.environ.get(
+        "HERMES_SESSION_PLATFORM"
+    )
     if platform:
         return platform
 
     session_context = sys.modules.get("gateway.session_context")
-    get_session_env = getattr(session_context, "get_session_env", None) if session_context else None
+    get_session_env = (
+        getattr(session_context, "get_session_env", None) if session_context else None
+    )
     if get_session_env is None:
         return ""
     try:
@@ -1899,9 +1936,10 @@ def build_skills_system_prompt(
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
-                )
+                skills_by_category.setdefault(entry["category"], []).append((
+                    frontmatter_name,
+                    entry["description"],
+                ))
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
@@ -1915,9 +1953,13 @@ def build_skills_system_prompt(
                     continue
                 rel = desc_file.relative_to(ext_dir)
                 cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
+                category_descriptions.setdefault(
+                    cat, str(cat_desc).strip().strip("'\"")
+                )
             except Exception as e:
-                logger.debug("Could not read external skill description %s: %s", desc_file, e)
+                logger.debug(
+                    "Could not read external skill description %s: %s", desc_file, e
+                )
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -1929,7 +1971,8 @@ def build_skills_system_prompt(
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
     demoted = frozenset(
-        cat for cat in skills_by_category
+        cat
+        for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
 
@@ -1988,8 +2031,7 @@ def build_skills_system_prompt(
             "If a skill you loaded was missing steps, had wrong commands, or needed "
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
+            "<available_skills>\n" + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
@@ -2061,20 +2103,19 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         "Current capability status:",
     ]
     lines.extend(_status_line(feature) for feature in features.items())
-    lines.extend(
-        [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
-            "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
-            "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
-            "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
-        ]
-    )
+    lines.extend([
+        "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys.",
+        "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
+        "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
+        "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
+    ])
     return "\n".join(lines)
 
 
 # =========================================================================
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
+
 
 def _truncate_content(
     content: str,
@@ -2125,6 +2166,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     """
     try:
         from hermes_cli.config import ensure_hermes_home
+
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
@@ -2138,7 +2180,9 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
             return None
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
-            content, "SOUL.md", context_length=context_length,
+            content,
+            "SOUL.md",
+            context_length=context_length,
             read_path=str(soul_path),
         )
         return content
@@ -2165,7 +2209,9 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         content = _scan_context_content(content, rel)
         result = f"## {rel}\n\n{content}"
         return _truncate_content(
-            result, ".hermes.md", context_length=context_length,
+            result,
+            ".hermes.md",
+            context_length=context_length,
             read_path=str(hermes_md_path),
         )
     except Exception as e:
@@ -2236,7 +2282,9 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             scanned = _scan_context_content(content, label)
             section = f"## {label}\n\n{scanned}"
             section = _truncate_content(
-                section, label, context_length=context_length,
+                section,
+                label,
+                context_length=context_length,
                 read_path=str(candidate),
             )
             sections.append(section)
@@ -2249,7 +2297,8 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     # so a deep monorepo cannot multiply the context-file budget unbounded.
     merged = "\n\n".join(sections)
     return _truncate_content(
-        merged, "AGENTS.md (directory chain)",
+        merged,
+        "AGENTS.md (directory chain)",
         context_length=context_length,
         read_path=str(cwd_resolved / "AGENTS.md"),
     )
@@ -2266,7 +2315,9 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(
-                        result, "CLAUDE.md", context_length=context_length,
+                        result,
+                        "CLAUDE.md",
+                        context_length=context_length,
                         read_path=str(candidate),
                     )
             except Exception as e:
@@ -2294,15 +2345,21 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
                 if content:
-                    content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
-                    cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
+                    content = _scan_context_content(
+                        content, f".cursor/rules/{mdc_file.name}"
+                    )
+                    cursorrules_content += (
+                        f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
+                    )
             except Exception as e:
                 logger.debug("Could not read %s: %s", mdc_file, e)
 
     if not cursorrules_content:
         return ""
     return _truncate_content(
-        cursorrules_content, ".cursorrules", context_length=context_length,
+        cursorrules_content,
+        ".cursorrules",
+        context_length=context_length,
         read_path=str(cwd_path / ".cursorrules"),
     )
 
@@ -2381,4 +2438,7 @@ def build_context_files_prompt(
 
     if not sections:
         return ""
-    return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+    return (
+        "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"
+        + "\n".join(sections)
+    )

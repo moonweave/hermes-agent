@@ -6558,6 +6558,11 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        if reviewer is not None:
+            try:
+                reviewer = _canonical_assignee(reviewer)
+            except ValueError as exc:
+                return _ret(False, f"invalid reviewer: {exc}")
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -6596,7 +6601,20 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+            elif not (isinstance(implementer, str) and implementer.strip()):
+                # A first review with neither an explicit reviewer nor an
+                # assignee to inherit lands in `review` owned by nobody, and the
+                # dispatcher skips unassigned review rows — so the row is not
+                # waiting for a reviewer, it is stranded, and nothing will ever
+                # pick it up. Measured 2026-08-14: a builder finished at 20:54
+                # and the row sat until a human assigned a reviewer by hand the
+                # next morning, twelve hours later.
+                return _ret(
+                    False,
+                    "first review has no reviewer and no assignee to inherit; "
+                    "pass reviewer= explicitly — an unassigned review row is "
+                    "never dispatched",
+                )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:

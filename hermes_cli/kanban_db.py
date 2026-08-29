@@ -10691,6 +10691,46 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _assert_worker_runtime_capabilities(
+    hermes_home: Optional[str], toolsets: Optional[list[str]]
+) -> None:
+    """Fail before spawn when an explicit browser grant resolves to no schema."""
+    if not hermes_home or not toolsets or "browser" not in toolsets:
+        return
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from model_tools import get_tool_definitions
+
+    token = set_hermes_home_override(hermes_home)
+    try:
+        # Validate only the implementation-sensitive surface.  Including
+        # terminal when granted preserves browser_exec's host-code security
+        # contract; unrelated profile tools must not trigger network/provider
+        # probes merely because the dispatcher is checking browser readiness.
+        probe_toolsets = ["browser"]
+        if "terminal" in toolsets:
+            probe_toolsets.append("terminal")
+        schema = get_tool_definitions(
+            enabled_toolsets=probe_toolsets,
+            quiet_mode=True,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    names = {
+        item.get("function", {}).get("name", "")
+        for item in schema
+        if isinstance(item, dict)
+    }
+    if not any(name == "browser_exec" or name.startswith("browser_") for name in names):
+        raise RuntimeError(
+            "browser capability unavailable for the assigned Kanban profile: "
+            "the canonical CLI grant includes browser, but no safe browser "
+            "backend produced a worker tool schema. Install/configure the "
+            "browser backend before dispatching this task."
+        )
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -10883,6 +10923,7 @@ def _default_spawn(
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
+        _assert_worker_runtime_capabilities(env.get("HERMES_HOME"), worker_toolsets)
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",

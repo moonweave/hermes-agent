@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -161,3 +163,119 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_browser_grant_without_terminal_gets_constrained_browser_schema(
+    monkeypatch, tmp_path
+):
+    """Browser Use must not collapse a least-privilege QA profile to no browser.
+
+    ``browser_exec`` is intentionally unavailable without terminal because it
+    executes host Python.  A profile that grants browser but not terminal must
+    fall back to the constrained built-in browser actions instead of losing the
+    entire browser capability.
+    """
+    profile = tmp_path / ".hermes" / "profiles" / "webdesignqa"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli: [browser, web, kanban]\n",
+        encoding="utf-8",
+    )
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools import browser_tool, browser_use_cli
+    from tools.registry import invalidate_check_fn_cache
+
+    # Browser Use is the default implementation, while the constrained local
+    # backend is also available for a no-terminal session.
+    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(
+        browser_tool, "_find_agent_browser", lambda *_a, **_kw: "agent-browser"
+    )
+    monkeypatch.setattr(browser_tool, "_chromium_installed", lambda: True)
+
+    token = set_hermes_home_override(str(profile))
+    try:
+        toolsets = __import__(
+            "hermes_cli.kanban_db", fromlist=["_resolve_worker_cli_toolsets"]
+        )._resolve_worker_cli_toolsets(str(profile))
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        schema = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+    finally:
+        reset_hermes_home_override(token)
+
+    names = {item["function"]["name"] for item in schema}
+    assert {"browser_navigate", "browser_snapshot"} <= names
+    assert "browser_exec" not in names
+    assert "terminal" not in names
+    assert "execute_code" not in names
+    assert not {"read_file", "write_file", "patch"} & names
+
+
+@pytest.mark.parametrize("workspace_kind", ["scratch", "dir"])
+def test_browser_grant_fails_before_spawn_when_no_safe_backend(
+    monkeypatch, tmp_path, workspace_kind
+):
+    """Unavailable browser grants must produce a pre-dispatch capability error."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "webdesignqa"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli: [browser, web, kanban]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from model_tools import _clear_tool_defs_cache
+    from tools import browser_tool, browser_use_cli
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: None)
+    monkeypatch.setattr(
+        browser_tool,
+        "_find_agent_browser",
+        lambda *_a, **_kw: (_ for _ in ()).throw(FileNotFoundError("unavailable")),
+    )
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_a, **_kw: pytest.fail("worker must not spawn without browser"),
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="webdesignqa")
+    task.workspace_kind = workspace_kind
+
+    with pytest.raises(RuntimeError, match="browser.*unavailable|browser.*capability"):
+        kb._default_spawn(task, str(workspace))
+
+
+def test_running_dispatcher_resolves_profile_toolset_reload(monkeypatch, tmp_path):
+    """A long-lived gateway dispatcher must read the updated profile grant."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "webdesignqa"
+    profile.mkdir(parents=True)
+    config_path = profile / "config.yaml"
+    config_path.write_text(
+        "platform_toolsets:\n  cli: [web, kanban]\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    before = kb._resolve_worker_cli_toolsets(str(profile))
+    assert before is not None and "browser" not in before
+
+    config_path.write_text(
+        "platform_toolsets:\n  cli: [browser, web, kanban]\n", encoding="utf-8"
+    )
+    after = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert after is not None and "browser" in after

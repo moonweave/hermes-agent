@@ -592,6 +592,57 @@ def _compute_tool_definitions(
         ]
         available_tool_names.discard("browser_exec")
 
+        # browser_exec is the Browser Use implementation of the browser
+        # toolset, but it is also arbitrary host-Python execution.  A
+        # least-privilege profile may intentionally grant browser without
+        # terminal/code/file (Web Design QA is the canonical example).  In
+        # that shape, keep the security gate above and expose the constrained
+        # built-in browser actions when their independent local backend probe
+        # passes.  Registry check_fn results cannot express this choice: they
+        # are TTL-cached process-wide while a gateway serves sessions with
+        # different grants, so the fallback belongs at this session-scoped
+        # schema seam.
+        try:
+            from tools.browser_tool import check_builtin_browser_requirements
+
+            builtin_ready = check_builtin_browser_requirements()
+        except Exception:
+            builtin_ready = False
+        if builtin_ready and "browser" in (enabled_toolsets or []):
+            constrained_names = {
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_scroll",
+                "browser_back",
+                "browser_press",
+                "browser_get_images",
+                "browser_console",
+            }
+            if "vision_analyze" in available_tool_names:
+                constrained_names.add("browser_vision")
+            restored = []
+            for name in sorted(constrained_names & tools_to_include):
+                entry = registry.get_entry(name)
+                if entry is None:
+                    continue
+                schema = {**entry.schema, "name": entry.name}
+                if entry.dynamic_schema_overrides is not None:
+                    try:
+                        overrides = entry.dynamic_schema_overrides()
+                        if isinstance(overrides, dict):
+                            schema.update(overrides)
+                    except Exception:
+                        logger.debug(
+                            "browser fallback schema override failed for %s",
+                            name,
+                            exc_info=True,
+                        )
+                restored.append({"type": "function", "function": schema})
+                available_tool_names.add(name)
+            filtered_tools.extend(restored)
+
     # delegate_task's child-restrictions rule names sibling tools (clarify,
     # memory, cronjob). Warning about tools this session doesn't even have
     # teaches ghost vocabulary — filter the list to tools actually present

@@ -5,6 +5,8 @@ import json
 import os
 import shlex
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -296,3 +298,217 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+@pytest.mark.parametrize("outcome", ["success", "exception"])
+def test_parent_can_mutate_kanban_while_background_child_is_active_and_after_cleanup(
+    monkeypatch,
+    tmp_path,
+    outcome,
+):
+    """Exercise the real child runner, subprocess env builder, and DB guard."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    from gateway.session_context import get_session_env
+    from tools import delegate_tool
+    from tools.environments.local import _make_run_env
+
+    entered = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    class Parent:
+        _current_task_id = tid
+
+        def _touch_activity(self, _desc):
+            return None
+
+    class Child:
+        tool_progress_callback = None
+        _delegate_saved_tool_names = []
+        _credential_pool = None
+        _subagent_id = f"sa-{outcome}"
+        _delegate_depth = 1
+        _parent_subagent_id = None
+        session_id = f"child-{outcome}"
+        model = "test-model"
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_estimated_cost_usd = 0.0
+        session_reasoning_tokens = 0
+
+        def get_activity_summary(self):
+            return {
+                "api_call_count": 0,
+                "max_iterations": 1,
+                "current_tool": "terminal",
+            }
+
+        def run_conversation(self, user_message, task_id, **_kwargs):
+            child_env = _make_run_env({})
+            observed["child_marker"] = child_env.get(
+                "HERMES_DELEGATED_CHILD_CONTEXT"
+            )
+            observed["child_session"] = get_session_env("HERMES_SESSION_ID", "")
+            observed["child_kanban_keys"] = {
+                key for key in child_env if key.startswith("HERMES_KANBAN_")
+            }
+            conn = kb.connect()
+            try:
+                with pytest.raises(PermissionError):
+                    kb.add_comment(conn, tid, "child", "must be rejected")
+            finally:
+                conn.close()
+            entered.set()
+            assert release.wait(5)
+            if outcome == "exception":
+                raise RuntimeError("controlled child failure")
+            return {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 0,
+                "messages": [],
+            }
+
+        def close(self):
+            return None
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            delegate_tool._run_single_child,
+            0,
+            "hold at barrier",
+            Child(),
+            Parent(),
+        )
+        assert entered.wait(5)
+
+        parent_env = _make_run_env({})
+        assert parent_env.get("HERMES_DELEGATED_CHILD_CONTEXT") is None
+        conn = kb.connect()
+        try:
+            kb.add_comment(conn, tid, "parent", "allowed while child active")
+        finally:
+            conn.close()
+
+        release.set()
+        result = future.result(timeout=10)
+
+    assert observed["child_marker"] == "1"
+    assert observed["child_session"] == f"child-{outcome}"
+    assert observed["child_kanban_keys"] == set()
+    assert result["status"] == ("completed" if outcome == "success" else "error")
+    assert _make_run_env({}).get("HERMES_DELEGATED_CHILD_CONTEXT") is None
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, tid, "parent", "allowed after child cleanup")
+        comments = kb.list_comments(conn, tid)
+    finally:
+        conn.close()
+    assert [comment.author for comment in comments] == ["parent", "parent"]
+
+
+def test_concurrent_children_keep_marker_and_session_identity_isolated(monkeypatch):
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    from agent.delegation_context import delegated_child_context
+    from gateway.session_context import get_session_env
+    from tools.environments.local import _make_run_env
+
+    barrier = threading.Barrier(2)
+
+    def inspect_child(session_id):
+        with delegated_child_context(session_id):
+            barrier.wait(timeout=5)
+            return (
+                _make_run_env({}).get("HERMES_DELEGATED_CHILD_CONTEXT"),
+                get_session_env("HERMES_SESSION_ID", ""),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        a = executor.submit(inspect_child, "child-a")
+        b = executor.submit(inspect_child, "child-b")
+        assert a.result(timeout=10) == ("1", "child-a")
+        assert b.result(timeout=10) == ("1", "child-b")
+
+    assert _make_run_env({}).get("HERMES_DELEGATED_CHILD_CONTEXT") is None
+
+
+def test_child_timeout_hard_interrupt_does_not_mark_parent(monkeypatch, tmp_path):
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch, tmp_path
+    )
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    from tools import delegate_tool
+    from tools.environments.local import _make_run_env
+
+    entered = threading.Event()
+    interrupted = threading.Event()
+    observed = {}
+
+    class Parent:
+        _current_task_id = tid
+
+        def _touch_activity(self, _desc):
+            return None
+
+    class Child:
+        tool_progress_callback = None
+        _delegate_saved_tool_names = []
+        _credential_pool = None
+        _subagent_id = "sa-timeout"
+        _delegate_depth = 1
+        _parent_subagent_id = None
+        session_id = "child-timeout"
+        model = "test-model"
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_estimated_cost_usd = 0.0
+        session_reasoning_tokens = 0
+
+        def get_activity_summary(self):
+            return {"api_call_count": 0, "max_iterations": 1, "current_tool": None}
+
+        def run_conversation(self, **_kwargs):
+            observed["child_marker"] = _make_run_env({}).get(
+                "HERMES_DELEGATED_CHILD_CONTEXT"
+            )
+            entered.set()
+            assert interrupted.wait(5)
+            return {
+                "final_response": "interrupted",
+                "completed": False,
+                "interrupted": True,
+                "api_calls": 0,
+                "messages": [],
+            }
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.05)
+
+    def hard_interrupt(_child, *_args, **_kwargs):
+        interrupted.set()
+        return True
+
+    monkeypatch.setattr(delegate_tool, "request_hard_interrupt", hard_interrupt)
+
+    result = delegate_tool._run_single_child(
+        0, "timeout at barrier", Child(), Parent()
+    )
+
+    assert entered.is_set()
+    assert observed["child_marker"] == "1"
+    assert result["status"] == "timeout"
+    assert _make_run_env({}).get("HERMES_DELEGATED_CHILD_CONTEXT") is None
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, tid, "parent", "allowed after timeout interrupt")
+    finally:
+        conn.close()

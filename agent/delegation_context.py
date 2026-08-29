@@ -70,6 +70,23 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
+def reset_inherited_execution_context() -> None:
+    """Start a new top-level turn without an inherited child execution role.
+
+    ``asyncio.create_task`` snapshots the caller's ContextVars.  Gateway
+    completion delivery can therefore create the next parent turn from a
+    callback that still carries a delegated-child or non-dispatcher scope.
+    A new inbound turn is an execution-role boundary, not a nested child, so
+    both task-local markers must be cleared before tools build subprocess envs
+    or apply Kanban ownership guards.
+
+    This intentionally does not touch ``os.environ``.  Process-global state is
+    never an execution-role authority and may be shared by concurrent turns.
+    """
+    _DELEGATED_CHILD_CONTEXT.set(False)
+    _NON_DISPATCHER_OWNED_CONTEXT.set(False)
+
+
 @contextmanager
 def non_dispatcher_owned_context() -> Iterator[None]:
     """Mark in-process execution that does NOT own the dispatcher's Kanban task.
@@ -132,9 +149,15 @@ def is_delegated_child_process_context() -> bool:
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Return *env* with dispatcher-only Kanban variables removed."""
-    cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
+    # Scrub by namespace, not only today's ownership-key tuple.  Dispatcher
+    # additions such as HERMES_KANBAN_ATTACHMENTS_ROOT and goal/branch metadata
+    # must not silently cross into a delegated subprocess merely because this
+    # helper's fixed list was not updated in the same change.
+    cleaned = {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("HERMES_KANBAN_")
+    }
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 

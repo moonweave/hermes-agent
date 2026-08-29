@@ -17437,6 +17437,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        # A gateway message is always a fresh top-level execution role.  The
+        # adapter creates its processing task with asyncio.create_task(), which
+        # snapshots the caller's ContextVars; a synthetic background-delegation
+        # completion can otherwise make the next parent turn inherit the child
+        # marker and materialize HERMES_DELEGATED_CHILD_CONTEXT=1 into every
+        # terminal/execute_code subprocess it starts.
+        try:
+            from agent.delegation_context import reset_inherited_execution_context
+
+            reset_inherited_execution_context()
+        except Exception:
+            logger.debug(
+                "reset_inherited_execution_context failed at handler entry",
+                exc_info=True,
+            )
+
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message

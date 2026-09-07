@@ -374,3 +374,28 @@ def test_sidecar_claim_of_parent_does_not_grant_lineage(spillover):
         session_id="invented-parent", task_id="invented-parent",
     )
     assert not json.loads(result)["success"] and "NOT_AUTHORIZED" not in result
+
+
+@pytest.mark.parametrize("producer,allowed", [
+    ("mcp__kospi_investment__get_event_context", True),
+    ("mcp__kospi_investment__get_situation_brief", True),
+    ("mcp__kospi_investment__get_fundamental_context", True),
+    ("mcp__kospi_investment__get_balance", False),
+    ("mcp__kospi_investment__get_dual_account_snapshot", False),
+])
+def test_aggregate_storage_preserves_research_producer_and_session(spillover, producer, allowed):
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from tools.budget_config import BudgetConfig
+    from tools.tool_result_storage import enforce_turn_budget, extract_persisted_path
+
+    messages = [make_tool_result_message(producer, "x" * 12000 + "AGGREGATE_TAIL", "aggregate_call")]
+    enforce_turn_budget(messages, config=BudgetConfig(turn_budget=500, preview_size=50),
+                        session_id="parent", requester_id="parent")
+    reference = extract_persisted_path(messages[0]["content"])
+    assert reference and "AGGREGATE_TAIL" not in messages[0]["content"]
+    sidecar = json.loads(Path(reference + ".meta.json").read_text())
+    assert sidecar["tool_name"] == producer and sidecar["session_id"] == "parent"
+    result = evidence.registry.dispatch("investment_evidence", {"reference": reference},
+                                        session_id="parent", task_id="parent")
+    assert json.loads(result)["success"] is allowed
+    assert ("AGGREGATE_TAIL" in result) is allowed

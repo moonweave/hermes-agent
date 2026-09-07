@@ -71,6 +71,9 @@ _INVESTMENT_EVIDENCE_PRODUCERS = frozenset({
     "mcp__kospi_investment__get_flow_context",
     "mcp__kospi_investment__get_pressure_context",
     "mcp__kospi_investment__get_macro_context",
+    "mcp__kospi_investment__get_event_context",
+    "mcp__kospi_investment__get_situation_brief",
+    "mcp__kospi_investment__get_fundamental_context",
     "mcp__kr_fundamentals__analyze_overview_tool",
     "mcp__kr_fundamentals__analyze_valuation_tool",
     "mcp__kr_fundamentals__analyze_stability_tool",
@@ -446,6 +449,10 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    *,
+    session_id: str = "",
+    requester_id: str = "",
+    parent_session_id: str = "",
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -478,11 +485,14 @@ def enforce_turn_budget(
 
         replacement = maybe_persist_tool_result(
             content=content,
-            tool_name=_BUDGET_TOOL_NAME,
+            tool_name=msg.get("name") or msg.get("tool_name") or _BUDGET_TOOL_NAME,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
+            session_id=session_id,
+            requester_id=requester_id,
+            parent_session_id=parent_session_id,
         )
         if replacement != content:
             total_size -= size

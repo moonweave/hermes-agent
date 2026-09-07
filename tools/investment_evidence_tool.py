@@ -16,6 +16,7 @@ import stat
 import time
 
 from agent.redact import redact_sensitive_text
+from agent.file_safety import get_read_block_error
 from tools.file_tools import read_file_tool
 from tools.registry import registry, tool_error
 from tools.tool_result_storage import SPILLOVER_MAX_AGE_HOURS, get_spillover_dir
@@ -182,7 +183,7 @@ def _guarded_character_page(path: Path, filename: str, offset: int) -> str:
                            "error": str(exc), "provider_retry": False})
 
 
-def _handle_investment_evidence(args: dict, **_: object) -> str:
+def _handle_investment_evidence(args: dict, task_id: str | None = None, **_: object) -> str:
     for key, default, maximum in (("offset", 1, None), ("limit", 500, 2000), ("character_offset", 1, None)):
         value = args.get(key, default)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1 or (maximum and value > maximum):
@@ -194,6 +195,10 @@ def _handle_investment_evidence(args: dict, **_: object) -> str:
             "error": "investment_evidence: missing or unsafe file under the active profile cache/spillover root",
             "provider_retry": False})
     path, filename = safe
+    block_error = get_read_block_error(str(path))
+    if block_error:
+        return json.dumps({"success": False, "status": "degraded", "unknown": True,
+                           "error": block_error, "provider_retry": False})
     if _expired(path):
         return json.dumps(
             {"success": False, "status": "degraded", "unknown": True,
@@ -212,7 +217,7 @@ def _handle_investment_evidence(args: dict, **_: object) -> str:
         path=str(path),
         offset=args.get("offset", 1),
         limit=args.get("limit", 500),
-        task_id="investment-evidence",
+        task_id=task_id or "investment-evidence",
     )
     try:
         payload = json.loads(result)

@@ -183,3 +183,22 @@ def test_character_page_fifo_swap_is_opened_nonblocking_and_rejected(spillover, 
     monkeypatch.setattr(evidence.os, "supports_dir_fd", os.supports_dir_fd | {raced_open})
     page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert page["success"] is False and page["status"] == "degraded"
+
+
+def test_character_mode_preserves_the_existing_internal_read_guard(spillover, monkeypatch):
+    path = spillover / "blocked.txt"
+    path.write_text("must-not-be-returned")
+    monkeypatch.setattr(evidence, "get_read_block_error", lambda _: "protected internal file")
+    page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    assert page["success"] is False and page["status"] == "degraded"
+    assert "must-not-be-returned" not in json.dumps(page)
+
+
+def test_independent_analysts_do_not_share_the_line_read_dedup_cache(spillover):
+    path = spillover / "independent.txt"
+    path.write_text("INDEPENDENT_EVIDENCE_READ\n")
+    args = {"reference": path.name, "offset": 1, "limit": 1}
+    for task_id in ("evidence-analyst-a", "evidence-analyst-b"):
+        page = json.loads(evidence._handle_investment_evidence(args, task_id=task_id))
+        assert page["success"]
+        assert "INDEPENDENT_EVIDENCE_READ" in page["content"]

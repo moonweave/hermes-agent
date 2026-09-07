@@ -12,14 +12,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import time
 
 from agent.redact import redact_sensitive_text
 from agent.file_safety import get_read_block_error
-from tools.file_tools import read_file_tool
 from tools.registry import registry, tool_error
-from tools.tool_result_storage import SPILLOVER_MAX_AGE_HOURS, get_spillover_dir
+from tools.tool_result_storage import (
+    SPILLOVER_MAX_AGE_HOURS,
+    _INVESTMENT_EVIDENCE_PRODUCERS,
+    get_spillover_dir,
+)
 
 _CHARACTER_PAGE_SIZE = 20_000
 _MAX_CHARACTER_SOURCE_BYTES = 8 * 1024 * 1024
@@ -129,12 +133,74 @@ def _metadata(path: Path, filename: str) -> dict[str, object]:
     }
 
 
-def _character_page(path: Path, filename: str, offset: int) -> str:
-    # Pin every directory and the leaf without following links, including
-    # replacements after _safe_reference. Redact before slicing so a secret
-    # crossing a page boundary cannot lose the context needed to redact it.
+def _read_provenance(path: Path) -> dict[str, object]:
+    sidecar = path.with_name(f"{path.name}.meta.json")
+    descriptor = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        sidecar_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_size > 64 * 1024:
+            raise ValueError("metadata is not a bounded regular file")
+        raw = os.read(descriptor, sidecar_stat.st_size + 1)
+        if len(raw) != sidecar_stat.st_size:
+            raise ValueError("metadata changed during the read")
+    finally:
+        os.close(descriptor)
+    metadata = json.loads(raw.decode("utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata is not an object")
+    return metadata
+
+
+def _provenance_error(
+    path: Path,
+    metadata: dict[str, object],
+    *,
+    session_id: str | None,
+    requester_id: str | None,
+) -> str | None:
+    """Require storage-issued, non-account provenance bound to the bytes."""
+    try:
+        if metadata.get("version") != 1 or metadata.get("filename") != path.name:
+            raise ValueError("metadata does not identify this evidence")
+        if metadata.get("tool_name") not in _INVESTMENT_EVIDENCE_PRODUCERS:
+            raise ValueError("producer is not authorized investment evidence")
+        if not isinstance(metadata.get("tool_use_id"), str) or not metadata["tool_use_id"]:
+            raise ValueError("tool call provenance is missing")
+        if not session_id:
+            raise ValueError("request session is missing")
+        stored_session = metadata.get("session_id")
+        if not isinstance(stored_session, str) or not stored_session:
+            raise ValueError("evidence session provenance is missing")
+        if session_id != stored_session:
+            # Lineage is runtime-owned session state, not a claim in the
+            # file sidecar or model-supplied tool arguments.
+            from hermes_constants import get_hermes_home
+
+            database = get_hermes_home() / "state.db"
+            connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)
+            try:
+                lineage = dict(connection.execute(
+                    "SELECT id, parent_session_id FROM sessions WHERE id IN (?, ?)",
+                    (session_id, stored_session),
+                ).fetchall())
+            finally:
+                connection.close()
+            if (session_id not in lineage or stored_session not in lineage or
+                    not (lineage[session_id] == stored_session or lineage[stored_session] == session_id)):
+                raise ValueError("evidence belongs to another session")
+        elif requester_id:
+            stored_requester = metadata.get("requester_id")
+            if stored_requester and stored_requester != requester_id:
+                raise ValueError("evidence belongs to another requester")
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        return f"investment_evidence: evidence provenance unavailable ({exc})"
+    return None
+
+
+def _read_pinned_source(path: Path) -> tuple[bytes, dict[str, object]]:
+    """Read one bounded, no-follow byte snapshot and its storage proof."""
     if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
-        raise ValueError("character paging requires local descriptor-relative reads")
+        raise ValueError("evidence paging requires local descriptor-relative reads")
     directory = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for component in path.parts[1:-1]:
@@ -147,18 +213,44 @@ def _character_page(path: Path, filename: str, offset: int) -> str:
     with os.fdopen(descriptor, "rb") as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_CHARACTER_SOURCE_BYTES:
-            raise ValueError("character paging requires a regular evidence file of at most 8 MiB")
+            raise ValueError("evidence must be a regular file of at most 8 MiB")
         raw = handle.read(_MAX_CHARACTER_SOURCE_BYTES + 1)
         after = os.fstat(handle.fileno())
         current = path.stat(follow_symlinks=False)
-        def fingerprint(s):
-            return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns
+        fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
         if fingerprint(before) != fingerprint(after) or fingerprint(after) != fingerprint(current) or len(raw) != after.st_size:
             raise ValueError("evidence changed during the read")
+    metadata = _read_provenance(path)
+    if metadata.get("content_sha256") != hashlib.sha256(raw).hexdigest():
+        raise ValueError("evidence provenance does not match the read bytes")
+    return raw, metadata
+
+
+def _character_page(
+    path: Path,
+    filename: str,
+    offset: int,
+    *,
+    session_id: str | None,
+    requester_id: str | None,
+) -> str:
+    # Pin every directory and the leaf without following links, including
+    # replacements after _safe_reference. Redact before slicing so a secret
+    # crossing a page boundary cannot lose the context needed to redact it.
+    raw, provenance = _read_pinned_source(path)
+    provenance_error = _provenance_error(
+        path, provenance, session_id=session_id, requester_id=requester_id,
+    )
+    if provenance_error:
+        raise ValueError(provenance_error)
     text = raw.decode("utf-8")
     if "\x00" in text:
         raise ValueError("evidence is not UTF-8 text")
     text = redact_sensitive_text(text, force=True, file_read=True, redact_url_credentials=True)
+    return _render_character_page(text, path, filename, offset)
+
+
+def _render_character_page(text: str, path: Path, filename: str, offset: int) -> str:
     if offset > len(text) + 1:
         raise ValueError("character_offset exceeds the redacted evidence")
     start = offset - 1
@@ -175,15 +267,21 @@ def _character_page(path: Path, filename: str, offset: int) -> str:
     }, ensure_ascii=False)
 
 
-def _guarded_character_page(path: Path, filename: str, offset: int) -> str:
+def _guarded_character_page(path: Path, filename: str, offset: int, *, session_id: str | None, requester_id: str | None) -> str:
     try:
-        return _character_page(path, filename, offset)
+        return _character_page(path, filename, offset, session_id=session_id, requester_id=requester_id)
     except (OSError, ValueError, NotImplementedError) as exc:
         return json.dumps({"success": False, "status": "degraded", "unknown": True,
                            "error": str(exc), "provider_retry": False})
 
 
-def _handle_investment_evidence(args: dict, task_id: str | None = None, **_: object) -> str:
+def _handle_investment_evidence(
+    args: dict,
+    task_id: str | None = None,
+    session_id: str | None = None,
+    requester_id: str | None = None,
+    **_: object,
+) -> str:
     for key, default, maximum in (("offset", 1, None), ("limit", 500, 2000), ("character_offset", 1, None)):
         value = args.get(key, default)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1 or (maximum and value > maximum):
@@ -195,6 +293,18 @@ def _handle_investment_evidence(args: dict, task_id: str | None = None, **_: obj
             "error": "investment_evidence: missing or unsafe file under the active profile cache/spillover root",
             "provider_retry": False})
     path, filename = safe
+    try:
+        provenance = _read_provenance(path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        provenance = None
+        provenance_error = f"investment_evidence: evidence provenance unavailable ({exc})"
+    else:
+        provenance_error = _provenance_error(
+            path, provenance, session_id=session_id, requester_id=requester_id or task_id,
+        )
+    if provenance_error:
+        return json.dumps({"success": False, "status": "degraded", "unknown": True,
+                           "error": provenance_error, "provider_retry": False})
     block_error = get_read_block_error(str(path))
     if block_error:
         return json.dumps({"success": False, "status": "degraded", "unknown": True,
@@ -212,36 +322,33 @@ def _handle_investment_evidence(args: dict, task_id: str | None = None, **_: obj
     if checked is None or checked[0] != path:
         return tool_error("investment_evidence: evidence path changed or is unsafe")
     if "character_offset" in args:
-        return _guarded_character_page(path, filename, args["character_offset"])
-    result = read_file_tool(
-        path=str(path),
-        offset=args.get("offset", 1),
-        limit=args.get("limit", 500),
-        task_id=task_id or "investment-evidence",
-    )
+        return _guarded_character_page(path, filename, args["character_offset"], session_id=session_id, requester_id=requester_id or task_id)
     try:
-        payload = json.loads(result)
-    except (TypeError, json.JSONDecodeError):
-        return json.dumps(
-            {"success": True, "status": "ok", "content": result,
-             **_metadata(path, filename)},
-            ensure_ascii=False,
+        raw, provenance = _read_pinned_source(path)
+        provenance_error = _provenance_error(
+            path, provenance, session_id=session_id, requester_id=requester_id or task_id,
         )
-    if isinstance(payload, dict):
-        if "... [truncated]" in payload.get("content", ""):
-            if args.get("offset", 1) != 1:
-                return json.dumps({"success": False, "status": "degraded", "unknown": True,
-                                   "error": "line was clamped; restart with character_offset=1",
-                                   "provider_retry": False})
-            return _guarded_character_page(path, filename, 1)
-        payload.update(_metadata(path, filename))
-        payload.setdefault("status", "ok" if not payload.get("error") else "degraded")
-        payload.setdefault("success", not bool(payload.get("error")))
-        payload["unknown"] = bool(payload.get("error"))
-        if payload.get("truncated_by") == "bytes" and "remainder is not retrievable" in payload.get("hint", ""):
-            payload.update(success=False, status="degraded", unknown=True,
-                           reason="a single evidence line exceeds the read budget; full coverage unavailable")
-    return json.dumps(payload, ensure_ascii=False)
+        if provenance_error:
+            raise ValueError(provenance_error)
+        text = raw.decode("utf-8")
+        if "\x00" in text:
+            raise ValueError("evidence is not UTF-8 text")
+        text = redact_sensitive_text(text, force=True, file_read=True, redact_url_credentials=True)
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return json.dumps({"success": False, "status": "degraded", "unknown": True,
+                           "error": str(exc), "provider_retry": False})
+    lines = text.splitlines(keepends=True)
+    if len(text) > _CHARACTER_PAGE_SIZE and any(len(line) > _CHARACTER_PAGE_SIZE for line in lines):
+        return _render_character_page(text, path, filename, 1)
+    offset = args.get("offset", 1)
+    limit = args.get("limit", 500)
+    content = "".join(lines[offset - 1:offset - 1 + limit])
+    return json.dumps({
+        "success": True, "status": "ok", "unknown": False, "content": content,
+        "offset": offset, "limit": limit, "total_lines": len(lines),
+        "truncated": offset - 1 + limit < len(lines),
+        **_metadata(path, filename),
+    }, ensure_ascii=False)
 
 
 registry.register(

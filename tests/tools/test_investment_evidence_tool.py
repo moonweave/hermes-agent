@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 
@@ -9,11 +10,30 @@ import pytest
 from tools import investment_evidence_tool as evidence
 
 
+def _write_evidence(path: Path, content: str, tool_name: str = "mcp__kospi_investment__get_market_context") -> None:
+    path.write_text(content, encoding="utf-8")
+    path.with_name(f"{path.name}.meta.json").write_text(json.dumps({
+        "version": 1, "filename": path.name, "tool_name": tool_name,
+        "tool_use_id": "sanitized-tool-call",
+        "session_id": "test-session", "requester_id": "test-requester",
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }), encoding="utf-8")
+
+
 @pytest.fixture
 def spillover(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     root = tmp_path / "cache" / "spillover"
     root.mkdir(parents=True)
     monkeypatch.setattr(evidence, "get_spillover_dir", lambda: root)
+    real_handler = evidence._handle_investment_evidence
+
+    def scoped_handler(args, task_id=None, **kwargs):
+        kwargs.setdefault("session_id", "test-session")
+        kwargs.setdefault("requester_id", "test-requester")
+        return real_handler(args, task_id=task_id, **kwargs)
+
+    monkeypatch.setattr(evidence, "_handle_investment_evidence", scoped_handler)
     return root
 
 
@@ -21,7 +41,7 @@ def test_reader_pages_existing_spillover_and_separates_wrapper_freshness(
     spillover: Path,
 ) -> None:
     path = spillover / "call_sanitized.txt"
-    path.write_text("provider_as_of=2026-09-07T01:00:00Z\nMEANINGFUL_FACT\n", encoding="utf-8")
+    _write_evidence(path, "provider_as_of=2026-09-07T01:00:00Z\nMEANINGFUL_FACT\n")
 
     result = json.loads(
         evidence._handle_investment_evidence(
@@ -56,7 +76,7 @@ def test_reader_rejects_traversal_and_symlink(spillover: Path, tmp_path: Path) -
 
 def test_reader_reports_expired_data_without_provider_retry(spillover: Path) -> None:
     path = spillover / "old.txt"
-    path.write_text("flow=unknown", encoding="utf-8")
+    _write_evidence(path, "flow=unknown")
     old = os.stat(path).st_mtime - 25 * 3600
     os.utime(path, (old, old))
 
@@ -80,12 +100,15 @@ def test_real_storage_and_full_pagination(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(evidence, 'get_spillover_dir', get_spillover_dir)
     content = ''.join(f'line_{i}: observed source data\n' for i in range(1800)) + 'TAIL_FACT: provider_flow_unavailable\n'
-    preview = maybe_persist_tool_result(content, 'investment_fixture', 'tail_evidence', threshold=1000)
+    preview = maybe_persist_tool_result(
+        content, 'mcp__kospi_investment__get_market_context', 'tail_evidence',
+        threshold=1000, session_id="test-session", requester_id="test-requester",
+    )
     reference = extract_persisted_path(preview)
     assert reference and 'TAIL_FACT' not in preview
     pages = []
     for offset in range(1, 1802, 400):
-        page = json.loads(evidence._handle_investment_evidence({'reference': reference, 'offset': offset, 'limit': 400}))
+        page = json.loads(evidence._handle_investment_evidence({'reference': reference, 'offset': offset, 'limit': 400}, session_id="test-session", requester_id="test-requester"))
         assert page['success'] and page['freshness_authority'] == 'provider_payload_as_of'
         pages.append(page['content'])
     assert 'TAIL_FACT: provider_flow_unavailable' in ''.join(pages)
@@ -97,7 +120,7 @@ def test_real_single_line_nested_json_is_read_completely(spillover):
         "tail": "TAIL_FACT_SINGLE_LINE_Q91",
     }, ensure_ascii=False)}, ensure_ascii=False)
     path = spillover / "single_line.txt"
-    path.write_text(source, encoding="utf-8")
+    _write_evidence(path, source)
     args = {"reference": path.name}
     pages = []
     for _ in range(10):
@@ -117,7 +140,7 @@ def test_real_single_line_nested_json_is_read_completely(spillover):
 def test_character_pages_redact_before_slicing(spillover):
     token = "sk-proj-" + "A" * 70
     path = spillover / "redaction.txt"
-    path.write_text("p" * 19973 + "Bearer " + token + " visible_tail", encoding="utf-8")
+    _write_evidence(path, "p" * 19973 + "Bearer " + token + " visible_tail")
     first = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     combined = first["content"]
     if first["truncated"]:
@@ -132,7 +155,7 @@ def test_character_pages_redact_before_slicing(spillover):
 
 @pytest.mark.parametrize("offset", [0, -1, True, "1", 10**30])
 def test_character_offset_rejects_invalid_or_out_of_range_values(spillover, offset):
-    (spillover / "small.txt").write_text("evidence")
+    _write_evidence(spillover / "small.txt", "evidence")
     page = json.loads(evidence._handle_investment_evidence({"reference": "small.txt", "character_offset": offset}))
     assert page["success"] is False
     assert page["status"] == "degraded" and page["unknown"] is True
@@ -140,7 +163,7 @@ def test_character_offset_rejects_invalid_or_out_of_range_values(spillover, offs
 
 def test_character_page_rejects_leaf_swap_without_exposing_outside_file(spillover, tmp_path, monkeypatch):
     path = spillover / "race.txt"
-    path.write_text("safe")
+    _write_evidence(path, "safe")
     outside = tmp_path / "outside.txt"
     outside.write_text("outside-confidential-evidence")
     original_open = os.open
@@ -156,12 +179,12 @@ def test_character_page_rejects_leaf_swap_without_exposing_outside_file(spillove
     page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert page["success"] is False
     assert "outside-confidential-evidence" not in json.dumps(page)
+    assert path.is_symlink()
 
 
 def test_oversized_character_source_is_degraded_without_partial_success(spillover):
     path = spillover / "large.txt"
-    with path.open("wb") as handle:
-        handle.truncate(8 * 1024 * 1024 + 1)
+    _write_evidence(path, "x" * (8 * 1024 * 1024 + 1))
     page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert page["success"] is False
     assert page["status"] == "degraded" and page["unknown"] is True
@@ -169,7 +192,7 @@ def test_oversized_character_source_is_degraded_without_partial_success(spillove
 
 def test_character_page_fifo_swap_is_opened_nonblocking_and_rejected(spillover, monkeypatch):
     path = spillover / "fifo-race.txt"
-    path.write_text("safe")
+    _write_evidence(path, "safe")
     original_open = os.open
 
     def raced_open(name, flags, *args, **kwargs):
@@ -183,22 +206,171 @@ def test_character_page_fifo_swap_is_opened_nonblocking_and_rejected(spillover, 
     monkeypatch.setattr(evidence.os, "supports_dir_fd", os.supports_dir_fd | {raced_open})
     page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert page["success"] is False and page["status"] == "degraded"
+    assert path.is_fifo()
 
 
 def test_character_mode_preserves_the_existing_internal_read_guard(spillover, monkeypatch):
     path = spillover / "blocked.txt"
-    path.write_text("must-not-be-returned")
+    _write_evidence(path, "must-not-be-returned")
     monkeypatch.setattr(evidence, "get_read_block_error", lambda _: "protected internal file")
     page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert page["success"] is False and page["status"] == "degraded"
     assert "must-not-be-returned" not in json.dumps(page)
+    assert page["error"] == "protected internal file"
 
 
 def test_independent_analysts_do_not_share_the_line_read_dedup_cache(spillover):
     path = spillover / "independent.txt"
-    path.write_text("INDEPENDENT_EVIDENCE_READ\n")
+    _write_evidence(path, "INDEPENDENT_EVIDENCE_READ\n")
     args = {"reference": path.name, "offset": 1, "limit": 1}
     for task_id in ("evidence-analyst-a", "evidence-analyst-b"):
         page = json.loads(evidence._handle_investment_evidence(args, task_id=task_id))
         assert page["success"]
         assert "INDEPENDENT_EVIDENCE_READ" in page["content"]
+
+
+@pytest.mark.parametrize("character", [False, True])
+def test_reader_denies_unauthorized_and_legacy_provenance(spillover, character):
+    path = spillover / "account-result.txt"
+    _write_evidence(path, "account_balance=100", tool_name="get_balance")
+    args = {"reference": path.name}
+    if character:
+        args["character_offset"] = 1
+    denied = json.loads(evidence._handle_investment_evidence(args))
+    assert denied["success"] is False and denied["unknown"] is True
+    assert "account_balance" not in json.dumps(denied)
+
+    legacy = spillover / "legacy.txt"
+    legacy.write_text("legacy private result", encoding="utf-8")
+    args = {"reference": legacy.name}
+    if character:
+        args["character_offset"] = 1
+    denied = json.loads(evidence._handle_investment_evidence(args))
+    assert denied["success"] is False and denied["status"] == "degraded"
+
+
+def test_reader_denies_unrelated_session_and_digest_replacement(spillover):
+    path = spillover / "isolated.txt"
+    _write_evidence(path, "ORIGINAL_FACT\n")
+    path.with_name(f"{path.name}.meta.json").write_text(json.dumps({
+        "version": 1, "filename": path.name,
+        "tool_name": "mcp__kospi_investment__get_pressure_context",
+        "tool_use_id": "pressure-call", "session_id": "other-session",
+        "requester_id": "other-requester",
+        "content_sha256": hashlib.sha256(b"ORIGINAL_FACT\n").hexdigest(),
+    }))
+    denied = json.loads(evidence._handle_investment_evidence({"reference": path.name}))
+    assert denied["success"] is False and "ORIGINAL_FACT" not in json.dumps(denied)
+
+    _write_evidence(path, "REPLACED_FACT\n")
+    meta = json.loads(path.with_name(f"{path.name}.meta.json").read_text())
+    meta["content_sha256"] = hashlib.sha256(b"ORIGINAL_FACT\n").hexdigest()
+    path.with_name(f"{path.name}.meta.json").write_text(json.dumps(meta))
+    denied = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    assert denied["success"] is False and "REPLACED_FACT" not in json.dumps(denied)
+
+
+def test_parent_session_can_read_delegated_child_evidence(spillover):
+    from hermes_state import SessionDB
+
+    db = SessionDB(spillover.parent.parent / "state.db")
+    db.create_session("test-session", "cli")
+    db.create_session("child-session", "delegate", parent_session_id="test-session")
+    db.close()
+    path = spillover / "child.txt"
+    _write_evidence(path, "DELEGATED_FACT\n")
+    meta_path = path.with_name(f"{path.name}.meta.json")
+    meta = json.loads(meta_path.read_text())
+    meta.update(session_id="child-session", parent_session_id="test-session", requester_id="child-task")
+    meta_path.write_text(json.dumps(meta))
+    result = json.loads(evidence._handle_investment_evidence(
+        {"reference": path.name}, session_id="test-session", requester_id="parent-task",
+    ))
+    assert result["success"] is True and "DELEGATED_FACT" in result["content"]
+
+
+@pytest.mark.parametrize("producer", [
+    "mcp__kospi_investment__get_pressure_context",
+    "mcp__kr_fundamentals__get_recent_disclosure_events_tool",
+])
+def test_enabled_non_account_producers_round_trip(spillover, producer):
+    path = spillover / "allowed.txt"
+    _write_evidence(path, "ALLOWED_RESEARCH_FACT\n", tool_name=producer)
+    result = json.loads(evidence._handle_investment_evidence({"reference": path.name}))
+    assert result["success"] is True
+    assert "ALLOWED_RESEARCH_FACT" in result["content"]
+
+
+def _persist_native(content, session, producer="mcp__kospi_investment__get_flow_context"):
+    from tools.tool_result_storage import extract_persisted_path, maybe_persist_tool_result
+
+    return extract_persisted_path(maybe_persist_tool_result(
+        content, producer, "call_native_probe", threshold=1,
+        session_id=session, requester_id=session,
+    ))
+
+
+@pytest.mark.parametrize("character", [False, True])
+def test_native_child_reads_parent_evidence_but_unrelated_session_cannot(spillover, character):
+    from hermes_state import SessionDB
+
+    db = SessionDB(spillover.parent.parent / "state.db")
+    db.create_session("parent", "cli")
+    db.create_session("child", "delegate", parent_session_id="parent")
+    db.create_session("unrelated", "cli")
+    db.close()
+    reference = _persist_native("PARENT_RESEARCH_TAIL", "parent")
+    args = {"reference": reference}
+    if character:
+        args["character_offset"] = 1
+    result = json.loads(evidence.registry.dispatch(
+        "investment_evidence", args, session_id="child", task_id="child",
+    ))
+    assert result["success"] and "PARENT_RESEARCH_TAIL" in result["content"]
+    denied = evidence.registry.dispatch(
+        "investment_evidence", args, session_id="unrelated", task_id="unrelated",
+    )
+    assert not json.loads(denied)["success"] and "PARENT_RESEARCH_TAIL" not in denied
+
+
+@pytest.mark.parametrize("character", [False, True])
+@pytest.mark.parametrize("producer,session", [
+    ("mcp__kospi_investment__get_balance", "parent"),
+    ("mcp__kospi_investment__get_flow_context", "unrelated"),
+])
+def test_replaced_source_and_matching_sidecar_are_reauthorized(
+    spillover, monkeypatch, character, producer, session,
+):
+    reference = _persist_native("PERMITTED_RESEARCH", "parent")
+    original = evidence._read_pinned_source
+    swapped = []
+
+    def replace_before_read(path):
+        _persist_native("UNAUTHORIZED_REPLACEMENT", session, producer)
+        swapped.append(True)
+        return original(path)
+
+    monkeypatch.setattr(evidence, "_read_pinned_source", replace_before_read)
+    args = {"reference": reference}
+    if character:
+        args["character_offset"] = 1
+    result = evidence.registry.dispatch(
+        "investment_evidence", args, session_id="parent", task_id="parent",
+    )
+    assert swapped
+    assert not json.loads(result)["success"]
+    assert "UNAUTHORIZED_REPLACEMENT" not in result
+
+
+def test_sidecar_claim_of_parent_does_not_grant_lineage(spillover):
+    path = spillover / "forged-parent.txt"
+    _write_evidence(path, "NOT_AUTHORIZED")
+    sidecar = path.with_name(path.name + ".meta.json")
+    metadata = json.loads(sidecar.read_text())
+    metadata["parent_session_id"] = "invented-parent"
+    sidecar.write_text(json.dumps(metadata))
+    result = evidence.registry.dispatch(
+        "investment_evidence", {"reference": str(path)},
+        session_id="invented-parent", task_id="invented-parent",
+    )
+    assert not json.loads(result)["success"] and "NOT_AUTHORIZED" not in result

@@ -276,6 +276,7 @@ TOOLSETS = {
     "investment_evidence": {
         "description": "Read persisted investment evidence within the active profile",
         "tools": ["investment_evidence"],
+        "includes": [],
     },
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",

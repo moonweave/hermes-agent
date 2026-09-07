@@ -89,3 +89,97 @@ def test_real_storage_and_full_pagination(tmp_path, monkeypatch):
         assert page['success'] and page['freshness_authority'] == 'provider_payload_as_of'
         pages.append(page['content'])
     assert 'TAIL_FACT: provider_flow_unavailable' in ''.join(pages)
+
+
+def test_real_single_line_nested_json_is_read_completely(spillover):
+    source = json.dumps({"result": json.dumps({
+        "rows": ["합성 근거 " + "x" * 900 for _ in range(80)],
+        "tail": "TAIL_FACT_SINGLE_LINE_Q91",
+    }, ensure_ascii=False)}, ensure_ascii=False)
+    path = spillover / "single_line.txt"
+    path.write_text(source, encoding="utf-8")
+    args = {"reference": path.name}
+    pages = []
+    for _ in range(10):
+        page = json.loads(evidence._handle_investment_evidence(args))
+        assert page["success"], page
+        pages.append(page["content"])
+        if not page.get("truncated"):
+            break
+        assert page["next_character_offset"] > args.get("character_offset", 0)
+        args = {"reference": path.name, "character_offset": page["next_character_offset"]}
+    assert "TAIL_FACT_SINGLE_LINE_Q91" in "".join(pages)
+    assert json.loads("".join(pages)) == json.loads(source)
+    assert path.read_text(encoding="utf-8") == source
+    assert all(len(page) <= 20_000 for page in pages)
+
+
+def test_character_pages_redact_before_slicing(spillover):
+    token = "sk-proj-" + "A" * 70
+    path = spillover / "redaction.txt"
+    path.write_text("p" * 19973 + "Bearer " + token + " visible_tail", encoding="utf-8")
+    first = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    combined = first["content"]
+    if first["truncated"]:
+        last = json.loads(evidence._handle_investment_evidence({
+            "reference": path.name, "character_offset": first["next_character_offset"],
+        }))
+        combined += last["content"]
+    assert token not in combined
+    assert "A" * 40 not in combined
+    assert "visible_tail" in combined
+
+
+@pytest.mark.parametrize("offset", [0, -1, True, "1", 10**30])
+def test_character_offset_rejects_invalid_or_out_of_range_values(spillover, offset):
+    (spillover / "small.txt").write_text("evidence")
+    page = json.loads(evidence._handle_investment_evidence({"reference": "small.txt", "character_offset": offset}))
+    assert page["success"] is False
+    assert page["status"] == "degraded" and page["unknown"] is True
+
+
+def test_character_page_rejects_leaf_swap_without_exposing_outside_file(spillover, tmp_path, monkeypatch):
+    path = spillover / "race.txt"
+    path.write_text("safe")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-confidential-evidence")
+    original_open = os.open
+
+    def raced_open(name, flags, *args, **kwargs):
+        if name == "race.txt" and "dir_fd" in kwargs:
+            path.unlink()
+            path.symlink_to(outside)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(evidence.os, "open", raced_open)
+    monkeypatch.setattr(evidence.os, "supports_dir_fd", os.supports_dir_fd | {raced_open})
+    page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    assert page["success"] is False
+    assert "outside-confidential-evidence" not in json.dumps(page)
+
+
+def test_oversized_character_source_is_degraded_without_partial_success(spillover):
+    path = spillover / "large.txt"
+    with path.open("wb") as handle:
+        handle.truncate(8 * 1024 * 1024 + 1)
+    page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    assert page["success"] is False
+    assert page["status"] == "degraded" and page["unknown"] is True
+
+
+def test_character_page_fifo_swap_is_opened_nonblocking_and_rejected(spillover, monkeypatch):
+    path = spillover / "fifo-race.txt"
+    path.write_text("safe")
+    original_open = os.open
+
+    def raced_open(name, flags, *args, **kwargs):
+        if name == path.name and "dir_fd" in kwargs:
+            assert flags & os.O_NONBLOCK
+            path.unlink()
+            os.mkfifo(path)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(evidence.os, "open", raced_open)
+    monkeypatch.setattr(evidence.os, "supports_dir_fd", os.supports_dir_fd | {raced_open})
+    page = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
+    assert page["success"] is False and page["status"] == "degraded"

@@ -138,7 +138,8 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     import cli as cli_mod
 
-    def run_conversation(*, user_message, conversation_history):
+    def run_conversation(*, user_message, conversation_history, task_id=None):
+        assert task_id == "quiet-session", "quiet resume must preserve evidence requester identity"
         calls.append(("run", user_message, conversation_history))
         return {
             "final_response": "",
@@ -201,3 +202,27 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_goal_turns_keep_session_identity_after_rotation(monkeypatch):
+    from hermes_cli import goals, kanban_db
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_existing")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    task = SimpleNamespace(title="Resume evidence", body="", goal_max_turns=2)
+    monkeypatch.setattr(kanban_db, "connect", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(kanban_db, "get_task", lambda *_: task)
+    seen = []
+    fake_cli = SimpleNamespace(session_id="original", conversation_history=[])
+    def conversation(*, user_message, conversation_history, task_id=None):
+        seen.append(task_id)
+        fake_cli.agent.session_id = "rotated"
+        return {"final_response": "continued"}
+    fake_cli.agent = SimpleNamespace(session_id="original", run_conversation=conversation)
+    def loop(**kwargs):
+        assert kwargs["task_id"] == "t_existing"
+        kwargs["run_turn"]("first")
+        kwargs["run_turn"]("second")
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", loop)
+    cli._run_kanban_goal_loop_q(fake_cli, "initial")
+    assert seen == ["original", "rotated"]

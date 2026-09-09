@@ -43,6 +43,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -63,8 +64,31 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 SPILLOVER_SUBDIR = "cache/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
+INVESTMENT_EVIDENCE_MAX_BYTES = 8 * 1024 * 1024
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
+_READ_ONLY_STRATEGY_PRODUCER = "mcp__kospi_investment__analyze_strategy"
+_INVESTMENT_EVIDENCE_PRODUCERS = frozenset({
+    "web_search",
+    "web_extract",
+    "mcp__kospi_investment__get_market_context",
+    "mcp__kospi_investment__get_flow_context",
+    "mcp__kospi_investment__get_pressure_context",
+    "mcp__kospi_investment__get_macro_context",
+    "mcp__kospi_investment__get_event_context",
+    "mcp__kospi_investment__get_situation_brief",
+    "mcp__kospi_investment__get_fundamental_context",
+    "mcp__kr_fundamentals__analyze_overview_tool",
+    "mcp__kr_fundamentals__analyze_valuation_tool",
+    "mcp__kr_fundamentals__analyze_stability_tool",
+    "mcp__kr_fundamentals__analyze_profitability_tool",
+    "mcp__kr_fundamentals__analyze_growth_tool",
+    "mcp__kr_fundamentals__analyze_earnings_trend_tool",
+    "mcp__kr_fundamentals__analyze_earnings_surprise_tool",
+    "mcp__kr_fundamentals__screen_fundamental_candidates_tool",
+    "mcp__kr_fundamentals__get_recent_disclosure_events_tool",
+    "mcp__kr_fundamentals__get_sector_earnings_cycle_tool",
+})
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
@@ -142,7 +166,16 @@ def _is_host_side_env(env) -> bool:
         return False
 
 
-def _write_to_spillover(content: str, filename: str):
+def _write_to_spillover(
+    content: str,
+    filename: str,
+    tool_name: str = "",
+    tool_use_id: str = "",
+    session_id: str = "",
+    requester_id: str = "",
+    parent_session_id: str = "",
+    tool_arguments: dict | None = None,
+):
     """Write content host-side to $HERMES_HOME/cache/spillover.
 
     Returns the absolute path string on success, None on failure.
@@ -152,6 +185,27 @@ def _write_to_spillover(content: str, filename: str):
         spill_dir.mkdir(parents=True, exist_ok=True)
         path = spill_dir / filename
         path.write_text(content, encoding="utf-8", errors="replace")
+        # Keep provenance next to the bytes.  The investment projection is
+        # intentionally fail-closed for legacy files and account-producing
+        # tools; it must not infer authorization from a filename or payload.
+        metadata_path = path.with_name(f"{path.name}.meta.json")
+        metadata = {
+            "version": 1,
+            "filename": path.name,
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "session_id": session_id,
+            "requester_id": requester_id,
+            "parent_session_id": parent_session_id,
+            "content_sha256": hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
+        }
+        if tool_name == _READ_ONLY_STRATEGY_PRODUCER:
+            # Execution arguments, not model-authored result text, grant access.
+            metadata["strategy_read_only"] = (
+                isinstance(tool_arguments, dict)
+                and tool_arguments.get("read_only") is True
+            )
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
         return None
@@ -270,6 +324,7 @@ def _build_persisted_message(
     has_more: bool,
     original_size: int,
     file_path: str,
+    investment_evidence: bool = False,
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -281,12 +336,22 @@ def _build_persisted_message(
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
     msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
-    msg += (
-        "Recovery: page through the saved file with read_file (offset/limit) or "
-        "process it with execute_code — do NOT re-request the same data from the "
-        "remote API; the full result is already on disk.\n\n"
-    )
+    if investment_evidence:
+        msg += (
+            "Read this result with investment_evidence(reference=the saved path). "
+            "Follow next_character_offset for long lines; a preview is not full evidence. "
+            "Do not re-request the provider data. Disclose failed reads and unread scope "
+            "in your final answer. Separate market analysis from operational execution "
+            "restrictions; carry forward unresolved evidence contradictions from this "
+            "conversation.\n\n"
+        )
+    else:
+        msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+        msg += (
+            "Recovery: page through the saved file with read_file (offset/limit) or "
+            "process it with execute_code — do NOT re-request the same data from the "
+            "remote API; the full result is already on disk.\n\n"
+        )
     msg += f"Preview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
@@ -318,6 +383,11 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    session_id: str = "",
+    requester_id: str = "",
+    parent_session_id: str = "",
+    tool_arguments: dict | None = None,
+    investment_evidence_enabled: bool = False,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -350,15 +420,37 @@ def maybe_persist_tool_result(
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
-    host_path = _write_to_spillover(content, filename)
+    host_path = _write_to_spillover(
+        content, filename, tool_name, tool_use_id,
+        session_id, requester_id, parent_session_id, tool_arguments,
+    )
 
+    evidence_reader = investment_evidence_enabled and (
+        tool_name in _INVESTMENT_EVIDENCE_PRODUCERS
+        or (
+            tool_name == _READ_ONLY_STRATEGY_PRODUCER
+            and isinstance(tool_arguments, dict)
+            and tool_arguments.get("read_only") is True
+        )
+    )
+    # investment_evidence executes on the host, even when terminal tools use
+    # a sandbox. A translated sandbox path cannot pass its host-root check.
+    if evidence_reader:
+        if host_path is not None:
+            return _build_persisted_message(preview, has_more, len(content), host_path, True)
+        return json.dumps({
+            "success": False, "status": "degraded", "unknown": True,
+            "error": "Investment evidence could not be saved in the active profile. "
+                     "Disclose this failure; do not report the preview as verified evidence.",
+            "provider_retry": False,
+        })
     if _is_host_side_env(env):
         if host_path is not None:
             logger.info(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return _build_persisted_message(preview, has_more, len(content), host_path, evidence_reader)
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the
@@ -400,6 +492,12 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    *,
+    session_id: str = "",
+    requester_id: str = "",
+    parent_session_id: str = "",
+    execution_provenance: dict | None = None,
+    investment_evidence_enabled: bool = False,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -430,13 +528,23 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
+        tool_name = msg.get("name") or msg.get("tool_name") or _BUDGET_TOOL_NAME
+        proof = (execution_provenance or {}).get(tool_use_id, {})
+        arguments = None
+        if isinstance(proof, dict) and proof.get("tool_name") == tool_name:
+            arguments = {"read_only": proof.get("read_only") is True}
         replacement = maybe_persist_tool_result(
             content=content,
-            tool_name=_BUDGET_TOOL_NAME,
+            tool_name=tool_name,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
             threshold=0,
+            session_id=session_id,
+            requester_id=requester_id,
+            parent_session_id=parent_session_id,
+            tool_arguments=arguments,
+            investment_evidence_enabled=investment_evidence_enabled,
         )
         if replacement != content:
             total_size -= size

@@ -1049,6 +1049,7 @@ async def web_extract_tool(
     urls: List[Any],
     format: str = None,
     char_limit: Optional[int] = None,
+    preserve_full_result: bool = False,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
@@ -1067,6 +1068,9 @@ async def web_extract_tool(
         format (str): Desired output format ("markdown" or "html", optional)
         char_limit (Optional[int]): Per-page char budget sent to the model
             (default: web.extract_char_limit or 15000). Larger pages truncate.
+        preserve_full_result (bool): Keep clean page bodies intact so the
+            caller can persist and page them through an authorized evidence
+            reader instead of emitting a read_file-only cache reference.
 
     Security: URLs are checked for embedded secrets before fetching.
 
@@ -1432,7 +1436,12 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            if preserve_full_result:
+                model_text, truncated = clean, False
+            else:
+                model_text, truncated = _truncate_with_footer(
+                    clean, url, effective_char_limit
+                )
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1462,6 +1471,28 @@ async def web_extract_tool(
             result_json = tool_error("Content was inaccessible or not found")
         else:
             result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
+
+        if preserve_full_result:
+            from tools.tool_result_storage import INVESTMENT_EVIDENCE_MAX_BYTES
+
+            encoded_size = len(result_json.encode("utf-8"))
+            if encoded_size > INVESTMENT_EVIDENCE_MAX_BYTES:
+                result_json = json.dumps(
+                    {
+                        "success": False,
+                        "status": "degraded",
+                        "unknown": True,
+                        "error": (
+                            "Extracted web evidence exceeds the bounded investment "
+                            "reader size. Extract fewer or more specific URLs and "
+                            "disclose that the full source was not read."
+                        ),
+                        "source_urls": [r.get("url", "") for r in trimmed_results],
+                        "extracted_bytes": encoded_size,
+                        "maximum_bytes": INVESTMENT_EVIDENCE_MAX_BYTES,
+                    },
+                    ensure_ascii=False,
+                )
 
         # base64 images were already converted to placeholders per-result above;
         # this is a belt-and-suspenders sweep over the serialized JSON in case a
@@ -1676,7 +1707,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
+    "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages preserve the full text when an authorized session evidence reader is available, otherwise they return a head+tail window. Follow the result's exact paging instructions and disclose failed or unread ranges. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1710,10 +1741,14 @@ registry.register(
     name="web_extract",
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
+    handler=lambda args, enabled_tools=None, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
         "markdown",
         char_limit=args.get("char_limit"),
+        preserve_full_result=(
+            isinstance(enabled_tools, (list, tuple, set))
+            and "investment_evidence" in enabled_tools
+        ),
     ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),

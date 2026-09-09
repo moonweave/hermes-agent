@@ -64,10 +64,13 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 SPILLOVER_SUBDIR = "cache/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
+INVESTMENT_EVIDENCE_MAX_BYTES = 8 * 1024 * 1024
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _READ_ONLY_STRATEGY_PRODUCER = "mcp__kospi_investment__analyze_strategy"
 _INVESTMENT_EVIDENCE_PRODUCERS = frozenset({
+    "web_search",
+    "web_extract",
     "mcp__kospi_investment__get_market_context",
     "mcp__kospi_investment__get_flow_context",
     "mcp__kospi_investment__get_pressure_context",
@@ -384,6 +387,7 @@ def maybe_persist_tool_result(
     requester_id: str = "",
     parent_session_id: str = "",
     tool_arguments: dict | None = None,
+    investment_evidence_enabled: bool = False,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -421,10 +425,13 @@ def maybe_persist_tool_result(
         session_id, requester_id, parent_session_id, tool_arguments,
     )
 
-    evidence_reader = tool_name in _INVESTMENT_EVIDENCE_PRODUCERS or (
-        tool_name == _READ_ONLY_STRATEGY_PRODUCER
-        and isinstance(tool_arguments, dict)
-        and tool_arguments.get("read_only") is True
+    evidence_reader = investment_evidence_enabled and (
+        tool_name in _INVESTMENT_EVIDENCE_PRODUCERS
+        or (
+            tool_name == _READ_ONLY_STRATEGY_PRODUCER
+            and isinstance(tool_arguments, dict)
+            and tool_arguments.get("read_only") is True
+        )
     )
     # investment_evidence executes on the host, even when terminal tools use
     # a sandbox. A translated sandbox path cannot pass its host-root check.
@@ -490,6 +497,7 @@ def enforce_turn_budget(
     requester_id: str = "",
     parent_session_id: str = "",
     execution_provenance: dict | None = None,
+    investment_evidence_enabled: bool = False,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -536,6 +544,7 @@ def enforce_turn_budget(
             requester_id=requester_id,
             parent_session_id=parent_session_id,
             tool_arguments=arguments,
+            investment_evidence_enabled=investment_evidence_enabled,
         )
         if replacement != content:
             total_size -= size

@@ -98,6 +98,96 @@ class TestEndToEnd:
         assert "para 0 " in content
         assert "para 2999 " in content
 
+    def test_investment_reader_mode_keeps_the_complete_page(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        big = "\n".join(f"para {i} " + "z" * 80 for i in range(3000))
+
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{"url": urls[0], "title": "Big Page", "content": big,
+                         "raw_content": big, "metadata": {}}]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(
+                    ["https://example.com/big"],
+                    char_limit=5000,
+                    preserve_full_result=True,
+                )
+            ))
+
+        content = result["results"][0]["content"]
+        assert "[TRUNCATED]" not in content
+        assert "Full text saved to:" not in content
+        assert "para 0 " in content
+        assert "para 1500 " in content
+        assert "para 2999 " in content
+
+    def test_investment_reader_mode_fails_closed_above_reader_limit(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        big = "x" * (wt.MAX_STORED_TEXT_CHARS * 5)
+
+        class FakeProvider:
+            name = "fake"
+            display_name = "Fake"
+
+            def supports_extract(self):
+                return True
+
+            async def extract(self, urls, **kwargs):
+                return [{"url": urls[0], "title": "Oversized", "content": big}]
+
+        with patch("tools.web_tools._ensure_web_plugins_loaded"), \
+             patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("tools.web_tools.async_is_safe_url", new=_AsyncTrue()), \
+             patch("agent.web_search_registry.get_provider", return_value=FakeProvider()):
+            result = json.loads(asyncio.new_event_loop().run_until_complete(
+                wt.web_extract_tool(
+                    ["https://example.com/oversized"],
+                    preserve_full_result=True,
+                )
+            ))
+
+        assert result["success"] is False
+        assert result["status"] == "degraded" and result["unknown"] is True
+        assert result["extracted_bytes"] > result["maximum_bytes"]
+        assert big[:1000] not in json.dumps(result)
+
+
+def test_registry_enables_full_preservation_only_with_investment_reader(monkeypatch):
+    observed = []
+
+    async def fake_extract(*args, **kwargs):
+        observed.append(kwargs["preserve_full_result"])
+        return "{}"
+
+    monkeypatch.setattr(wt, "web_extract_tool", fake_extract)
+    entry = wt.registry.get_entry("web_extract")
+    assert entry is not None
+
+    asyncio.new_event_loop().run_until_complete(
+        entry.handler({"urls": []}, enabled_tools=["web_extract"])
+    )
+    asyncio.new_event_loop().run_until_complete(
+        entry.handler(
+            {"urls": []},
+            enabled_tools=["web_extract", "investment_evidence"],
+        )
+    )
+
+    assert observed == [False, True]
+
 
 def _make_awaitable(value):
     async def _coro(*a, **k):

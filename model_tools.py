@@ -1214,9 +1214,10 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         user_task: The user's original task (for browser_snapshot context).
-        enabled_tools: Tool names enabled for this session.  When provided,
-                       execute_code uses this list to determine which sandbox
-                       tools to generate.  Falls back to the process-global
+        enabled_tools: Tool names enabled for this session.  Registry handlers
+                       may use this only to tailor behavior to an already
+                       granted capability; execute_code also uses it to build
+                       its sandbox tool list. Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
         enabled_toolsets: The session's enabled toolsets.  Used to scope the
                        Tool Search bridge catalog so ``tool_search`` /
@@ -1508,6 +1509,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        enabled_tools=enabled_tools,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

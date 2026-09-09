@@ -20,6 +20,7 @@ from agent.redact import redact_sensitive_text
 from agent.file_safety import get_read_block_error
 from tools.registry import registry, tool_error
 from tools.tool_result_storage import (
+    INVESTMENT_EVIDENCE_MAX_BYTES,
     SPILLOVER_MAX_AGE_HOURS,
     _INVESTMENT_EVIDENCE_PRODUCERS,
     _READ_ONLY_STRATEGY_PRODUCER,
@@ -27,7 +28,6 @@ from tools.tool_result_storage import (
 )
 
 _CHARACTER_PAGE_SIZE = 20_000
-_MAX_CHARACTER_SOURCE_BYTES = 8 * 1024 * 1024
 
 _INVESTMENT_EVIDENCE_SCHEMA = {
     "name": "investment_evidence",
@@ -217,9 +217,9 @@ def _read_pinned_source(path: Path) -> tuple[bytes, dict[str, object]]:
         os.close(directory)
     with os.fdopen(descriptor, "rb") as handle:
         before = os.fstat(handle.fileno())
-        if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_CHARACTER_SOURCE_BYTES:
+        if not stat.S_ISREG(before.st_mode) or before.st_size > INVESTMENT_EVIDENCE_MAX_BYTES:
             raise ValueError("evidence must be a regular file of at most 8 MiB")
-        raw = handle.read(_MAX_CHARACTER_SOURCE_BYTES + 1)
+        raw = handle.read(INVESTMENT_EVIDENCE_MAX_BYTES + 1)
         after = os.fstat(handle.fileno())
         current = path.stat(follow_symlinks=False)
         fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)

@@ -165,7 +165,7 @@ def test_character_page_rejects_leaf_swap_without_exposing_outside_file(spillove
     path = spillover / "race.txt"
     _write_evidence(path, "safe")
     outside = tmp_path / "outside.txt"
-    outside.write_text("outside-confidential-evidence")
+    outside.write_text("outside-confidential-evidence", encoding="utf-8")
     original_open = os.open
 
     def raced_open(name, flags, *args, **kwargs):
@@ -263,9 +263,13 @@ def test_reader_denies_unrelated_session_and_digest_replacement(spillover):
     assert denied["success"] is False and "ORIGINAL_FACT" not in json.dumps(denied)
 
     _write_evidence(path, "REPLACED_FACT\n")
-    meta = json.loads(path.with_name(f"{path.name}.meta.json").read_text())
+    meta = json.loads(
+        path.with_name(f"{path.name}.meta.json").read_text(encoding="utf-8")
+    )
     meta["content_sha256"] = hashlib.sha256(b"ORIGINAL_FACT\n").hexdigest()
-    path.with_name(f"{path.name}.meta.json").write_text(json.dumps(meta))
+    path.with_name(f"{path.name}.meta.json").write_text(
+        json.dumps(meta), encoding="utf-8"
+    )
     denied = json.loads(evidence._handle_investment_evidence({"reference": path.name, "character_offset": 1}))
     assert denied["success"] is False and "REPLACED_FACT" not in json.dumps(denied)
 
@@ -280,9 +284,9 @@ def test_parent_session_can_read_delegated_child_evidence(spillover):
     path = spillover / "child.txt"
     _write_evidence(path, "DELEGATED_FACT\n")
     meta_path = path.with_name(f"{path.name}.meta.json")
-    meta = json.loads(meta_path.read_text())
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta.update(session_id="child-session", parent_session_id="test-session", requester_id="child-task")
-    meta_path.write_text(json.dumps(meta))
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     result = json.loads(evidence._handle_investment_evidence(
         {"reference": path.name}, session_id="test-session", requester_id="parent-task",
     ))
@@ -366,9 +370,9 @@ def test_sidecar_claim_of_parent_does_not_grant_lineage(spillover):
     path = spillover / "forged-parent.txt"
     _write_evidence(path, "NOT_AUTHORIZED")
     sidecar = path.with_name(path.name + ".meta.json")
-    metadata = json.loads(sidecar.read_text())
+    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
     metadata["parent_session_id"] = "invented-parent"
-    sidecar.write_text(json.dumps(metadata))
+    sidecar.write_text(json.dumps(metadata), encoding="utf-8")
     result = evidence.registry.dispatch(
         "investment_evidence", {"reference": str(path)},
         session_id="invented-parent", task_id="invented-parent",
@@ -393,7 +397,9 @@ def test_aggregate_storage_preserves_research_producer_and_session(spillover, pr
                         session_id="parent", requester_id="parent")
     reference = extract_persisted_path(messages[0]["content"])
     assert reference and "AGGREGATE_TAIL" not in messages[0]["content"]
-    sidecar = json.loads(Path(reference + ".meta.json").read_text())
+    sidecar = json.loads(
+        Path(reference + ".meta.json").read_text(encoding="utf-8")
+    )
     assert sidecar["tool_name"] == producer and sidecar["session_id"] == "parent"
     result = evidence.registry.dispatch("investment_evidence", {"reference": reference},
                                         session_id="parent", task_id="parent")
@@ -412,6 +418,7 @@ def test_strategy_reader_requires_runtime_read_only_proof(spillover, read_only):
         content, "mcp__kospi_investment__analyze_strategy", "strategy_test",
         threshold=1000, session_id="test-session", requester_id="test-requester",
         tool_arguments={"read_only": read_only},
+        investment_evidence_enabled=True,
     )
     reference = extract_persisted_path(preview)
     args = {"reference": reference}
@@ -483,7 +490,7 @@ def test_remote_investment_evidence_keeps_host_reference(spillover, monkeypatch,
     preview = storage.maybe_persist_tool_result(
         "raw evidence " * 400, "mcp__kospi_investment__analyze_strategy", "remote",
         env=object(), threshold=1000, session_id="test-session", requester_id="test-requester",
-        tool_arguments={"read_only": True})
+        tool_arguments={"read_only": True}, investment_evidence_enabled=True)
     reference = storage.extract_persisted_path(preview)
     assert Path(reference).is_relative_to(spillover)
     assert "investment_evidence(reference=" in preview
@@ -498,6 +505,48 @@ def test_failed_host_storage_does_not_offer_unreadable_sandbox_evidence(spillove
     monkeypatch.setattr(storage, "_is_host_side_env", lambda env: False)
     result = json.loads(storage.maybe_persist_tool_result(
         "raw evidence " * 400, "mcp__kospi_investment__analyze_strategy", "unsaved",
-        env=object(), threshold=1000, tool_arguments={"read_only": True}))
+        env=object(), threshold=1000, tool_arguments={"read_only": True},
+        investment_evidence_enabled=True))
     assert result["success"] is False and result["status"] == "degraded"
     assert result["unknown"] is True and result["provider_retry"] is False
+
+
+@pytest.mark.parametrize("producer", ["web_search", "web_extract"])
+def test_web_results_use_investment_reader_only_when_enabled(
+    spillover, producer,
+):
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    content = "PUBLIC_WEB_EVIDENCE\n" * 200
+    enabled = maybe_persist_tool_result(
+        content, producer, f"{producer}-enabled", threshold=100,
+        session_id="test-session", requester_id="test-requester",
+        investment_evidence_enabled=True,
+    )
+    disabled = maybe_persist_tool_result(
+        content, producer, f"{producer}-disabled", threshold=100,
+        session_id="test-session", requester_id="test-requester",
+        investment_evidence_enabled=False,
+    )
+
+    assert "investment_evidence(reference=" in enabled
+    assert "Use the read_file" not in enabled
+    assert "Use the read_file" in disabled
+
+
+def test_web_evidence_keeps_session_and_digest_boundaries(spillover):
+    from tools.tool_result_storage import extract_persisted_path, maybe_persist_tool_result
+
+    preview = maybe_persist_tool_result(
+        "WEB_SOURCE_FACT\n" * 200, "web_extract", "web-boundary",
+        threshold=100, session_id="test-session", requester_id="test-requester",
+        investment_evidence_enabled=True,
+    )
+    reference = extract_persisted_path(preview)
+    assert reference
+    allowed = json.loads(evidence._handle_investment_evidence({"reference": reference}))
+    denied = json.loads(evidence._handle_investment_evidence(
+        {"reference": reference}, session_id="unrelated-session"
+    ))
+    assert allowed["success"] is True and "WEB_SOURCE_FACT" in allowed["content"]
+    assert denied["success"] is False and "WEB_SOURCE_FACT" not in json.dumps(denied)

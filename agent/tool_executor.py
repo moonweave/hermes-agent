@@ -1830,6 +1830,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
             tool_arguments=function_args if execution_dispatched and not blocked else None,
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -1933,6 +1936,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
             execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         )
 
     # ── /steer injection ──────────────────────────────────────────────
@@ -2766,6 +2772,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
             tool_arguments=function_args if _execution_dispatched and not _execution_blocked else None,
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -2879,6 +2888,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
             execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         )
 
     # ── /steer injection ──────────────────────────────────────────────
@@ -2950,6 +2962,9 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
             execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

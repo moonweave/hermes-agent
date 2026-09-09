@@ -27,6 +27,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
+from agent.investment_evidence_verifier import disclose_evidence_failure
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
@@ -271,6 +272,22 @@ def finalize_turn(
         )
         if callable(_rollback_fn):
             _rollback_fn(_preflight_snapshot)
+
+    _evidence_original_response = final_response
+    if not interrupted:
+        final_response = disclose_evidence_failure(agent, final_response)
+        if final_response != _evidence_original_response and messages:
+            tail = messages[-1]
+            if tail.get("role") == "assistant" and tail.get("content") == _evidence_original_response:
+                tail["content"] = final_response
+                tail.pop(_DB_PERSISTED_MARKER, None)
+                # The undisclosed response may already have been appended by
+                # an incremental mid-turn flush.  Keeping its canonical row
+                # id makes append_messages_batch adopt that older content and
+                # silently discard the disclosure.  Detach only this rewrite
+                # so the final flush appends the user-visible response.
+                tail.pop("_row_id", None)
+                agent._db_flush_scan_prefix = None
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -601,8 +618,8 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
-    _pre_transform_response = None
+    _response_transformed = final_response != _evidence_original_response
+    _pre_transform_response = _evidence_original_response if _response_transformed else None
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -626,6 +643,10 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Output transforms must not erase a runtime-observed evidence failure.
+    if not interrupted:
+        final_response = disclose_evidence_failure(agent, final_response)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

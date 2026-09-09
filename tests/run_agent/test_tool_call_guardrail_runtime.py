@@ -423,3 +423,152 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_investment_strategy_provenance_survives_both_real_dispatch_paths(tmp_path, monkeypatch):
+    from tools.tool_result_storage import extract_persisted_path
+    from tools.investment_evidence_tool import _handle_investment_evidence
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    producer = "mcp__kospi_investment__analyze_strategy"
+    payload = json.dumps({"structuredContent": {"read_only": True, "data": "evidence " * 30000}})
+    for mode in ("sequential", "concurrent"):
+        agent = _make_agent(producer, "investment_evidence")
+        agent._turn_failed_evidence_reads = set()
+        call = _mock_tool_call(producer, '{"read_only":true}', "strategy-" + mode)
+        messages = []
+        with patch("run_agent.handle_function_call", return_value=payload):
+            getattr(agent, "_execute_tool_calls_" + mode)(
+                SimpleNamespace(content="", tool_calls=[call]), messages, "task-1")
+        path = extract_persisted_path(messages[-1]["content"])
+        assert path, messages[-1]["content"][:500]
+        page = json.loads(_handle_investment_evidence({"reference": path},
+            session_id=agent.session_id, requester_id="task-1"))
+        assert page["success"] is True, page
+        failure = _mock_tool_call("investment_evidence", '{"reference":"missing.txt"}', "missing-" + mode)
+        with patch("run_agent.handle_function_call", return_value='{"success":false,"status":"degraded"}'):
+            getattr(agent, "_execute_tool_calls_" + mode)(
+                SimpleNamespace(content="", tool_calls=[failure]), messages, "task-1")
+        assert agent._turn_failed_evidence_reads
+
+
+def test_evidence_disclosure_real_conversation_persists_and_resets(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from agent.investment_evidence_verifier import EVIDENCE_FAILURE_NOTICE
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _make_agent("investment_evidence")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(agent.session_id, source="telegram")
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_disabled = False
+    agent.skip_background_review = True
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[
+            _mock_tool_call("investment_evidence", '{"reference":"missing.txt"}', "missing-full-turn")]),
+        _mock_response(content="분석 완료", finish_reason="stop"),
+        _mock_response(content="안녕하세요", finish_reason="stop"),
+    ]
+    with patch("run_agent.handle_function_call", return_value='{"success":false,"status":"degraded"}'):
+        result = agent.run_conversation("이 원문을 확인하고 결론을 알려줘")
+    assert EVIDENCE_FAILURE_NOTICE in result["final_response"]
+    rows = db.get_messages_as_conversation(agent.session_id)
+    assert rows[-1]["content"] == result["final_response"]
+    assert sum(EVIDENCE_FAILURE_NOTICE in str(row.get("content")) for row in rows) == 1
+    following = agent.run_conversation("인사만 해줘", conversation_history=result["messages"])
+    assert EVIDENCE_FAILURE_NOTICE not in following["final_response"]
+    db.close()
+
+
+def test_strategy_aggregate_proof_survives_all_dispatch_finalizers(tmp_path, monkeypatch):
+    from tools.budget_config import BudgetConfig
+    from tools.tool_result_storage import extract_persisted_path
+    from tools.investment_evidence_tool import _handle_investment_evidence
+    from agent.tool_executor import execute_tool_calls_segmented
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    budget = BudgetConfig(mcp_result_size=10000, turn_budget=1000, preview_size=100)
+    monkeypatch.setattr("agent.tool_executor._budget_for_agent", lambda agent: budget)
+    producer = "mcp__kospi_investment__analyze_strategy"
+    content = json.dumps({"read_only": True, "data": "raw evidence " * 400})
+    assert 1000 < len(content) < 10000
+    for mode in ("sequential", "concurrent", "segmented"):
+        agent = _make_agent(producer)
+        messages = []
+        call = _mock_tool_call(producer, '{"read_only":true}', "aggregate-" + mode)
+        message = SimpleNamespace(content="", tool_calls=[call])
+        with patch("run_agent.handle_function_call", return_value=content):
+            if mode == "segmented":
+                execute_tool_calls_segmented(agent, message, messages, "task-1")
+            else:
+                getattr(agent, "_execute_tool_calls_" + mode)(message, messages, "task-1")
+        reference = extract_persisted_path(messages[-1]["content"])
+        assert reference
+        result = json.loads(_handle_investment_evidence({"reference": reference},
+            session_id=agent.session_id, requester_id="task-1"))
+        assert result["success"] is True, result
+
+
+def test_unstarted_concurrent_calls_never_grant_strategy_provenance(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    from tools.budget_config import BudgetConfig
+    from tools.tool_result_storage import extract_persisted_path
+    from pathlib import Path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Force the non-execution diagnostic through both persistence layers.
+    budget = BudgetConfig(default_result_size=1, mcp_result_size=1, turn_budget=1, preview_size=30)
+    monkeypatch.setattr("agent.tool_executor._budget_for_agent", lambda agent: budget)
+    producer = "mcp__kospi_investment__analyze_strategy"
+    for failure in ("missing", "timeout", "interrupt", "shutdown"):
+        for strategy_last in (False, True):
+            class UnstartedPool:
+                def __init__(self, **kwargs):
+                    pass
+
+                def submit(self, *args, **kwargs):
+                    if failure == "shutdown":
+                        raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+                    if failure == "interrupt":
+                        agent._interrupt_requested = True
+                    future = Future()
+                    if failure == "missing":
+                        future.set_result(None)
+                    return future
+
+                def shutdown(self, **kwargs):
+                    pass
+
+            monkeypatch.setattr("tools.daemon_pool.DaemonThreadPoolExecutor", UnstartedPool)
+            monkeypatch.setattr("agent.tool_executor._resolve_concurrent_tool_timeout",
+                                lambda: 0.0 if failure == "timeout" else None)
+            agent = _make_agent(producer, "web_search")
+            agent._interrupt_requested = False
+            if failure == "interrupt":
+                monkeypatch.setattr("agent.tool_executor.concurrent.futures.wait",
+                                    lambda futures, **kwargs: (set(), set(futures)))
+            strategy_id = f"unstarted-{failure}-{strategy_last}"
+            other_id = f"other-{failure}-{strategy_last}"
+            calls = [_mock_tool_call(producer, '{"read_only":true}', strategy_id),
+                     _mock_tool_call("web_search", '{}', other_id)]
+            if strategy_last:
+                calls.reverse()
+            messages = []
+            with patch("run_agent.handle_function_call") as invoke:
+                agent._execute_tool_calls_concurrent(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+                invoke.assert_not_called()
+            proofs = agent._turn_strategy_execution_provenance
+            assert other_id not in proofs
+            assert proofs[strategy_id]["read_only"] is False
+            strategy_message = next(message for message in messages if message['tool_call_id'] == strategy_id)
+            reference = extract_persisted_path(strategy_message['content'])
+            assert reference
+            metadata = json.loads(
+                Path(reference + ".meta.json").read_text(encoding="utf-8")
+            )
+            assert metadata['tool_name'] == producer
+            assert metadata['strategy_read_only'] is False

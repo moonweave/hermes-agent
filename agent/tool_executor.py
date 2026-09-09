@@ -51,6 +51,8 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path,
 )
+from agent.investment_evidence_verifier import record_evidence_read, record_strategy_execution
+
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -1223,7 +1225,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     results = [None] * num_tools
     for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
-            results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+            results[i] = (name, args, block_result, 0.0, True, True, middleware_trace, False)
 
     start_condition = threading.Condition()
     next_start_order = 0
@@ -1438,6 +1440,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     True,
                     False,
                     middleware_trace,
+                    False,
                 )
                 return
             except Exception as tool_error:
@@ -1468,6 +1471,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 is_error,
                 blocked,
                 middleware_trace,
+                dispatched,
             )
         finally:
             # Teardown advance: keep the counter moving for any later-ordered
@@ -1567,6 +1571,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     True,
                                     False,
                                     middleware_trace,
+                                    False,
                                 )
                         break
                     futures.append(f)
@@ -1703,6 +1708,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ):
         r = results[i]
         tool_call_id = _pairing_tool_call_id(tc)
+        function_name, function_args = name, args
+        execution_dispatched = False
         blocked = False
         is_error = True
         progress_function_name = name
@@ -1761,7 +1768,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             tool_duration = 0.0
         else:
-            function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace, execution_dispatched = r
             name = function_name
             args = function_args
             progress_function_name = function_name
@@ -1814,6 +1821,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        record_strategy_execution(
+            agent, function_name, function_args, tool_call_id, executed=execution_dispatched and not blocked,
+        )
+        record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -1821,6 +1832,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            requester_id=str(effective_task_id or ""),
+            parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            tool_arguments=function_args if execution_dispatched and not blocked else None,
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -1918,7 +1936,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
-        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            requester_id=str(effective_task_id or ""),
+            parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # Append any pending user steer text to the last tool result so the
@@ -2739,6 +2766,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
+        record_strategy_execution(
+            agent, function_name, function_args, tool_call_id, executed=_execution_dispatched and not _execution_blocked,
+        )
+        record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -2746,6 +2777,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            requester_id=str(effective_task_id or ""),
+            parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            tool_arguments=function_args if _execution_dispatched and not _execution_blocked else None,
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -2853,7 +2891,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # be discarded when aggregate budget enforcement replaces a tool result.
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        enforce_turn_budget(
+            messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            requester_id=str(effective_task_id or ""),
+            parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
+        )
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -2920,6 +2967,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             messages[-total_tools:],
             env=get_active_env(effective_task_id),
             config=_tool_budget,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            requester_id=str(effective_task_id or ""),
+            parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
+            investment_evidence_enabled=(
+                "investment_evidence" in (agent.valid_tool_names or ())
+            ),
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

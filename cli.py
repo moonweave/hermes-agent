@@ -21187,6 +21187,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
+            task_id=cli.session_id,
         )
         # Keep session_id in sync if mid-run compression rotated it.
         if (
@@ -21769,6 +21770,7 @@ def main(
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
+                                task_id=cli.session_id,
                             )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")

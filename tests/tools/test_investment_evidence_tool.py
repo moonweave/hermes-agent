@@ -399,3 +399,54 @@ def test_aggregate_storage_preserves_research_producer_and_session(spillover, pr
                                         session_id="parent", task_id="parent")
     assert json.loads(result)["success"] is allowed
     assert ("AGGREGATE_TAIL" in result) is allowed
+
+
+@pytest.mark.parametrize("read_only", [True, False, None, "true", 1])
+def test_strategy_reader_requires_runtime_read_only_proof(spillover, read_only):
+    from tools.tool_result_storage import maybe_persist_tool_result, extract_persisted_path
+
+    # A payload claiming read_only cannot authorize itself.
+    content = json.dumps({"structuredContent": {"read_only": True,
+        "rows": ["근거 " * 500] * 40, "tail": "STRATEGY_END"}}, ensure_ascii=False)
+    preview = maybe_persist_tool_result(
+        content, "mcp__kospi_investment__analyze_strategy", "strategy_test",
+        threshold=1000, session_id="test-session", requester_id="test-requester",
+        tool_arguments={"read_only": read_only},
+    )
+    reference = extract_persisted_path(preview)
+    args = {"reference": reference}
+    pages = []
+    for _ in range(30):
+        page = json.loads(evidence._handle_investment_evidence(args))
+        if read_only is not True:
+            assert page["success"] is False
+            assert page["status"] == "degraded" and page["provider_retry"] is False
+            assert "read-only execution provenance" in page["error"]
+            return
+        assert page["success"] is True, page
+        pages.append(page["content"])
+        if not page["truncated"]:
+            break
+        args["character_offset"] = page["next_character_offset"]
+    else:
+        pytest.fail("strategy evidence never reached the tail")
+    assert "investment_evidence(reference=" in preview and "Use the read_file" not in preview
+    assert "STRATEGY_END" in "".join(pages)
+    assert json.loads("".join(pages))["structuredContent"]["read_only"] is True
+    denied = json.loads(evidence._handle_investment_evidence(
+        {"reference": reference}, session_id="unrelated-session"))
+    assert denied["success"] is False
+    Path(reference).write_text(content + "changed", encoding="utf-8")
+    assert json.loads(evidence._handle_investment_evidence({"reference": reference}))["success"] is False
+
+
+def test_legacy_strategy_and_account_producers_remain_denied(spillover):
+    from tools.tool_result_storage import maybe_persist_tool_result, extract_persisted_path
+
+    for producer in ("mcp__kospi_investment__analyze_strategy", "mcp__kospi_investment__get_balance"):
+        preview = maybe_persist_tool_result(
+            "account text" * 2000, producer, "legacy", threshold=1000,
+            session_id="test-session", requester_id="test-requester",
+        )
+        result = json.loads(evidence._handle_investment_evidence({"reference": extract_persisted_path(preview)}))
+        assert result["success"] is False

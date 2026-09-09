@@ -66,6 +66,7 @@ SPILLOVER_SUBDIR = "cache/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
+_READ_ONLY_STRATEGY_PRODUCER = "mcp__kospi_investment__analyze_strategy"
 _INVESTMENT_EVIDENCE_PRODUCERS = frozenset({
     "mcp__kospi_investment__get_market_context",
     "mcp__kospi_investment__get_flow_context",
@@ -170,6 +171,7 @@ def _write_to_spillover(
     session_id: str = "",
     requester_id: str = "",
     parent_session_id: str = "",
+    tool_arguments: dict | None = None,
 ):
     """Write content host-side to $HERMES_HOME/cache/spillover.
 
@@ -194,6 +196,12 @@ def _write_to_spillover(
             "parent_session_id": parent_session_id,
             "content_sha256": hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
         }
+        if tool_name == _READ_ONLY_STRATEGY_PRODUCER:
+            # Execution arguments, not model-authored result text, grant access.
+            metadata["strategy_read_only"] = (
+                isinstance(tool_arguments, dict)
+                and tool_arguments.get("read_only") is True
+            )
         metadata_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
     except OSError as exc:
         logger.warning("Spillover write failed for %s: %s", filename, exc)
@@ -313,6 +321,7 @@ def _build_persisted_message(
     has_more: bool,
     original_size: int,
     file_path: str,
+    investment_evidence: bool = False,
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -324,12 +333,22 @@ def _build_persisted_message(
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
     msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
-    msg += (
-        "Recovery: page through the saved file with read_file (offset/limit) or "
-        "process it with execute_code — do NOT re-request the same data from the "
-        "remote API; the full result is already on disk.\n\n"
-    )
+    if investment_evidence:
+        msg += (
+            "Read this result with investment_evidence(reference=the saved path). "
+            "Follow next_character_offset for long lines; a preview is not full evidence. "
+            "Do not re-request the provider data. Disclose failed reads and unread scope "
+            "in your final answer. Separate market analysis from operational execution "
+            "restrictions; carry forward unresolved evidence contradictions from this "
+            "conversation.\n\n"
+        )
+    else:
+        msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+        msg += (
+            "Recovery: page through the saved file with read_file (offset/limit) or "
+            "process it with execute_code — do NOT re-request the same data from the "
+            "remote API; the full result is already on disk.\n\n"
+        )
     msg += f"Preview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
@@ -364,6 +383,7 @@ def maybe_persist_tool_result(
     session_id: str = "",
     requester_id: str = "",
     parent_session_id: str = "",
+    tool_arguments: dict | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -398,16 +418,21 @@ def maybe_persist_tool_result(
     # caches, pruned by gateway housekeeping) regardless of backend.
     host_path = _write_to_spillover(
         content, filename, tool_name, tool_use_id,
-        session_id, requester_id, parent_session_id,
+        session_id, requester_id, parent_session_id, tool_arguments,
     )
 
+    evidence_reader = tool_name in _INVESTMENT_EVIDENCE_PRODUCERS or (
+        tool_name == _READ_ONLY_STRATEGY_PRODUCER
+        and isinstance(tool_arguments, dict)
+        and tool_arguments.get("read_only") is True
+    )
     if _is_host_side_env(env):
         if host_path is not None:
             logger.info(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return _build_persisted_message(preview, has_more, len(content), host_path, evidence_reader)
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the

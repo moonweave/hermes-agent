@@ -51,6 +51,8 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path,
 )
+from agent.investment_evidence_verifier import record_evidence_read
+
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -1808,6 +1810,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -1818,6 +1821,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            tool_arguments=function_args,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -2738,6 +2742,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
+        record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -2748,6 +2753,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            tool_arguments=function_args,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 

@@ -22,6 +22,7 @@ from tools.registry import registry, tool_error
 from tools.tool_result_storage import (
     SPILLOVER_MAX_AGE_HOURS,
     _INVESTMENT_EVIDENCE_PRODUCERS,
+    _READ_ONLY_STRATEGY_PRODUCER,
     get_spillover_dir,
 )
 
@@ -162,7 +163,11 @@ def _provenance_error(
     try:
         if metadata.get("version") != 1 or metadata.get("filename") != path.name:
             raise ValueError("metadata does not identify this evidence")
-        if metadata.get("tool_name") not in _INVESTMENT_EVIDENCE_PRODUCERS:
+        producer = metadata.get("tool_name")
+        if producer == _READ_ONLY_STRATEGY_PRODUCER:
+            if metadata.get("strategy_read_only") is not True:
+                raise ValueError("strategy requires explicit read-only execution provenance")
+        elif producer not in _INVESTMENT_EVIDENCE_PRODUCERS:
             raise ValueError("producer is not authorized investment evidence")
         if not isinstance(metadata.get("tool_use_id"), str) or not metadata["tool_use_id"]:
             raise ValueError("tool call provenance is missing")

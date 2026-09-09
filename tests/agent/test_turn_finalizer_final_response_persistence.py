@@ -271,3 +271,43 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     )
 
     assert agent._db_flush_scan_prefix is None
+
+
+def test_evidence_read_failure_reaches_answer_and_durable_history(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+    from agent.investment_evidence_verifier import record_evidence_read, EVIDENCE_FAILURE_NOTICE
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(agent.session_id, source="telegram")
+    agent._persist_session = lambda messages, history: db.replace_messages(agent.session_id, messages)
+    record_evidence_read(agent, "investment_evidence", {"reference": "a.txt"},
+                         '{"success":false,"status":"degraded"}')
+    # Success on another reference or page cannot erase the failed read.
+    record_evidence_read(agent, "investment_evidence", {"reference": "b.txt"}, '{"success":true}')
+    record_evidence_read(agent, "investment_evidence", {"reference": "a.txt", "character_offset": 20001}, '{"success":true}')
+    messages = [{"role": "user", "content": "결론은?"},
+                {"role": "assistant", "content": "분석 완료"}]
+    result = finalize_turn(agent, final_response="분석 완료", api_call_count=2,
+        interrupted=False, failed=False, messages=messages, conversation_history=[],
+        effective_task_id="task", turn_id="turn", user_message="결론은?",
+        original_user_message="결론은?", _should_review_memory=False,
+        _turn_exit_reason="text_response")
+    assert result["final_response"].count(EVIDENCE_FAILURE_NOTICE) == 1
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert db.get_messages_as_conversation(agent.session_id)[-1]["content"] == result["final_response"]
+    assert result["response_transformed"] is True
+    db.close()
+
+
+def test_evidence_failure_exact_recovery_and_other_tools():
+    from agent.investment_evidence_verifier import record_evidence_read, disclose_evidence_failure
+
+    agent = FakeAgent()
+    args = {"reference": "a.txt", "character_offset": 20001}
+    record_evidence_read(agent, "investment_evidence", args, "malformed")
+    assert disclose_evidence_failure(agent, "answer") != "answer"
+    record_evidence_read(agent, "investment_evidence", args, '{"success":true}')
+    record_evidence_read(agent, "some_other_tool", args, '{"success":false}')
+    assert disclose_evidence_failure(agent, "answer") == "answer"

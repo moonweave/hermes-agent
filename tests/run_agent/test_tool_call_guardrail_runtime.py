@@ -423,3 +423,62 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_investment_strategy_provenance_survives_both_real_dispatch_paths(tmp_path, monkeypatch):
+    from tools.tool_result_storage import extract_persisted_path
+    from tools.investment_evidence_tool import _handle_investment_evidence
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    producer = "mcp__kospi_investment__analyze_strategy"
+    payload = json.dumps({"structuredContent": {"read_only": True, "data": "evidence " * 30000}})
+    for mode in ("sequential", "concurrent"):
+        agent = _make_agent(producer, "investment_evidence")
+        agent._turn_failed_evidence_reads = set()
+        call = _mock_tool_call(producer, '{"read_only":true}', "strategy-" + mode)
+        messages = []
+        with patch("run_agent.handle_function_call", return_value=payload):
+            getattr(agent, "_execute_tool_calls_" + mode)(
+                SimpleNamespace(content="", tool_calls=[call]), messages, "task-1")
+        path = extract_persisted_path(messages[-1]["content"])
+        assert path, messages[-1]["content"][:500]
+        page = json.loads(_handle_investment_evidence({"reference": path},
+            session_id=agent.session_id, requester_id="task-1"))
+        assert page["success"] is True, page
+        failure = _mock_tool_call("investment_evidence", '{"reference":"missing.txt"}', "missing-" + mode)
+        with patch("run_agent.handle_function_call", return_value='{"success":false,"status":"degraded"}'):
+            getattr(agent, "_execute_tool_calls_" + mode)(
+                SimpleNamespace(content="", tool_calls=[failure]), messages, "task-1")
+        assert agent._turn_failed_evidence_reads
+
+
+def test_evidence_disclosure_real_conversation_persists_and_resets(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from agent.investment_evidence_verifier import EVIDENCE_FAILURE_NOTICE
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _make_agent("investment_evidence")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(agent.session_id, source="telegram")
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_disabled = False
+    agent.skip_background_review = True
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[
+            _mock_tool_call("investment_evidence", '{"reference":"missing.txt"}', "missing-full-turn")]),
+        _mock_response(content="분석 완료", finish_reason="stop"),
+        _mock_response(content="안녕하세요", finish_reason="stop"),
+    ]
+    with patch("run_agent.handle_function_call", return_value='{"success":false,"status":"degraded"}'):
+        result = agent.run_conversation("이 원문을 확인하고 결론을 알려줘")
+    assert EVIDENCE_FAILURE_NOTICE in result["final_response"]
+    rows = db.get_messages_as_conversation(agent.session_id)
+    assert rows[-1]["content"] == result["final_response"]
+    assert sum(EVIDENCE_FAILURE_NOTICE in str(row.get("content")) for row in rows) == 1
+    following = agent.run_conversation("인사만 해줘", conversation_history=result["messages"])
+    assert EVIDENCE_FAILURE_NOTICE not in following["final_response"]
+    db.close()

@@ -1219,7 +1219,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     results = [None] * num_tools
     for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
-            results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+            results[i] = (name, args, block_result, 0.0, True, True, middleware_trace, False)
 
     start_condition = threading.Condition()
     next_start_order = 0
@@ -1434,6 +1434,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     True,
                     False,
                     middleware_trace,
+                    False,
                 )
                 return
             except Exception as tool_error:
@@ -1464,6 +1465,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 is_error,
                 blocked,
                 middleware_trace,
+                dispatched,
             )
         finally:
             # Teardown advance: keep the counter moving for any later-ordered
@@ -1563,6 +1565,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                     True,
                                     False,
                                     middleware_trace,
+                                    False,
                                 )
                         break
                     futures.append(f)
@@ -1699,6 +1702,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ):
         r = results[i]
         tool_call_id = _pairing_tool_call_id(tc)
+        function_name, function_args = name, args
+        execution_dispatched = False
         blocked = False
         is_error = True
         progress_function_name = name
@@ -1757,7 +1762,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             tool_duration = 0.0
         else:
-            function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace, execution_dispatched = r
             name = function_name
             args = function_args
             progress_function_name = function_name
@@ -1811,7 +1816,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         record_strategy_execution(
-            agent, function_name, function_args, tool_call_id, executed=not blocked,
+            agent, function_name, function_args, tool_call_id, executed=execution_dispatched and not blocked,
         )
         record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
@@ -1824,7 +1829,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
-            tool_arguments=function_args,
+            tool_arguments=function_args if execution_dispatched and not blocked else None,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
@@ -2747,7 +2752,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         record_strategy_execution(
-            agent, function_name, function_args, tool_call_id, executed=not _execution_blocked,
+            agent, function_name, function_args, tool_call_id, executed=_execution_dispatched and not _execution_blocked,
         )
         record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
@@ -2760,7 +2765,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
-            tool_arguments=function_args,
+            tool_arguments=function_args if _execution_dispatched and not _execution_blocked else None,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 

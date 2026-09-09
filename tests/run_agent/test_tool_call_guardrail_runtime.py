@@ -511,3 +511,62 @@ def test_strategy_aggregate_proof_survives_all_dispatch_finalizers(tmp_path, mon
         result = json.loads(_handle_investment_evidence({"reference": reference},
             session_id=agent.session_id, requester_id="task-1"))
         assert result["success"] is True, result
+
+
+def test_unstarted_concurrent_calls_never_grant_strategy_provenance(tmp_path, monkeypatch):
+    from concurrent.futures import Future
+    from tools.budget_config import BudgetConfig
+    from tools.tool_result_storage import extract_persisted_path
+    from pathlib import Path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Force the non-execution diagnostic through both persistence layers.
+    budget = BudgetConfig(default_result_size=1, mcp_result_size=1, turn_budget=1, preview_size=30)
+    monkeypatch.setattr("agent.tool_executor._budget_for_agent", lambda agent: budget)
+    producer = "mcp__kospi_investment__analyze_strategy"
+    for failure in ("missing", "timeout", "interrupt", "shutdown"):
+        for strategy_last in (False, True):
+            class UnstartedPool:
+                def __init__(self, **kwargs):
+                    pass
+
+                def submit(self, *args, **kwargs):
+                    if failure == "shutdown":
+                        raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+                    if failure == "interrupt":
+                        agent._interrupt_requested = True
+                    future = Future()
+                    if failure == "missing":
+                        future.set_result(None)
+                    return future
+
+                def shutdown(self, **kwargs):
+                    pass
+
+            monkeypatch.setattr("tools.daemon_pool.DaemonThreadPoolExecutor", UnstartedPool)
+            monkeypatch.setattr("agent.tool_executor._resolve_concurrent_tool_timeout",
+                                lambda: 0.0 if failure == "timeout" else None)
+            agent = _make_agent(producer, "web_search")
+            agent._interrupt_requested = False
+            if failure == "interrupt":
+                monkeypatch.setattr("agent.tool_executor.concurrent.futures.wait",
+                                    lambda futures, **kwargs: (set(), set(futures)))
+            strategy_id = f"unstarted-{failure}-{strategy_last}"
+            other_id = f"other-{failure}-{strategy_last}"
+            calls = [_mock_tool_call(producer, '{"read_only":true}', strategy_id),
+                     _mock_tool_call("web_search", '{}', other_id)]
+            if strategy_last:
+                calls.reverse()
+            messages = []
+            with patch("run_agent.handle_function_call") as invoke:
+                agent._execute_tool_calls_concurrent(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+                invoke.assert_not_called()
+            proofs = agent._turn_strategy_execution_provenance
+            assert other_id not in proofs
+            assert proofs[strategy_id]["read_only"] is False
+            strategy_message = next(message for message in messages if message['tool_call_id'] == strategy_id)
+            reference = extract_persisted_path(strategy_message['content'])
+            assert reference
+            metadata = json.loads(Path(reference + '.meta.json').read_text())
+            assert metadata['tool_name'] == producer
+            assert metadata['strategy_read_only'] is False

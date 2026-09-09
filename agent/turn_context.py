@@ -1351,6 +1351,7 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_failed_evidence_reads = set()
+    agent._turn_strategy_execution_provenance = {}
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0

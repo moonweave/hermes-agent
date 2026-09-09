@@ -4,6 +4,20 @@ from __future__ import annotations
 
 import json
 
+from tools.tool_result_storage import _READ_ONLY_STRATEGY_PRODUCER
+
+
+def record_strategy_execution(agent, tool_name, arguments, tool_call_id, *, executed):
+    if tool_name != _READ_ONLY_STRATEGY_PRODUCER:
+        return
+    state = getattr(agent, "_turn_strategy_execution_provenance", None)
+    if state is None:
+        state = agent._turn_strategy_execution_provenance = {}
+    state[tool_call_id] = {
+        "tool_name": tool_name,
+        "read_only": executed and isinstance(arguments, dict) and arguments.get("read_only") is True,
+    }
+
 EVIDENCE_FAILURE_NOTICE = (
     "근거 확인 제한: 이번 답변에서 요청한 투자 원문 중 읽기에 실패한 부분이 있습니다. "
     "위 답변은 전체 근거 확인을 마친 결론이 아니며, 미확인 부분에 의존한 투자 판단은 확정할 수 없습니다."

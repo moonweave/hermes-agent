@@ -450,3 +450,54 @@ def test_legacy_strategy_and_account_producers_remain_denied(spillover):
         )
         result = json.loads(evidence._handle_investment_evidence({"reference": extract_persisted_path(preview)}))
         assert result["success"] is False
+
+
+@pytest.mark.parametrize("proof", [None, {"tool_name": "other", "read_only": True},
+    {"tool_name": "mcp__kospi_investment__analyze_strategy", "read_only": False},
+    {"tool_name": "mcp__kospi_investment__analyze_strategy", "read_only": True}])
+def test_aggregate_strategy_storage_uses_execution_proof(spillover, proof):
+    from tools.tool_result_storage import enforce_turn_budget, extract_persisted_path
+    from tools.budget_config import BudgetConfig
+
+    messages = [{"tool_call_id": "aggregate-strategy", "name": "mcp__kospi_investment__analyze_strategy",
+                 "content": json.dumps({"read_only": True, "data": "raw evidence " * 400})}]
+    enforce_turn_budget(messages, config=BudgetConfig(turn_budget=1000, preview_size=100),
+        session_id="test-session", requester_id="test-requester",
+        execution_provenance={"aggregate-strategy": proof} if proof else None)
+    reference = extract_persisted_path(messages[0]["content"])
+    result = json.loads(evidence._handle_investment_evidence({"reference": reference}))
+    authorized = bool(proof and proof["tool_name"] == messages[0]["name"] and proof["read_only"] is True)
+    assert result["success"] is authorized, result
+    if authorized:
+        assert "raw evidence" in result["content"]
+        assert json.loads(evidence._handle_investment_evidence(
+            {"reference": reference}, session_id="unrelated"))["success"] is False
+
+
+@pytest.mark.parametrize("sandbox_visible", ["/sandbox/cache/spillover/remote.txt", None])
+def test_remote_investment_evidence_keeps_host_reference(spillover, monkeypatch, sandbox_visible):
+    from tools import tool_result_storage as storage
+
+    monkeypatch.setattr(storage, "_is_host_side_env", lambda env: False)
+    monkeypatch.setattr(storage, "_sandbox_visible_spillover_path", lambda path, env: sandbox_visible)
+    preview = storage.maybe_persist_tool_result(
+        "raw evidence " * 400, "mcp__kospi_investment__analyze_strategy", "remote",
+        env=object(), threshold=1000, session_id="test-session", requester_id="test-requester",
+        tool_arguments={"read_only": True})
+    reference = storage.extract_persisted_path(preview)
+    assert Path(reference).is_relative_to(spillover)
+    assert "investment_evidence(reference=" in preview
+    assert "Use the read_file" not in preview
+    assert json.loads(evidence._handle_investment_evidence({"reference": reference}))["success"] is True
+
+
+def test_failed_host_storage_does_not_offer_unreadable_sandbox_evidence(spillover, monkeypatch):
+    from tools import tool_result_storage as storage
+
+    monkeypatch.setattr(storage, "_write_to_spillover", lambda *a, **k: None)
+    monkeypatch.setattr(storage, "_is_host_side_env", lambda env: False)
+    result = json.loads(storage.maybe_persist_tool_result(
+        "raw evidence " * 400, "mcp__kospi_investment__analyze_strategy", "unsaved",
+        env=object(), threshold=1000, tool_arguments={"read_only": True}))
+    assert result["success"] is False and result["status"] == "degraded"
+    assert result["unknown"] is True and result["provider_retry"] is False

@@ -426,6 +426,17 @@ def maybe_persist_tool_result(
         and isinstance(tool_arguments, dict)
         and tool_arguments.get("read_only") is True
     )
+    # investment_evidence executes on the host, even when terminal tools use
+    # a sandbox. A translated sandbox path cannot pass its host-root check.
+    if evidence_reader:
+        if host_path is not None:
+            return _build_persisted_message(preview, has_more, len(content), host_path, True)
+        return json.dumps({
+            "success": False, "status": "degraded", "unknown": True,
+            "error": "Investment evidence could not be saved in the active profile. "
+                     "Disclose this failure; do not report the preview as verified evidence.",
+            "provider_retry": False,
+        })
     if _is_host_side_env(env):
         if host_path is not None:
             logger.info(
@@ -478,6 +489,7 @@ def enforce_turn_budget(
     session_id: str = "",
     requester_id: str = "",
     parent_session_id: str = "",
+    execution_provenance: dict | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
@@ -508,9 +520,14 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
+        tool_name = msg.get("name") or msg.get("tool_name") or _BUDGET_TOOL_NAME
+        proof = (execution_provenance or {}).get(tool_use_id, {})
+        arguments = None
+        if isinstance(proof, dict) and proof.get("tool_name") == tool_name:
+            arguments = {"read_only": proof.get("read_only") is True}
         replacement = maybe_persist_tool_result(
             content=content,
-            tool_name=msg.get("name") or msg.get("tool_name") or _BUDGET_TOOL_NAME,
+            tool_name=tool_name,
             tool_use_id=tool_use_id,
             env=env,
             config=config,
@@ -518,6 +535,7 @@ def enforce_turn_budget(
             session_id=session_id,
             requester_id=requester_id,
             parent_session_id=parent_session_id,
+            tool_arguments=arguments,
         )
         if replacement != content:
             total_size -= size

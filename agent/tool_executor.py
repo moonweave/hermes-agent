@@ -51,7 +51,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
     extract_persisted_path,
 )
-from agent.investment_evidence_verifier import record_evidence_read
+from agent.investment_evidence_verifier import record_evidence_read, record_strategy_execution
 
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
@@ -1810,6 +1810,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
+        record_strategy_execution(
+            agent, function_name, function_args, tool_call_id, executed=not blocked,
+        )
         record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
@@ -1924,6 +1927,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
         )
 
     # ── /steer injection ──────────────────────────────────────────────
@@ -2742,6 +2746,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
+        record_strategy_execution(
+            agent, function_name, function_args, tool_call_id, executed=not _execution_blocked,
+        )
         record_evidence_read(agent, function_name, function_args, function_result)
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
@@ -2866,6 +2873,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
         )
 
     # ── /steer injection ──────────────────────────────────────────────
@@ -2936,6 +2944,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             session_id=str(getattr(agent, "session_id", "") or ""),
             requester_id=str(effective_task_id or ""),
             parent_session_id=str(getattr(agent, "parent_session_id", "") or ""),
+            execution_provenance=getattr(agent, "_turn_strategy_execution_provenance", None),
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
 

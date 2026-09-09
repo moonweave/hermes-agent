@@ -482,3 +482,32 @@ def test_evidence_disclosure_real_conversation_persists_and_resets(tmp_path, mon
     following = agent.run_conversation("인사만 해줘", conversation_history=result["messages"])
     assert EVIDENCE_FAILURE_NOTICE not in following["final_response"]
     db.close()
+
+
+def test_strategy_aggregate_proof_survives_all_dispatch_finalizers(tmp_path, monkeypatch):
+    from tools.budget_config import BudgetConfig
+    from tools.tool_result_storage import extract_persisted_path
+    from tools.investment_evidence_tool import _handle_investment_evidence
+    from agent.tool_executor import execute_tool_calls_segmented
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    budget = BudgetConfig(mcp_result_size=10000, turn_budget=1000, preview_size=100)
+    monkeypatch.setattr("agent.tool_executor._budget_for_agent", lambda agent: budget)
+    producer = "mcp__kospi_investment__analyze_strategy"
+    content = json.dumps({"read_only": True, "data": "raw evidence " * 400})
+    assert 1000 < len(content) < 10000
+    for mode in ("sequential", "concurrent", "segmented"):
+        agent = _make_agent(producer)
+        messages = []
+        call = _mock_tool_call(producer, '{"read_only":true}', "aggregate-" + mode)
+        message = SimpleNamespace(content="", tool_calls=[call])
+        with patch("run_agent.handle_function_call", return_value=content):
+            if mode == "segmented":
+                execute_tool_calls_segmented(agent, message, messages, "task-1")
+            else:
+                getattr(agent, "_execute_tool_calls_" + mode)(message, messages, "task-1")
+        reference = extract_persisted_path(messages[-1]["content"])
+        assert reference
+        result = json.loads(_handle_investment_evidence({"reference": reference},
+            session_id=agent.session_id, requester_id="task-1"))
+        assert result["success"] is True, result

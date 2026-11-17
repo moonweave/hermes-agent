@@ -145,9 +145,10 @@ class TestDrainWaitsForApiWork:
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
 
+        api_asyncio = SimpleNamespace(**vars(asyncio))
+        api_asyncio.create_task = delayed_create_task
         with patch(
-            "gateway.platforms.api_server.asyncio.create_task",
-            side_effect=delayed_create_task,
+            "gateway.platforms.api_server.asyncio", api_asyncio,
         ), patch.object(api, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as client:
                 response = await client.post("/v1/runs", json={"input": "hello"})

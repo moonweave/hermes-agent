@@ -9,6 +9,7 @@ from plugins.platforms.google_chat import oauth
 
 
 def test_stale_google_transitives_are_reported_missing(monkeypatch):
+    pyasn1_spec = next(spec for spec in oauth._REQUIRED_PACKAGES if spec.startswith("pyasn1=="))
     installed = {
         "google-cloud-pubsub": "2.39.0",
         "google-api-python-client": "2.194.0",
@@ -30,17 +31,18 @@ def test_stale_google_transitives_are_reported_missing(monkeypatch):
     assert oauth._missing_required_packages() == [
         "google-auth==2.55.1",
         "httplib2==0.32.0",
-        "pyasn1==0.6.4",
+        pyasn1_spec,
     ]
 
 
 def test_installer_repairs_stale_transitives(monkeypatch):
+    pyasn1_spec = next(spec for spec in oauth._REQUIRED_PACKAGES if spec.startswith("pyasn1=="))
     states = iter(
         [
             [
                 "google-auth==2.55.1",
                 "httplib2==0.32.0",
-                "pyasn1==0.6.4",
+                pyasn1_spec,
             ],
             [],
         ]
@@ -58,6 +60,6 @@ def test_installer_repairs_stale_transitives(monkeypatch):
             "--quiet",
             "google-auth==2.55.1",
             "httplib2==0.32.0",
-            "pyasn1==0.6.4",
+            pyasn1_spec,
         ]
     ]

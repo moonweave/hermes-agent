@@ -253,9 +253,9 @@ class TestIsSatisfiedVersionAware:
                     "pyasn1": "0.6.3",
                 },
                 (
-                    "google-auth==2.55.1",
-                    "httplib2==0.32.0",
-                    "pyasn1==0.6.4",
+                    "google-auth",
+                    "httplib2",
+                    "pyasn1",
                 ),
             ),
             (
@@ -264,7 +264,7 @@ class TestIsSatisfiedVersionAware:
                     "google-auth": "2.55.1",
                     "pyasn1": "0.6.3",
                 },
-                ("pyasn1==0.6.4",),
+                ("pyasn1",),
             ),
         ],
     )
@@ -290,7 +290,13 @@ class TestIsSatisfiedVersionAware:
 
         ld.ensure(feature, prompt=False)
 
-        assert tuple(installed) == expected_repairs
+        assert tuple(spec.split("==", 1)[0] for spec in installed) == expected_repairs
+        declared_repairs = tuple(
+            spec for spec in ld.LAZY_DEPS[feature]
+            if spec.split("==", 1)[0] in expected_repairs
+        )
+        assert tuple(installed) == declared_repairs
+        assert ld.feature_missing(feature) == ()
 
 
 # ---------------------------------------------------------------------------

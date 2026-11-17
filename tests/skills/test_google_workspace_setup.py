@@ -28,6 +28,7 @@ def setup_module():
 
 
 def test_stale_google_transitives_are_reported_missing(setup_module, monkeypatch):
+    pyasn1_spec = next(spec for spec in setup_module.REQUIRED_PACKAGES if spec.startswith("pyasn1=="))
     installed = {
         "google-api-python-client": "2.194.0",
         "google-auth": "2.55.0",
@@ -48,17 +49,18 @@ def test_stale_google_transitives_are_reported_missing(setup_module, monkeypatch
     assert setup_module._missing_required_packages() == [
         "google-auth==2.55.1",
         "httplib2==0.32.0",
-        "pyasn1==0.6.4",
+        pyasn1_spec,
     ]
 
 
 def test_installer_repairs_stale_transitives(setup_module, monkeypatch):
+    pyasn1_spec = next(spec for spec in setup_module.REQUIRED_PACKAGES if spec.startswith("pyasn1=="))
     states = iter(
         [
             [
                 "google-auth==2.55.1",
                 "httplib2==0.32.0",
-                "pyasn1==0.6.4",
+                pyasn1_spec,
             ],
             [],
         ]
@@ -85,6 +87,6 @@ def test_installer_repairs_stale_transitives(setup_module, monkeypatch):
             "--quiet",
             "google-auth==2.55.1",
             "httplib2==0.32.0",
-            "pyasn1==0.6.4",
+            pyasn1_spec,
         ]
     ]
